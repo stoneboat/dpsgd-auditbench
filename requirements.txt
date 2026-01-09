@@ -1,7 +1,9 @@
 numpy
 opacus==1.5.4
 torch==2.9.0
+torchvision
 ipykernel
 pyzmq
 scipy
 opt-einsum>=3.3.0
+tqdm
