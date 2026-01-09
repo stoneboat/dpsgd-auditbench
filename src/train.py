@@ -5,8 +5,19 @@ import numpy as np
 from opacus.utils.batch_memory_manager import BatchMemoryManager
 from tqdm import tqdm
 
-def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_physical_batch_size):
-    """Training function with augmentation multiplicity and gradient reduction"""
+def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_physical_batch_size, logical_batch_size):
+    """Training function with augmentation multiplicity and gradient reduction
+    
+    Args:
+        model: The model to train
+        optimizer: The optimizer
+        train_loader: Training data loader
+        device: Device to use
+        epoch: Current epoch number
+        aug_multiplicity: Number of augmentations per sample (K)
+        max_physical_batch_size: Maximum physical batch size for BatchMemoryManager
+        logical_batch_size: Logical batch size (required for counting logical batches)
+    """
     model.train()
     criterion = nn.CrossEntropyLoss(reduction='none') 
     losses = []
@@ -17,7 +28,7 @@ def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_p
         transforms.RandomHorizontalFlip(),
     ])
     
-    # BatchMemoryManager splits the 4096 batch into chunks
+    # BatchMemoryManager splits the logical batch into chunks
     with BatchMemoryManager(
         data_loader=train_loader, 
         max_physical_batch_size=max_physical_batch_size, 
@@ -27,6 +38,8 @@ def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_p
         # Wrap in tqdm
         pbar = tqdm(memory_safe_loader, desc=f"Epoch {epoch}", unit="batch")
         
+        num_logical_steps = 0  # Count logical batches, not physical batches
+        samples_in_current_logical_batch = 0  # Track samples processed in current logical batch
         for i, (images, labels) in enumerate(pbar):
             # images shape: [B, 3, 32, 32] (Physical Batch)
             
@@ -78,11 +91,21 @@ def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_p
             # If it's the end of logical batch, Opacus noises and updates.
             optimizer.step()
             
+            # Track samples processed for logical batch counting
+            # images.shape[0] is the physical batch size (before augmentation)
+            physical_batch_size = images.shape[0]
+            samples_in_current_logical_batch += physical_batch_size
+            
+            # When we've processed a full logical batch, count it as one step
+            if samples_in_current_logical_batch >= logical_batch_size:
+                num_logical_steps += 1
+                samples_in_current_logical_batch = 0  # Reset for next logical batch
+            
             losses.append(loss.item())
             if i % 10 == 0:
                 pbar.set_postfix(loss=np.mean(losses[-10:]))
     
-    return np.mean(losses)
+    return np.mean(losses), num_logical_steps
 
 def test(model, test_loader, device):
     """Test function"""

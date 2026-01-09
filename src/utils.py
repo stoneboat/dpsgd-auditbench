@@ -48,8 +48,18 @@ def setup_logging(log_file=None, log_dir='./logs'):
 # ==========================================
 # 6. Checkpoint Saving
 # ==========================================
-def save_checkpoint(model, optimizer, epoch, test_acc, ckpt_dir, logger):
-    """Save model checkpoint to .npz file"""
+def save_checkpoint(model, optimizer, epoch, test_acc, ckpt_dir, logger, global_step):
+    """Save model checkpoint to .npz file
+    
+    Args:
+        model: The model to save
+        optimizer: The optimizer to save
+        epoch: Current epoch number
+        test_acc: Test accuracy at this epoch
+        ckpt_dir: Directory to save checkpoint
+        logger: Logger instance
+        global_step: Total number of training steps completed (required)
+    """
     ckpt_path = os.path.join(ckpt_dir, f"{epoch:010d}.npz")
     
     # Get model state dict (handle Opacus-wrapped models)
@@ -90,9 +100,10 @@ def save_checkpoint(model, optimizer, epoch, test_acc, ckpt_dir, logger):
     # Save training metadata
     npz_dict['epoch'] = np.array([epoch], dtype=np.int32)
     npz_dict['test_accuracy'] = np.array([test_acc], dtype=np.float32)
+    npz_dict['global_step'] = np.array([global_step], dtype=np.int64)
     
     np.savez_compressed(ckpt_path, **npz_dict)
-    logger.info(f"Checkpoint saved: {ckpt_path} (Epoch {epoch}, Test Accuracy: {test_acc:.2f}%)")
+    logger.info(f"Checkpoint saved: {ckpt_path} (Epoch {epoch}, Global Step {global_step}, Test Accuracy: {test_acc:.2f}%)")
 
 def find_latest_checkpoint(ckpt_dir):
     """Find the checkpoint file with the largest epoch number"""
@@ -120,12 +131,22 @@ def find_latest_checkpoint(ckpt_dir):
     return os.path.join(ckpt_dir, latest_file), latest_epoch
 
 def load_checkpoint(checkpoint_path, model, optimizer, device, logger=None):
-    """Load model and optimizer state from .npz checkpoint file"""
+    """Load model and optimizer state from .npz checkpoint file
+    
+    Returns:
+        epoch: The epoch number
+        global_step: The global step number (None if not saved in checkpoint)
+    """
     # Load the .npz file
     checkpoint = np.load(checkpoint_path, allow_pickle=True)
     
     # Extract epoch
     epoch = int(checkpoint['epoch'][0])
+    
+    # Extract global_step if available
+    global_step = None
+    if 'global_step' in checkpoint.files:
+        global_step = int(checkpoint['global_step'][0])
     
     # Reconstruct model state dict
     model_state_dict = {}
@@ -199,8 +220,14 @@ def load_checkpoint(checkpoint_path, model, optimizer, device, logger=None):
             print(f"Warning: Could not fully load optimizer state: {e}. Continuing with default optimizer state.")
     
     if logger:
-        logger.info(f"Loaded checkpoint from epoch {epoch}")
+        if global_step is not None:
+            logger.info(f"Loaded checkpoint from epoch {epoch}, global step {global_step}")
+        else:
+            logger.info(f"Loaded checkpoint from epoch {epoch}")
     else:
-        print(f"Loaded checkpoint from epoch {epoch}")
+        if global_step is not None:
+            print(f"Loaded checkpoint from epoch {epoch}, global step {global_step}")
+        else:
+            print(f"Loaded checkpoint from epoch {epoch}")
     
-    return epoch
+    return epoch, global_step
