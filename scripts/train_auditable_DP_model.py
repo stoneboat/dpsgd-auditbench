@@ -35,7 +35,7 @@ DEFAULT_AUG_MULTIPLICITY = 16
 DEFAULT_MAX_GRAD_NORM = 1.0
 DEFAULT_EPSILON = 8.0
 DEFAULT_DELTA = 1e-5
-DEFAULT_EPOCHS = 140
+DEFAULT_EPOCHS = 200
 DEFAULT_LR = 4.0
 DEFAULT_MOMENTUM = 0.0
 DEFAULT_NOISE_MULTIPLIER = 3.0
@@ -62,7 +62,7 @@ def main():
     # Experiment parameters
     parser.add_argument('--canary-count', type=int, default=DEFAULT_CANARY_COUNT, help='Number of canaries')
     parser.add_argument('--pkeep', type=float, default=DEFAULT_PKEEP, help='Probability of including each canary')
-    parser.add_argument('--database-seed', type=int, default=None, help='Random seed for dataset (if None, generates random 128-bit seed)')
+    parser.add_argument('--database-seed', type=str, default=None, help='Random seed for dataset as string (if None, generates random 128-bit seed)')
     
     # Paths
     parser.add_argument('--data-dir', type=str, default='./data', help='Directory for CIFAR-10 data')
@@ -82,11 +82,15 @@ def main():
     # Handle database seed
     if args.database_seed is None:
         DATABSEED = secrets.randbits(128)
-        np.random.seed(DATABSEED)
         logger.info(f"Generated random 128-bit seed: {DATABSEED}")
     else:
-        DATABSEED = args.database_seed
-        np.random.seed(DATABSEED)
+        # Convert string to int (Python's int is arbitrary precision, so it can handle 128-bit integers)
+        try:
+            DATABSEED = int(args.database_seed)
+        except ValueError:
+            logger.error(f"Invalid database-seed: '{args.database_seed}'. Must be a valid integer.")
+            sys.exit(1)
+        logger.info(f"Using provided database seed: {DATABSEED}")
     
     # Create experiment directory
     exp_dir = os.path.join(args.data_dir, f"mislabeled-canaries-{DATABSEED}-{args.canary_count}-{args.pkeep}-cifar10")
@@ -174,8 +178,8 @@ def main():
         start_epoch = loaded_epoch + 1
         
         # Recover privacy state
-        dataset_size = len(train_dataset)
-        sample_rate = args.logical_batch_size / dataset_size
+        steps_per_epoch = len(train_loader) 
+        sample_rate = 1 / len(train_loader)
         
         # Update privacy accountant history
         if loaded_global_step is not None:
