@@ -13,15 +13,15 @@ fi
 
 mkdir -p /tmp/python-venv
 
-if [ -d "/tmp/python-venv/onerun_lra_venv" ]; then
-    echo "Conda env 'onerun_lra_venv' already exists in /tmp/python-venv."
+if [ -d "/tmp/python-venv/dpsgd-auditbench_venv" ]; then
+    echo "Conda env 'dpsgd-auditbench_venv' already exists in /tmp/python-venv."
 else
-    echo "Creating conda env 'onerun_lra_venv' in /tmp/python-venv..."
-    conda create --prefix /tmp/python-venv/onerun_lra_venv python=3.12 -y || { echo "conda create failed" >&2; exit 1; }
+    echo "Creating conda env 'dpsgd-auditbench_venv' in /tmp/python-venv..."
+    conda create --prefix /tmp/python-venv/dpsgd-auditbench_venv python=3.12 -y || { echo "conda create failed" >&2; exit 1; }
 fi
 
 # Activate the conda environment
-conda activate /tmp/python-venv/onerun_lra_venv || { echo "conda activate failed" >&2; exit 1; }
+conda activate /tmp/python-venv/dpsgd-auditbench_venv || { echo "conda activate failed" >&2; exit 1; }
 
 # Upgrade pip
 pip install --upgrade pip || { echo "pip upgrade failed" >&2; exit 1; }
@@ -44,13 +44,13 @@ if [ -f requirements.txt ] && [ -s requirements.txt ]; then
 fi
 
 # Uninstall existing kernel if it exists (to avoid conflicts)
-python -m ipykernel uninstall --user --name=onerun-lra-env -y 2>/dev/null || true
+python -m ipykernel uninstall --user --name=dpsgd-auditbench-env -y 2>/dev/null || true
 
 # Register kernel first (this creates the directory and basic kernel.json)
-python -m ipykernel install --user --name=onerun-lra-env --display-name "Python (onerun-lra-env)" || { echo "ipykernel install failed" >&2; exit 1; }
+python -m ipykernel install --user --name=dpsgd-auditbench-env --display-name "Python (dpsgd-auditbench-env)" || { echo "ipykernel install failed" >&2; exit 1; }
 
 # Create the custom kernel spec directory (in case ipykernel didn't create it)
-KERNEL_DIR=~/.local/share/jupyter/kernels/onerun-lra-env
+KERNEL_DIR=~/.local/share/jupyter/kernels/dpsgd-auditbench-env
 mkdir -p "$KERNEL_DIR"
 
 # Create a simple wrapper that loads modules before starting kernel
@@ -109,13 +109,13 @@ cat > "$KERNEL_DIR/kernel.json" <<EOL
 {
   "argv": [
     "$KERNEL_WRAPPER_ABS",
-    "/tmp/python-venv/onerun_lra_venv/bin/python",
+    "/tmp/python-venv/dpsgd-auditbench_venv/bin/python",
     "-m",
     "ipykernel_launcher",
     "-f",
     "{connection_file}"
   ],
-  "display_name": "Python (onerun-lra-env)",
+  "display_name": "Python (dpsgd-auditbench-env)",
   "language": "python"
 }
 EOL

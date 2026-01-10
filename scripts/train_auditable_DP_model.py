@@ -107,12 +107,15 @@ def main():
     logger.info(f"Run experiment on device: {device}")
     
     # Set random seeds for reproducibility
-    torch.manual_seed(DATABSEED)
+    # Cast 128-bit seed to 64-bit for PyTorch compatibility
+    torch_seed = int(DATABSEED % (2**32 - 1))
+    np_seed = int(DATABSEED % (2**32 - 1))
+    torch.manual_seed(torch_seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(DATABSEED)
-        torch.cuda.manual_seed_all(DATABSEED)
-    np.random.seed(DATABSEED)
-    logger.info(f"Set random seeds (torch, numpy) to: {DATABSEED}")
+        torch.cuda.manual_seed(torch_seed)
+        torch.cuda.manual_seed_all(torch_seed)
+    np.random.seed(np_seed)
+    logger.info(f"Set random seeds (torch, numpy) to: {torch_seed} (from DATABSEED: {DATABSEED})")
     
     # Store hyperparameters
     params = {
