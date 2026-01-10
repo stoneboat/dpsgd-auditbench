@@ -34,4 +34,8 @@ To train a DP-SGD model, see the notebook `train_original_DP_model.ipynb`. This 
 
 To train an auditable DP-SGD model, see the notebook `train_auditable_DP_model_blackbox.ipynb`. This notebook uses a dataloader that follows the canary insertion procedure suggested in the paper "Privacy Auditing with One Training Run" to train a DP-SGD model. The network architectures and training hyperparameters follow the same settings as the original DP-SGD training, with the only difference that the training dataset is altered to add canaries for auditing purposes. 
 
-We also provide a script `train_auditable_DP_model.py` in the `scripts` directory for long training runs. The script supports checkpoint resuming and tracks privacy loss from previous training sessions. 
+We also provide a script `train_auditable_DP_model.py` in the `scripts` directory for long training runs. The script supports checkpoint resuming and tracks privacy loss from previous training sessions.
+
+#### Generating audit observations
+
+To generate observations for auditing, run the notebook `infer_auditable_DP_model.ipynb`. This notebook computes losses and audit scores for all canaries across all checkpoints and saves them in the `logits` and `scores` directories. To visualize basic statistics of these observations, see the notebook `plot_auditable_DP_model.ipynb`. 
