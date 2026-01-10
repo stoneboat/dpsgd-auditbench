@@ -106,6 +106,14 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Run experiment on device: {device}")
     
+    # Set random seeds for reproducibility
+    torch.manual_seed(DATABSEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(DATABSEED)
+        torch.cuda.manual_seed_all(DATABSEED)
+    np.random.seed(DATABSEED)
+    logger.info(f"Set random seeds (torch, numpy) to: {DATABSEED}")
+    
     # Store hyperparameters
     params = {
         'logical_batch_size': args.logical_batch_size,
