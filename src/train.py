@@ -64,7 +64,8 @@ def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_p
             optimizer.zero_grad()
             outputs = model(aug_images)
             loss_per_sample = criterion(outputs, aug_labels)
-            loss = loss_per_sample.mean()
+
+            loss = loss_per_sample.mean() * aug_multiplicity
             loss.backward()
             
             # --- GRADIENT REDUCTION (B*K -> B) ---

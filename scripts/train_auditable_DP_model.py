@@ -14,6 +14,7 @@ import logging
 import torch
 from opacus import PrivacyEngine
 import torch.optim as optim
+import math
 
 # Add the src directory to sys.path
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -42,6 +43,7 @@ DEFAULT_NOISE_MULTIPLIER = 3.0
 DEFAULT_CKPT_INTERVAL = 20
 DEFAULT_CANARY_COUNT = 5000
 DEFAULT_PKEEP = 0.5
+DEFAULT_WARMUP_EPOCHS = 5
 
 def main():
     parser = argparse.ArgumentParser(description='Train differentially private CIFAR-10 model with privacy auditing')
@@ -58,6 +60,7 @@ def main():
     parser.add_argument('--momentum', type=float, default=DEFAULT_MOMENTUM, help='Momentum')
     parser.add_argument('--noise-multiplier', type=float, default=DEFAULT_NOISE_MULTIPLIER, help='Noise multiplier (sigma)')
     parser.add_argument('--ckpt-interval', type=int, default=DEFAULT_CKPT_INTERVAL, help='Save checkpoint every N epochs')
+    parser.add_argument('--warmup-epochs', type=int, default=DEFAULT_WARMUP_EPOCHS, help='Warmup epochs for LR schedule')
     
     # Experiment parameters
     parser.add_argument('--canary-count', type=int, default=DEFAULT_CANARY_COUNT, help='Number of canaries')
@@ -132,6 +135,7 @@ def main():
         'ckpt_interval': args.ckpt_interval,
         'canary_count': args.canary_count,
         'pkeep': args.pkeep,
+        'warmup_epochs': args.warmup_epochs,
         'database_seed': DATABSEED
     }
     
@@ -174,6 +178,25 @@ def main():
         noise_multiplier=args.noise_multiplier,
         max_grad_norm=args.max_grad_norm,
     )
+
+    # LR schedule: linear warmup then cosine decay (epoch-based)
+    warmup_epochs = max(0, args.warmup_epochs)
+    total_epochs = max(1, args.epochs)
+    warmup_epochs = min(warmup_epochs, total_epochs)
+    warmup_start = 1e-3
+
+    def lr_lambda(epoch_idx):
+        if warmup_epochs == 0:
+            progress = epoch_idx / max(1, total_epochs - 1)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        if epoch_idx < warmup_epochs:
+            # Linear warmup from warmup_start * lr to lr
+            return warmup_start + (1.0 - warmup_start) * (epoch_idx + 1) / warmup_epochs
+        # Cosine decay for the remaining epochs
+        progress = (epoch_idx - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     
     # Checkpoint loading
     start_epoch = 1
@@ -212,14 +235,17 @@ def main():
     logger.info("Training parameters:")
     logger.info(f"  Epochs: {args.epochs}")
     logger.info(f"  Learning rate: {args.lr}")
+    logger.info(f"  LR schedule: warmup({args.warmup_epochs}) + cosine decay")
     logger.info(f"  Logical batch size: {args.logical_batch_size}")
     logger.info(f"  Max physical batch size: {args.max_physical_batch_size}")
     logger.info(f"  Augmentation multiplicity: {args.aug_multiplicity}")
+    logger.info(f"  Loss scaling: mean(loss) * {args.aug_multiplicity} (to compensate for K)")
     logger.info(f"  Noise multiplier: {args.noise_multiplier}")
     logger.info(f"  Max grad norm: {args.max_grad_norm}")
     logger.info(f"  Canary count: {args.canary_count}")
     logger.info(f"  P(keep): {args.pkeep}")
     logger.info(f"  Checkpoint interval: {args.ckpt_interval} epochs")
+    logger.info(f"  Warmup epochs: {args.warmup_epochs}")
     
     # Flush handlers
     for handler in logging.getLogger().handlers:
@@ -227,6 +253,11 @@ def main():
         if hasattr(handler, 'stream') and hasattr(handler.stream, 'flush'):
             handler.stream.flush()
     
+    # Align scheduler if resuming from checkpoint
+    if start_epoch > 1:
+        for _ in range(start_epoch - 1):
+            scheduler.step()
+
     final_test_acc = None
     for epoch in range(start_epoch, args.epochs + 1):
         train_loss, num_steps = train(
@@ -235,11 +266,15 @@ def main():
         )
         total_steps += num_steps
         test_acc = test(model, test_loader, device)
+
+        # Step LR schedule after each epoch
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
         
         # Get current privacy budget (epsilon)
         epsilon = privacy_engine.get_epsilon(delta=args.delta)
         
-        logger.info(f"Epoch {epoch} - Train Loss: {train_loss:.4f}, Test Accuracy: {test_acc:.2f}%, Epsilon: {epsilon:.2f}, Delta: {args.delta}, Steps: {num_steps}, Total Steps: {total_steps}")
+        logger.info(f"Epoch {epoch} - Train Loss: {train_loss:.4f}, Test Accuracy: {test_acc:.2f}%, Epsilon: {epsilon:.2f}, Delta: {args.delta}, LR: {current_lr:.6f}, Steps: {num_steps}, Total Steps: {total_steps}")
         final_test_acc = test_acc
         
         # Save checkpoint every N epochs
