@@ -38,7 +38,8 @@ DEFAULT_EPSILON = 8.0
 DEFAULT_DELTA = 1e-5
 DEFAULT_EPOCHS = 200
 DEFAULT_LR = 4.0
-DEFAULT_MOMENTUM = 0.0
+DEFAULT_MOMENTUM = 0.9
+DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_NOISE_MULTIPLIER = 3.0
 DEFAULT_CKPT_INTERVAL = 20
 DEFAULT_CANARY_COUNT = 5000
@@ -58,6 +59,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=DEFAULT_LR, help='Learning rate')
     parser.add_argument('--momentum', type=float, default=DEFAULT_MOMENTUM, help='Momentum')
+    parser.add_argument('--weight-decay', type=float, default=DEFAULT_WEIGHT_DECAY, help='Weight decay (L2)')
     parser.add_argument('--noise-multiplier', type=float, default=DEFAULT_NOISE_MULTIPLIER, help='Noise multiplier (sigma)')
     parser.add_argument('--ckpt-interval', type=int, default=DEFAULT_CKPT_INTERVAL, help='Save checkpoint every N epochs')
     parser.add_argument('--warmup-epochs', type=int, default=DEFAULT_WARMUP_EPOCHS, help='Warmup epochs for LR schedule')
@@ -132,6 +134,7 @@ def main():
         'lr': args.lr,
         'momentum': args.momentum,
         'noise_multiplier': args.noise_multiplier,
+        'weight_decay': args.weight_decay,
         'ckpt_interval': args.ckpt_interval,
         'canary_count': args.canary_count,
         'pkeep': args.pkeep,
@@ -166,7 +169,12 @@ def main():
     # Create model
     logger.info("Creating model...")
     model = WideResNet(depth=16, widen_factor=4).to(device)
-    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
+    optimizer = optim.SGD(
+        model.parameters(),
+        lr=args.lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay,
+    )
     
     # Setup privacy engine
     logger.info("Setting up privacy engine...")
@@ -241,6 +249,7 @@ def main():
     logger.info(f"  Augmentation multiplicity: {args.aug_multiplicity}")
     logger.info(f"  Loss scaling: mean(loss) * {args.aug_multiplicity} (to compensate for K)")
     logger.info(f"  Noise multiplier: {args.noise_multiplier}")
+    logger.info(f"  Weight decay: {args.weight_decay}")
     logger.info(f"  Max grad norm: {args.max_grad_norm}")
     logger.info(f"  Canary count: {args.canary_count}")
     logger.info(f"  P(keep): {args.pkeep}")
@@ -257,7 +266,7 @@ def main():
     if start_epoch > 1:
         for _ in range(start_epoch - 1):
             scheduler.step()
-
+    
     final_test_acc = None
     for epoch in range(start_epoch, args.epochs + 1):
         train_loss, num_steps = train(

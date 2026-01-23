@@ -8,3 +8,4 @@ scipy
 opt-einsum>=3.3.0
 tqdm
 matplotlib
+dp-accounting

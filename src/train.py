@@ -27,6 +27,10 @@ def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_p
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
     ])
+    normalize_transform = transforms.Normalize(
+        (0.4914, 0.4822, 0.4465),
+        (0.2023, 0.1994, 0.2010),
+    )
     
     # BatchMemoryManager splits the logical batch into chunks
     with BatchMemoryManager(
@@ -57,6 +61,7 @@ def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_p
             
             # Stack: [K, B, C, H, W] -> [B*K, C, H, W]
             aug_images = torch.stack(aug_images).transpose(0, 1).reshape(-1, 3, 32, 32)
+            aug_images = normalize_transform(aug_images)
             # Repeat labels: [B] -> [B*K]
             aug_labels = labels.repeat_interleave(aug_multiplicity)
             

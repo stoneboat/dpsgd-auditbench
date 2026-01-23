@@ -9,7 +9,6 @@ def get_data_loaders(data_dir, logical_batch_size, num_workers):
     """Create data loaders for CIFAR-10"""
     train_transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
     test_transform = transforms.Compose([
         transforms.ToTensor(),
@@ -114,7 +113,6 @@ def generate_poisoned_canaries_and_mask(
     # Transforms
     train_transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
 
     # Load Full Training Dataset
@@ -161,7 +159,6 @@ def get_auditable_data_loaders(
     # Transforms
     train_transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
     test_transform = transforms.Compose([
         transforms.ToTensor(),
