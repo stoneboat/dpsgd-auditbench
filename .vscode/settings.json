@@ -1,0 +1,9 @@
+{
+  "terminal.integrated.profiles.linux": {
+    "pace-cluster (dpsgd-auditbench)": {
+      "path": "bash",
+      "args": ["--rcfile", "${workspaceFolder}/scripts/local_scripts/cursor_terminal_env.sh"]
+    }
+  },
+  "terminal.integrated.defaultProfile.linux": "pace-cluster (dpsgd-auditbench)"
+}

@@ -63,6 +63,10 @@ cat > "$KERNEL_WRAPPER" <<'WRAPPER_EOF'
 # 1. Load pytorch/25 module (provides torch)
 # 2. Set up PYTHONPATH so Python can find torch
 
+# Log wrapper invocation
+LOG_FILE="$HOME/.local/share/jupyter/kernels/dpsgd-auditbench-env/kernel_wrapper.log"
+echo "$(date '+%Y-%m-%d %H:%M:%S') kernel_wrapper invoked with args: $*" >> "$LOG_FILE"
+
 # Initialize module system
 if [ -f /usr/local/pace-apps/lmod/lmod/init/bash ]; then
     source /usr/local/pace-apps/lmod/lmod/init/bash
@@ -70,6 +74,9 @@ fi
 
 # Load pytorch/25 module
 module load pytorch/25 2>/dev/null
+
+# Reduce CUDA allocator fragmentation for PyTorch
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Get Python version from the Python executable that will be used (from kernel.json)
 # The first argument after the wrapper should be the Python executable path
