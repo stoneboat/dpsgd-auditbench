@@ -108,7 +108,8 @@ def _whitebox_dp_step(
             if param_idx not in canary_dirac["by_param"]:
                 continue
             flat_indices, canary_ids = canary_dirac["by_param"][param_idx]
-            delta = (p.grad - base_summed[param_idx]).view(-1)
+            # delta = (p.grad - base_summed[param_idx]).view(-1)
+            delta = p.grad.view(-1)
             step_scores[canary_ids] = delta[flat_indices]
         scores.append(step_scores.detach().cpu().tolist())
         if include_flags is not None:
