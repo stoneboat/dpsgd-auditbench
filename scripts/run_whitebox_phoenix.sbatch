@@ -1,12 +1,10 @@
 #!/bin/bash
 #SBATCH -J dpsgd-whitebox           # Job name
-#SBATCH -A p-vzikas3                # Account/project
-#SBATCH -q inferno                  # Queue
-#SBATCH -N 1                        # Number of nodes
-#SBATCH --ntasks-per-node=1         # Tasks per node
-#SBATCH --gpus-per-node=H200:1      # GPU type and count (adjust: A100, H100, etc.)
-#SBATCH --mem=32G                   # Memory
-#SBATCH -t 24:00:00                 # Wall time (adjust as needed)
+#SBATCH -A gts-vzikas3                # Account/project
+#SBATCH --partition=gpu-h200
+#SBATCH --gres=gpu:1
+#SBATCH --mem=100G
+#SBATCH --time=24:00:00
 #SBATCH -o logs/slurm-%j.out       # Stdout
 #SBATCH -e logs/slurm-%j.err       # Stderr
 
