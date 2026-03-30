@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH -J dpsgd-whitebox           # Job name
-#SBATCH -A gts-vzikas3                # Account/project
+#SBATCH --job-name=dpsgd_auditbench
+#SBATCH --account=gts-vzikas3
 #SBATCH --partition=gpu-h200
 #SBATCH --gres=gpu:1
 #SBATCH --mem=100G
 #SBATCH --time=24:00:00
-#SBATCH -o logs/slurm-%j.out       # Stdout
-#SBATCH -e logs/slurm-%j.err       # Stderr
+#SBATCH --output=logs/dp_audit_%j.out
+#SBATCH --error=logs/dp_audit_%j.err
 
 # === Module and env setup ===
 module purge
