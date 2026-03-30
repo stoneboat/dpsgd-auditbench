@@ -4,7 +4,7 @@
 #SBATCH -q inferno                  # Queue
 #SBATCH -N 1                        # Number of nodes
 #SBATCH --ntasks-per-node=1         # Tasks per node
-#SBATCH --gpus-per-node=V100:1      # GPU type and count (adjust: A100, H100, etc.)
+#SBATCH --gpus-per-node=H200:1      # GPU type and count (adjust: A100, H100, etc.)
 #SBATCH --mem=32G                   # Memory
 #SBATCH -t 24:00:00                 # Wall time (adjust as needed)
 #SBATCH -o logs/slurm-%j.out       # Stdout
