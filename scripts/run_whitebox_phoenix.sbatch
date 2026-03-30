@@ -9,24 +9,8 @@
 #SBATCH --error=logs/dp_audit_%j.err
 
 # === Module and env setup ===
-module purge
-module load pytorch/25
 module load anaconda3
-
-eval "$(conda shell.bash hook)"
-conda activate /tmp/python-venv/dpsgd-auditbench_venv
-
-# If env doesn't exist on this node, create it
-if [ ! -d "/tmp/python-venv/dpsgd-auditbench_venv" ]; then
-    echo "Env not found, running install script..."
-    bash scripts/local_scripts/cluster_install_gpu.sh
-    eval "$(conda shell.bash hook)"
-    conda activate /tmp/python-venv/dpsgd-auditbench_venv
-fi
-
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-cd $SLURM_SUBMIT_DIR
+conda activate /storage/scratch1/6/aagrawal609/conda_envs/dpsgd_bench
 
 # === Run training ===
 python scripts/gen_scores_DP_whitebox.py \
