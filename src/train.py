@@ -71,19 +71,27 @@ def _whitebox_dp_step(
 
     optimizer._is_last_step_skipped = False
 
-    base_summed = [p.summed_grad.detach().clone() for p in optimizer.params]
-    include = False
+    include_mask = None
     if canary_dirac is not None and canary_prob is not None and canary_prob > 0.0:
         device = canary_dirac["device"]
+        # Per-step sampling: each canary is sampled with prob canary_prob
         include_mask = torch.rand(
             (canary_dirac["num_canaries"],), device=device
         ) < canary_prob
-        if include_mask.any():
+
+        # Only inject IN canaries: AND per-step sampling with membership mask
+        membership_mask = canary_dirac.get("inclusion_mask")
+        if membership_mask is not None:
+            inject_mask = include_mask & membership_mask
+        else:
+            inject_mask = include_mask
+
+        if inject_mask.any():
             for param_idx, p in enumerate(optimizer.params):
                 if param_idx not in canary_dirac["by_param"]:
                     continue
                 flat_indices, canary_ids = canary_dirac["by_param"][param_idx]
-                sel = include_mask[canary_ids]
+                sel = inject_mask[canary_ids]
                 if sel.any():
                     flat = p.summed_grad.view(-1)
                     flat.index_add_(
@@ -96,10 +104,11 @@ def _whitebox_dp_step(
                             dtype=flat.dtype,
                         ),
                     )
-        include = True
 
     optimizer.add_noise()
 
+    # Record scores at ALL canary coordinates (both in and out).
+    # The inclusion_mask (saved separately) determines which is which at analysis time.
     if scores is not None and canary_dirac is not None:
         step_scores = torch.empty(
             (canary_dirac["num_canaries"],), device=canary_dirac["device"]
@@ -108,11 +117,10 @@ def _whitebox_dp_step(
             if param_idx not in canary_dirac["by_param"]:
                 continue
             flat_indices, canary_ids = canary_dirac["by_param"][param_idx]
-            # delta = (p.grad - base_summed[param_idx]).view(-1)
-            delta = p.grad.view(-1)
-            step_scores[canary_ids] = delta[flat_indices]
+            noised_grad = p.grad.view(-1)
+            step_scores[canary_ids] = noised_grad[flat_indices]
         scores.append(step_scores.detach().cpu().tolist())
-        if include_flags is not None:
+        if include_flags is not None and include_mask is not None:
             include_flags.append(include_mask.detach().cpu().tolist())
 
     optimizer.scale_grad()
@@ -241,6 +249,7 @@ def train_whitebox(
     logical_batch_size,
     *,
     canary_dirac_indices=None,
+    canary_inclusion_mask=None,
     canary_prob=None,
     canary_scale=None,
     return_scores=False,
@@ -249,6 +258,9 @@ def train_whitebox(
     """Training function for auditing in whitebox model.
 
     canary_dirac_indices: list of (param_index, flat_index) for dirac canaries.
+    canary_inclusion_mask: boolean array of length num_canaries. True = IN (inject signal),
+        False = OUT (no injection, pure noise). Scores are recorded for ALL canaries.
+        If None, all canaries are injected (legacy behavior).
     canary_prob: probability q of injecting the canary per logical step.
     canary_scale: magnitude (mu) of the canary; defaults to optimizer.max_grad_norm.
     """
@@ -284,10 +296,21 @@ def train_whitebox(
                 torch.tensor(data["ids"], device=device, dtype=torch.long),
             )
 
+        inclusion_mask_t = None
+        if canary_inclusion_mask is not None:
+            inclusion_mask_t = torch.as_tensor(
+                canary_inclusion_mask, device=device, dtype=torch.bool
+            )
+            assert inclusion_mask_t.shape[0] == len(canary_dirac_indices), (
+                f"canary_inclusion_mask length {inclusion_mask_t.shape[0]} != "
+                f"num canaries {len(canary_dirac_indices)}"
+            )
+
         canary_dirac = {
             "by_param": by_param_t,
             "num_canaries": len(canary_dirac_indices),
             "device": device,
+            "inclusion_mask": inclusion_mask_t,
         }
 
     if canary_prob is None:

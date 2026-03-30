@@ -26,7 +26,6 @@ from utils import setup_logging, save_checkpoint, find_latest_checkpoint, load_c
 from dataset import get_data_loaders
 from network_arch import WideResNet
 from train import test, train_whitebox
-from classifier.white_box_dp_sgd import sample_gaussian
 
 # ==========================================
 # Default Hyperparameters (white-box, from notebook)
@@ -180,17 +179,13 @@ def main():
         logger.info(f"Privacy Accountant updated with {loaded_global_step} past steps.")
         total_steps = loaded_global_step if loaded_global_step is not None else 0
 
-        in_scores_path = os.path.join(exp_dir, f'in_scores_{checkpoint_epoch:06d}.csv')
-        out_scores_path = os.path.join(exp_dir, f'out_scores_{checkpoint_epoch:06d}.csv')
-        if os.path.isfile(in_scores_path) and total_steps > 0:
-            in_scores_loaded = np.loadtxt(in_scores_path, delimiter=',')
-            sum_scores = in_scores_loaded * total_steps
+        # Restore sum_scores from saved per-canary sums + inclusion mask
+        sum_scores_path = os.path.join(exp_dir, f'sum_scores_{checkpoint_epoch:06d}.csv')
+        if os.path.isfile(sum_scores_path) and total_steps > 0:
+            sum_scores = np.loadtxt(sum_scores_path, delimiter=',')
             logger.info(
-                f"Loaded in_scores for epoch {checkpoint_epoch} -> restored sum_scores (total_steps={total_steps})"
+                f"Loaded sum_scores for epoch {checkpoint_epoch} (total_steps={total_steps})"
             )
-        if os.path.isfile(out_scores_path):
-            out_scores_loaded = np.loadtxt(out_scores_path, delimiter=',')
-            logger.info(f"Loaded out_scores for epoch {checkpoint_epoch} (same epoch as checkpoint)")
 
         current_eps = privacy_engine.get_epsilon(args.delta)
         logger.info(f"Current Cumulative Epsilon: {current_eps:.2f}")
@@ -207,6 +202,19 @@ def main():
         remaining -= take
         if remaining == 0:
             break
+
+    # Generate or load inclusion mask: True = IN (signal injected), False = OUT (pure noise)
+    mask_path = os.path.join(exp_dir, 'inclusion_mask.csv')
+    if os.path.isfile(mask_path):
+        inclusion_mask = np.loadtxt(mask_path, delimiter=',').astype(bool)
+        logger.info(f"Loaded existing inclusion mask from: {mask_path}")
+    else:
+        inclusion_mask = rng.random(args.canary_count) < args.pkeep
+        np.savetxt(mask_path, inclusion_mask.astype(int), delimiter=',', fmt='%d')
+        logger.info(f"Inclusion mask saved to: {mask_path}")
+    n_in = int(inclusion_mask.sum())
+    n_out = args.canary_count - n_in
+    logger.info(f"Inclusion mask: {n_in} IN canaries, {n_out} OUT canaries (pkeep={args.pkeep})")
 
     logger.info("Starting training...")
     logger.info(f"  Epochs: {args.epochs}, LR: {args.lr}, Momentum: {args.momentum}")
@@ -231,10 +239,11 @@ def main():
             args.max_physical_batch_size,
             args.logical_batch_size,
             canary_dirac_indices=canary_dirac_indices,
+            canary_inclusion_mask=inclusion_mask,
             canary_prob=canary_prob,
             return_scores=True,
         )
-        scores = np.asarray(scores)
+        scores = np.asarray(scores)  # (num_steps, num_canaries)
         assert scores.shape[0] == num_steps, (
             f"scores.shape[0] = {scores.shape[0]} != num_steps = {num_steps}"
         )
@@ -256,20 +265,31 @@ def main():
             save_checkpoint(
                 model, optimizer, epoch, test_acc, ckpt_dir, logger, global_step=total_steps
             )
-            in_scores = sum_scores / total_steps
-            out_canary_observations = sample_gaussian(
-                total_steps, args.canary_count, args.noise_multiplier, rng
-            )
-            out_scores = out_canary_observations.sum(axis=1) / total_steps
+
+            # Split scores by inclusion mask
+            # For paper methods (one-run, f-DP): raw sum
+            in_sum = sum_scores[inclusion_mask]
+            out_sum = sum_scores[~inclusion_mask]
+
+            # For NDIS: normalized by sqrt(T)
+            in_scores_ndis = sum_scores[inclusion_mask] / np.sqrt(total_steps)
+            out_scores_ndis = sum_scores[~inclusion_mask] / np.sqrt(total_steps)
+
             np.savetxt(
-                os.path.join(exp_dir, f'out_scores_{epoch:06d}.csv'),
-                out_scores,
-                delimiter=',',
+                os.path.join(exp_dir, f'in_scores_sum_{epoch:06d}.csv'),
+                in_sum, delimiter=',',
             )
             np.savetxt(
-                os.path.join(exp_dir, f'in_scores_{epoch:06d}.csv'),
-                in_scores,
-                delimiter=',',
+                os.path.join(exp_dir, f'out_scores_sum_{epoch:06d}.csv'),
+                out_sum, delimiter=',',
+            )
+            np.savetxt(
+                os.path.join(exp_dir, f'in_scores_ndis_{epoch:06d}.csv'),
+                in_scores_ndis, delimiter=',',
+            )
+            np.savetxt(
+                os.path.join(exp_dir, f'out_scores_ndis_{epoch:06d}.csv'),
+                out_scores_ndis, delimiter=',',
             )
             np.savetxt(
                 os.path.join(exp_dir, f'privacy_params_{epoch:06d}.csv'),
@@ -277,6 +297,16 @@ def main():
                 delimiter=',',
                 header='current_eps,delta',
                 comments='',
+            )
+            # Save full sum_scores (all canaries) for checkpoint resume
+            np.savetxt(
+                os.path.join(exp_dir, f'sum_scores_{epoch:06d}.csv'),
+                sum_scores, delimiter=',',
+            )
+            logger.info(
+                f"Saved scores at epoch {epoch}: "
+                f"in_sum({n_in}), out_sum({n_out}), "
+                f"in_ndis({n_in}), out_ndis({n_out})"
             )
 
         for handler in logging.getLogger().handlers:
