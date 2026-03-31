@@ -33,11 +33,8 @@ def main():
     parser.add_argument('--delta', type=float, default=1e-5)
     parser.add_argument('--significance', type=float, default=0.05,
                         help='Significance level for paper methods (95%% confidence)')
-    parser.add_argument('--noise-multiplier', type=float, default=3.0)
     parser.add_argument('--fig-dir', type=str, default=None,
                         help='Directory to save figures (default: <project>/fig)')
-    parser.add_argument('--steps-per-epoch', type=int, default=None,
-                        help='Steps per epoch (auto-detected from privacy_params if not set)')
     args = parser.parse_args()
 
     if args.fig_dir is None:
@@ -62,33 +59,6 @@ def main():
 
     print(f"Found score files for epochs: {epochs}")
 
-    # Compute theoretical upper bound
-    # Need opacus for RDP accounting
-    from opacus.accountants import RDPAccountant
-
-    # Detect steps_per_epoch from privacy_params or use provided value
-    # Load hparams if available
-    hparams_path = os.path.join(exp_dir, 'hparams.json')
-    if os.path.isfile(hparams_path):
-        import json
-        with open(hparams_path) as f:
-            hparams = json.load(f)
-        logical_batch_size = hparams.get('logical_batch_size', 4096)
-        noise_multiplier = hparams.get('noise_multiplier', args.noise_multiplier)
-        print(f"Loaded hparams: batch={logical_batch_size}, sigma={noise_multiplier}")
-    else:
-        noise_multiplier = args.noise_multiplier
-        logical_batch_size = 4096
-
-    # CIFAR-10 has 50000 samples, steps_per_epoch = ceil(50000 / batch_size)
-    n_train = 50000
-    if args.steps_per_epoch is not None:
-        steps_per_epoch = args.steps_per_epoch
-    else:
-        steps_per_epoch = int(np.ceil(n_train / logical_batch_size))
-    sample_rate = 1.0 / steps_per_epoch
-    print(f"Steps per epoch: {steps_per_epoch}, sample_rate: {sample_rate:.6f}")
-
     # Run auditing for each epoch
     epoch_list = []
     upper_bounds = []
@@ -103,6 +73,8 @@ def main():
         # Load normalized scores (for NDIS)
         in_ndis_path = os.path.join(exp_dir, f'in_scores_ndis_{epoch:06d}.csv')
         out_ndis_path = os.path.join(exp_dir, f'out_scores_ndis_{epoch:06d}.csv')
+        # Load privacy params saved during training (the ground truth upper bound)
+        privacy_path = os.path.join(exp_dir, f'privacy_params_{epoch:06d}.csv')
 
         if not all(os.path.isfile(p) for p in [in_sum_path, out_sum_path, in_ndis_path, out_ndis_path]):
             print(f"  Epoch {epoch}: missing score files, skipping")
@@ -113,11 +85,13 @@ def main():
         in_ndis = np.loadtxt(in_ndis_path, delimiter=',')
         out_ndis = np.loadtxt(out_ndis_path, delimiter=',')
 
-        # 1. Theoretical upper bound (RDP accounting)
-        total_steps = steps_per_epoch * epoch
-        accountant = RDPAccountant()
-        accountant.history.append((noise_multiplier, sample_rate, total_steps))
-        eps_upper = accountant.get_epsilon(delta=args.delta)
+        # 1. Theoretical upper bound — read from Opacus (saved during training)
+        if os.path.isfile(privacy_path):
+            pp = np.loadtxt(privacy_path, delimiter=',', skiprows=1)
+            eps_upper = float(pp[0]) if pp.ndim == 1 else float(pp[0, 0])
+        else:
+            print(f"  Epoch {epoch}: missing privacy_params, skipping upper bound")
+            eps_upper = float('nan')
 
         # 2. Steinke et al. 2023 (one-run) — raw sum scores
         auditor = CanaryScoreAuditor(in_sum, out_sum)
