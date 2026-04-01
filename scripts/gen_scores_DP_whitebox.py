@@ -39,7 +39,6 @@ DEFAULT_DELTA = 1e-5
 DEFAULT_EPOCHS = 200
 DEFAULT_LR = 4.0
 DEFAULT_MOMENTUM = 0.0
-DEFAULT_NOISE_MULTIPLIER = 3.0
 DEFAULT_CKPT_INTERVAL = 20
 DEFAULT_CANARY_COUNT = 10000
 DEFAULT_PKEEP = 0.5
@@ -59,7 +58,6 @@ def main():
     parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS)
     parser.add_argument('--lr', type=float, default=DEFAULT_LR)
     parser.add_argument('--momentum', type=float, default=DEFAULT_MOMENTUM)
-    parser.add_argument('--noise-multiplier', type=float, default=DEFAULT_NOISE_MULTIPLIER)
     parser.add_argument('--ckpt-interval', type=int, default=DEFAULT_CKPT_INTERVAL)
     # Experiment
     parser.add_argument('--canary-count', type=int, default=DEFAULT_CANARY_COUNT)
@@ -123,7 +121,6 @@ def main():
         'epochs': args.epochs,
         'lr': args.lr,
         'momentum': args.momentum,
-        'noise_multiplier': args.noise_multiplier,
         'ckpt_interval': args.ckpt_interval,
         'canary_count': args.canary_count,
         'pkeep': args.pkeep,
@@ -149,13 +146,20 @@ def main():
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
     logger.info("Setting up privacy engine...")
     privacy_engine = PrivacyEngine()
-    model, optimizer, train_loader = privacy_engine.make_private(
+    model, optimizer, train_loader = privacy_engine.make_private_with_epsilon(
         module=model,
         optimizer=optimizer,
         data_loader=train_loader,
-        noise_multiplier=args.noise_multiplier,
+        epochs=args.epochs,
+        target_epsilon=args.epsilon,
+        target_delta=args.delta,
         max_grad_norm=args.max_grad_norm,
     )
+    noise_multiplier = optimizer.noise_multiplier
+    logger.info(f"Opacus computed noise_multiplier={noise_multiplier:.4f} for epsilon={args.epsilon}, delta={args.delta}, epochs={args.epochs}")
+    params['noise_multiplier'] = noise_multiplier
+    with open(hparams_path, 'w') as f:
+        json.dump(params, f, indent=2)
 
     # Checkpoint loading
     start_epoch = 1
@@ -173,7 +177,7 @@ def main():
         steps_per_epoch = len(train_loader)
         sample_rate = 1 / len(train_loader)
         privacy_engine.accountant.history.append(
-            (args.noise_multiplier, sample_rate, loaded_global_step)
+            (noise_multiplier, sample_rate, loaded_global_step)
         )
         logger.info(f"Resumed from Epoch {start_epoch}")
         logger.info(f"Privacy Accountant updated with {loaded_global_step} past steps.")
@@ -221,7 +225,7 @@ def main():
     logger.info(f"  Logical batch size: {args.logical_batch_size}")
     logger.info(f"  Max physical batch size: {args.max_physical_batch_size}")
     logger.info(f"  Aug multiplicity: {args.aug_multiplicity}")
-    logger.info(f"  Noise multiplier: {args.noise_multiplier}")
+    logger.info(f"  Noise multiplier (computed): {noise_multiplier:.4f}")
     logger.info(f"  Canary count: {args.canary_count}, P(keep): {args.pkeep}")
     logger.info(f"  Checkpoint interval: {args.ckpt_interval} epochs")
 
