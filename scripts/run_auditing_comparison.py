@@ -215,22 +215,18 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
                header='target_epsilon,upper_bound,steinke_2023,fdp_2024,ndis', comments='')
     print(f"\nResults saved to: {results_path}")
 
-    # Grouped bar chart
-    x = np.arange(len(target_epsilons))
-    width = 0.2
+    # Line plot (same style as single-experiment plot, but x-axis = target epsilon)
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.bar(x - 1.5 * width, upper_bounds, width, label='Theoretical (RDP)', color='#4472C4')
-    ax.bar(x - 0.5 * width, steinke_bounds, width, label='Steinke 2023', color='#ED7D31')
-    ax.bar(x + 0.5 * width, fdp_bounds, width, label='Mahloujifar 2024', color='#70AD47')
-    ax.bar(x + 1.5 * width, ndis_bounds, width, label='NDIS (ours)', color='#9B59B6')
-
+    ax.plot(target_epsilons, upper_bounds, 'b-o', label='Upper bound (RDP)', linewidth=2)
+    ax.plot(target_epsilons, steinke_bounds, 'r-s', label='Steinke 2023 (one-run)', linewidth=2)
+    ax.plot(target_epsilons, fdp_bounds, 'g-^', label='Mahloujifar 2024 (f-DP)', linewidth=2)
+    ax.plot(target_epsilons, ndis_bounds, 'm-D', label='NDIS (ours)', linewidth=2)
     ax.set_xlabel('Target Epsilon', fontsize=12)
     ax.set_ylabel('Epsilon', fontsize=12)
-    ax.set_title('Theoretical vs Empirical Privacy (Final Epoch)', fontsize=14)
-    ax.set_xticks(x)
-    ax.set_xticklabels([str(e) for e in target_epsilons])
+    ax.set_title('Privacy Bounds Comparison: Upper (theoretical) vs Lower (empirical)', fontsize=14)
+    ax.set_xticks(target_epsilons)
     ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3, axis='y')
+    ax.grid(True, alpha=0.3)
     fig.tight_layout()
 
     fig_path = os.path.join(fig_dir, 'privacy_bounds_comparison_multi_eps.png')
