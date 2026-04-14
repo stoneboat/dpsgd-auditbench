@@ -1,10 +1,19 @@
 ## dpsgd-auditbench
 
-This repository provides an end-to-end codebase for training and auditing differentially private SGD (DP-SGD) models.
+This repository supports the rebuttal auditing evaluation for NDIS-based privacy auditing, while also keeping the DP-SGD training and one-run auditing workflows used to generate the experiments.
 
 It includes PyTorch implementations of DP-SGD training pipelines for image classification, including (i) the DP-SGD training procedure from the paper "Unlocking High-Accuracy Differentially Private Image Classification through Scale", and (ii) the auditable DP-SGD training procedure from the paper "Privacy Auditing with One Training Run".
 
 The code also includes privacy auditing workflows, including sequential auditing as described in the paper "Sequential Auditing for f-Differential Privacy".
+
+### Auditing evaluation
+
+The main auditing results for the rebuttal are in the NDIS and one-run auditing notebooks:
+
+- `Notebooks/NDIS/gaussian_whitebox_audit.ipynb`: white-box audit of the Gaussian mechanism with `eps=1` and `delta=1e-5`. This notebook uses the known Gaussian parameters to evaluate the exact pairwise privacy curve, giving a deterministic baseline.
+- `Notebooks/NDIS/gaussian_parametric_blackbox_audit.ipynb`: Gaussian parametric black-box audit for the same target privacy point. This notebook estimates the Gaussian parameters from output samples, plugs those estimates into the exact Gaussian-pair formula, and uses the bootstrap upper confidence bound to make the audit decision. It contains the convergence table for sample sizes `n=10^3, 10^4, 10^5`; the conservative upper estimate of `delta` at `eps=1` tightens from `0.000197343` at `n=10^3` to `1.37279e-05` at `n=10^5`, approaching the true value `1e-5`. The pointwise 95% bootstrap interval contains the true value for all three reported sample sizes.
+- `Notebooks/white_box/simulation_one_run_auditing.ipynb`: one-run DP-SGD auditing simulation for approximately Gaussian outputs. This is the notebook to inspect for the rebuttal comparison against the "Privacy Auditing with One (1) Training Run" baseline. In the saved 200-epoch output, the theoretical upper bound is `6.91`, the baseline lower bound is `1.86`, the NDIS lower bound in the white-box setting is `6.48`, and the NDIS lower bound in the parametric black-box setting is `5.79`.
+- `src/whitebox_auditing/ndis_1d.py`: helper implementation for the 1D Gaussian NDIS calculations, including the closed-form `delta(eps)` routine and the `eps`-from-`delta` root finder used by the one-run auditing workflow.
 
 ### INSTALLING
 
@@ -39,3 +48,5 @@ We also provide a script `train_auditable_DP_model.py` in the `scripts` director
 #### Generating audit observations
 
 To generate observations for auditing, run the notebook `infer_auditable_DP_model.ipynb`. This notebook computes losses and audit scores for all canaries across all checkpoints and saves them in the `logits` and `scores` directories. To visualize basic statistics of these observations, see the notebook `plot_auditable_DP_model.ipynb`. 
+
+For the rebuttal auditing figures and numbers, use the notebooks listed in the **Auditing evaluation** section above rather than this observation-generation workflow.
