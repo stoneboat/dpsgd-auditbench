@@ -147,9 +147,11 @@ def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_p
     losses = []
     
     # Augmentation transform
+    # Sander et al. (2023) / Mahloujifar et al. (2024) augmentation recipe.
     augment_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
+        transforms.RandomCrop(32, padding=20, padding_mode='reflect'),
         transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
     ])
     normalize_transform = transforms.Normalize(
         (0.4914, 0.4822, 0.4465),
@@ -254,6 +256,9 @@ def train_whitebox(
     canary_scale=None,
     return_scores=False,
     return_include_flags=False,
+    ema_model=None,
+    ema_decay=0.9999,
+    max_logical_steps=None,
 ):
     """Training function for auditing in whitebox model.
 
@@ -321,9 +326,11 @@ def train_whitebox(
         canary_scale = 1.0
     
     # Augmentation transform
+    # Sander et al. (2023) / Mahloujifar et al. (2024) augmentation recipe.
     augment_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
+        transforms.RandomCrop(32, padding=20, padding_mode='reflect'),
         transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
     ])
     normalize_transform = transforms.Normalize(
         (0.4914, 0.4822, 0.4465),
@@ -411,11 +418,21 @@ def train_whitebox(
             if samples_in_current_logical_batch >= logical_batch_size:
                 num_logical_steps += 1
                 samples_in_current_logical_batch = 0  # Reset for next logical batch
-            
+
+                if ema_model is not None:
+                    with torch.no_grad():
+                        for p_ema, p in zip(ema_model.parameters(), model.parameters()):
+                            p_ema.data.mul_(ema_decay).add_(p.data, alpha=1.0 - ema_decay)
+                        for b_ema, b in zip(ema_model.buffers(), model.buffers()):
+                            b_ema.data.copy_(b.data)
+
+                if max_logical_steps is not None and num_logical_steps >= max_logical_steps:
+                    break
+
             losses.append(loss.item())
             if i % 10 == 0:
                 pbar.set_postfix(loss=np.mean(losses[-10:]))
-    
+
     if return_scores:
         num_logical_steps = len(scores)
         if return_include_flags:

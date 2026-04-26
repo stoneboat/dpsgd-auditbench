@@ -19,16 +19,18 @@ EPS=${EPSILONS[$SLURM_ARRAY_TASK_ID]}
 
 echo "Running with target epsilon=${EPS} (array task ${SLURM_ARRAY_TASK_ID})"
 
-# === Run training ===
+# === Run training (Sander/Mahloujifar recipe: 2500 steps, K=16, EMA 0.9999) ===
 python scripts/gen_scores_DP_whitebox.py \
-    --epochs 200 \
+    --epochs 300 \
+    --target-steps 2500 \
+    --ema-decay 0.9999 \
     --ckpt-interval 20 \
     --canary-count 5000 \
     --pkeep 0.5 \
     --epsilon ${EPS} \
     --logical-batch-size 4096 \
     --max-physical-batch-size 128 \
-    --aug-multiplicity 1 \
+    --aug-multiplicity 16 \
     --lr 4.0 \
     --data-dir ./data \
     --log-dir ./logs

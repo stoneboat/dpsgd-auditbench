@@ -7,6 +7,7 @@ privacy_params at each checkpoint interval (same logic as train_auditable_DP_mod
 
 import sys
 import os
+import math
 import json
 import secrets
 import argparse
@@ -37,6 +38,8 @@ DEFAULT_MAX_GRAD_NORM = 1.0
 DEFAULT_EPSILON = 8.0
 DEFAULT_DELTA = 1e-5
 DEFAULT_EPOCHS = 200
+DEFAULT_TARGET_STEPS = 2500   # Sander/Mahloujifar setting
+DEFAULT_EMA_DECAY = 0.9999    # Sander/Mahloujifar setting
 DEFAULT_LR = 4.0
 DEFAULT_MOMENTUM = 0.0
 DEFAULT_CKPT_INTERVAL = 20
@@ -55,7 +58,12 @@ def main():
     parser.add_argument('--max-grad-norm', type=float, default=DEFAULT_MAX_GRAD_NORM)
     parser.add_argument('--epsilon', type=float, default=DEFAULT_EPSILON)
     parser.add_argument('--delta', type=float, default=DEFAULT_DELTA)
-    parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS,
+                        help='Hard cap on epochs; training also stops when --target-steps is reached.')
+    parser.add_argument('--target-steps', type=int, default=DEFAULT_TARGET_STEPS,
+                        help='Total DP-SGD steps to run (Sander/Mahloujifar use 2500). Privacy budget is calibrated to this exact step count.')
+    parser.add_argument('--ema-decay', type=float, default=DEFAULT_EMA_DECAY,
+                        help='Decay for the exponential moving average of model weights used at evaluation. Set to 0 to disable.')
     parser.add_argument('--lr', type=float, default=DEFAULT_LR)
     parser.add_argument('--momentum', type=float, default=DEFAULT_MOMENTUM)
     parser.add_argument('--ckpt-interval', type=int, default=DEFAULT_CKPT_INTERVAL)
@@ -119,6 +127,8 @@ def main():
         'epsilon': args.epsilon,
         'delta': args.delta,
         'epochs': args.epochs,
+        'target_steps': args.target_steps,
+        'ema_decay': args.ema_decay,
         'lr': args.lr,
         'momentum': args.momentum,
         'ckpt_interval': args.ckpt_interval,
@@ -144,19 +154,50 @@ def main():
     logger.info("Creating model...")
     model = WideResNet(depth=16, widen_factor=4).to(device)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
+
+    # Calibrate the privacy budget to the *target step count*, not to args.epochs.
+    # Opacus computes sigma from (target_eps, target_delta, sample_rate, epochs);
+    # total budgeted steps = epochs * len(orig_loader). We pick epochs so the
+    # budget covers exactly args.target_steps.
+    steps_per_epoch_pre = max(1, len(train_loader))
+    epochs_for_priv = max(
+        1, math.ceil(args.target_steps / steps_per_epoch_pre)
+    )
+    epochs_cap = min(args.epochs, epochs_for_priv)
+    logger.info(
+        f"steps_per_epoch (pre-Opacus) = {steps_per_epoch_pre}, "
+        f"target_steps = {args.target_steps}, "
+        f"epochs_for_privacy = {epochs_for_priv}, epochs_cap = {epochs_cap}"
+    )
+
     logger.info("Setting up privacy engine...")
     privacy_engine = PrivacyEngine()
     model, optimizer, train_loader = privacy_engine.make_private_with_epsilon(
         module=model,
         optimizer=optimizer,
         data_loader=train_loader,
-        epochs=args.epochs,
+        epochs=epochs_for_priv,
         target_epsilon=args.epsilon,
         target_delta=args.delta,
         max_grad_norm=args.max_grad_norm,
     )
     noise_multiplier = optimizer.noise_multiplier
-    logger.info(f"Opacus computed noise_multiplier={noise_multiplier:.4f} for epsilon={args.epsilon}, delta={args.delta}, epochs={args.epochs}")
+    logger.info(f"Opacus computed noise_multiplier={noise_multiplier:.4f} for epsilon={args.epsilon}, delta={args.delta}, epochs={epochs_for_priv}")
+
+    # ---- EMA: Sander et al. / Mahloujifar et al. eval on EMA weights, not live weights.
+    if args.ema_decay > 0:
+        ema_model = WideResNet(depth=16, widen_factor=4).to(device).eval()
+        with torch.no_grad():
+            for p_ema, p in zip(ema_model.parameters(), model.parameters()):
+                p_ema.data.copy_(p.data)
+            for b_ema, b in zip(ema_model.buffers(), model.buffers()):
+                b_ema.data.copy_(b.data)
+        for p in ema_model.parameters():
+            p.requires_grad_(False)
+        logger.info(f"EMA enabled with decay {args.ema_decay}")
+    else:
+        ema_model = None
+        logger.info("EMA disabled (--ema-decay 0)")
     params['noise_multiplier'] = noise_multiplier
     with open(hparams_path, 'w') as f:
         json.dump(params, f, indent=2)
@@ -182,6 +223,18 @@ def main():
         logger.info(f"Resumed from Epoch {start_epoch}")
         logger.info(f"Privacy Accountant updated with {loaded_global_step} past steps.")
         total_steps = loaded_global_step if loaded_global_step is not None else 0
+
+        # Restore EMA state if present
+        if ema_model is not None:
+            ema_path = os.path.join(ckpt_dir, f'ema_state_{checkpoint_epoch:06d}.pt')
+            if os.path.isfile(ema_path):
+                ema_model.load_state_dict(torch.load(ema_path, map_location=device))
+                logger.info(f"Loaded EMA state from {ema_path}")
+            else:
+                logger.info(
+                    f"No EMA state at {ema_path}; re-initializing EMA from current model "
+                    "(estimate will be biased for the first few hundred steps)."
+                )
 
         # Restore sum_scores from saved per-canary sums + inclusion mask
         sum_scores_path = os.path.join(exp_dir, f'sum_scores_{checkpoint_epoch:06d}.csv')
@@ -232,7 +285,11 @@ def main():
     final_test_acc = None
     canary_prob = 1.0 / len(train_loader)
 
-    for epoch in range(start_epoch, args.epochs + 1):
+    for epoch in range(start_epoch, epochs_cap + 1):
+        steps_remaining = args.target_steps - total_steps
+        if steps_remaining <= 0:
+            logger.info(f"Reached target_steps={args.target_steps} at epoch {epoch-1}; stopping.")
+            break
         train_loss, num_steps, scores = train_whitebox(
             model,
             optimizer,
@@ -246,6 +303,9 @@ def main():
             canary_inclusion_mask=inclusion_mask,
             canary_prob=canary_prob,
             return_scores=True,
+            ema_model=ema_model,
+            ema_decay=args.ema_decay,
+            max_logical_steps=steps_remaining,
         )
         scores = np.asarray(scores)  # (num_steps, num_canaries)
         assert scores.shape[0] == num_steps, (
@@ -257,7 +317,9 @@ def main():
             sum_scores = sum_scores + scores.sum(axis=0)
 
         total_steps += num_steps
-        test_acc = test(model, test_loader, device)
+        # Sander/Mahloujifar evaluate on EMA weights when EMA is enabled.
+        eval_model = ema_model if ema_model is not None else model
+        test_acc = test(eval_model, test_loader, device)
         epsilon = privacy_engine.get_epsilon(delta=args.delta)
         logger.info(
             f"Epoch {epoch} - Train Loss: {train_loss:.4f}, Test Accuracy: {test_acc:.2f}%, "
@@ -269,6 +331,10 @@ def main():
             save_checkpoint(
                 model, optimizer, epoch, test_acc, ckpt_dir, logger, global_step=total_steps
             )
+            if ema_model is not None:
+                ema_path = os.path.join(ckpt_dir, f'ema_state_{epoch:06d}.pt')
+                torch.save(ema_model.state_dict(), ema_path)
+                logger.info(f"Saved EMA state to {ema_path}")
 
             # Split scores by inclusion mask
             # For paper methods (one-run, f-DP): raw sum
