@@ -1,9 +1,24 @@
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
+import torchvision.transforms.v2 as transforms_v2
 import numpy as np
 from opacus.utils.batch_memory_manager import BatchMemoryManager
 from tqdm import tqdm
+
+
+_PER_IMAGE_AUG = transforms_v2.Compose([
+    transforms_v2.RandomCrop(32, padding=20, padding_mode='reflect'),
+    transforms_v2.RandomHorizontalFlip(),
+    transforms_v2.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
+])
+
+
+def _augment_per_image(images):
+    # torchvision v2 transforms applied to a batched tensor still share one
+    # random state across the batch; vmap over the batch dim to get independent
+    # augmentations per image (Sander et al. / Mahloujifar et al. recipe).
+    return torch.stack([_PER_IMAGE_AUG(img) for img in images])
 
 
 def make_dirac_canary_like(params, param_index=0, flat_index=0, device=None, dtype=None):
@@ -148,11 +163,9 @@ def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_p
     
     # Augmentation transform
     # Sander et al. (2023) / Mahloujifar et al. (2024) augmentation recipe.
-    augment_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=20, padding_mode='reflect'),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
-    ])
+    # torchvision v1 Compose on a batched tensor applies the SAME random params
+    # to every image in the batch; we want per-image randomness, so we apply per
+    # image inside the K loop below via _augment_per_image().
     normalize_transform = transforms.Normalize(
         (0.4914, 0.4822, 0.4465),
         (0.2023, 0.1994, 0.2010),
@@ -183,7 +196,7 @@ def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_p
             aug_images = []
             for _ in range(aug_multiplicity):
                 # Augment requires BCHW
-                aug_images.append(augment_transform(images))
+                aug_images.append(_augment_per_image(images))
             
             # Stack: [K, B, C, H, W] -> [B*K, C, H, W]
             aug_images = torch.stack(aug_images).transpose(0, 1).reshape(-1, 3, 32, 32)
@@ -258,6 +271,7 @@ def train_whitebox(
     return_include_flags=False,
     ema_model=None,
     ema_decay=0.9999,
+    ema_step_offset=0,
     max_logical_steps=None,
 ):
     """Training function for auditing in whitebox model.
@@ -327,11 +341,9 @@ def train_whitebox(
     
     # Augmentation transform
     # Sander et al. (2023) / Mahloujifar et al. (2024) augmentation recipe.
-    augment_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=20, padding_mode='reflect'),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
-    ])
+    # torchvision v1 Compose on a batched tensor applies the SAME random params
+    # to every image in the batch; we want per-image randomness, so we apply per
+    # image inside the K loop below via _augment_per_image().
     normalize_transform = transforms.Normalize(
         (0.4914, 0.4822, 0.4465),
         (0.2023, 0.1994, 0.2010),
@@ -362,7 +374,7 @@ def train_whitebox(
             aug_images = []
             for _ in range(aug_multiplicity):
                 # Augment requires BCHW
-                aug_images.append(augment_transform(images))
+                aug_images.append(_augment_per_image(images))
             
             # Stack: [K, B, C, H, W] -> [B*K, C, H, W]
             aug_images = torch.stack(aug_images).transpose(0, 1).reshape(-1, 3, 32, 32)
@@ -420,9 +432,13 @@ def train_whitebox(
                 samples_in_current_logical_batch = 0  # Reset for next logical batch
 
                 if ema_model is not None:
+                    # TIMM-style warmup so the EMA isn't dominated by the random init
+                    # over short training runs (Sander et al. recipe: 2500 steps).
+                    global_step = ema_step_offset + num_logical_steps
+                    effective_decay = min(ema_decay, (1.0 + global_step) / (10.0 + global_step))
                     with torch.no_grad():
                         for p_ema, p in zip(ema_model.parameters(), model.parameters()):
-                            p_ema.data.mul_(ema_decay).add_(p.data, alpha=1.0 - ema_decay)
+                            p_ema.data.mul_(effective_decay).add_(p.data, alpha=1.0 - effective_decay)
                         for b_ema, b in zip(ema_model.buffers(), model.buffers()):
                             b_ema.data.copy_(b.data)
 

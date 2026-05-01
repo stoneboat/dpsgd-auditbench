@@ -305,6 +305,7 @@ def main():
             return_scores=True,
             ema_model=ema_model,
             ema_decay=args.ema_decay,
+            ema_step_offset=total_steps,
             max_logical_steps=steps_remaining,
         )
         scores = np.asarray(scores)  # (num_steps, num_canaries)
@@ -317,12 +318,19 @@ def main():
             sum_scores = sum_scores + scores.sum(axis=0)
 
         total_steps += num_steps
-        # Sander/Mahloujifar evaluate on EMA weights when EMA is enabled.
-        eval_model = ema_model if ema_model is not None else model
-        test_acc = test(eval_model, test_loader, device)
+        # Sander/Mahloujifar evaluate on EMA weights when EMA is enabled, but
+        # also log the live-model accuracy so we can spot EMA-vs-live drift.
+        live_acc = test(model, test_loader, device)
+        if ema_model is not None:
+            ema_acc = test(ema_model, test_loader, device)
+            test_acc = ema_acc
+        else:
+            ema_acc = float('nan')
+            test_acc = live_acc
         epsilon = privacy_engine.get_epsilon(delta=args.delta)
         logger.info(
-            f"Epoch {epoch} - Train Loss: {train_loss:.4f}, Test Accuracy: {test_acc:.2f}%, "
+            f"Epoch {epoch} - Train Loss: {train_loss:.4f}, "
+            f"Live Acc: {live_acc:.2f}%, EMA Acc: {ema_acc:.2f}%, "
             f"Epsilon: {epsilon:.2f}, Delta: {args.delta}, Steps: {num_steps}, Total Steps: {total_steps}"
         )
         final_test_acc = test_acc
