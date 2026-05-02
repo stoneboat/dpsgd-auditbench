@@ -249,16 +249,27 @@ def main():
     else:
         logger.info("No checkpoint found. Starting from scratch.")
 
-    # Build dirac canaries (same as notebook)
+    # Build dirac canaries: random non-repeating coords across the WHOLE model.
+    # Sequential indexing puts every canary into conv1 + early layer1, which
+    # corrupts the feature-extractor stem (each IN canary drifts that coord by
+    # ~q*C*lr*T/B = +0.2 over training; with all conv1 coords being canaries
+    # this destroys early filters). Mahloujifar et al. explicitly say "we make
+    # sure the indices selected in our experiments do not have any repetitions"
+    # -- they sample uniformly. We do the same here.
     params_list = list(model.parameters())
+    total_coords = sum(p.numel() for p in params_list)
+    if args.canary_count > total_coords:
+        raise ValueError(
+            f"canary_count={args.canary_count} > total model coords {total_coords}"
+        )
+    flat_offsets = np.cumsum([0] + [p.numel() for p in params_list])
+    chosen_flat = rng.choice(total_coords, size=args.canary_count, replace=False)
+    chosen_flat.sort()
     canary_dirac_indices = []
-    remaining = args.canary_count
-    for p_idx, p in enumerate(params_list):
-        take = min(remaining, p.numel())
-        canary_dirac_indices.extend((p_idx, i) for i in range(take))
-        remaining -= take
-        if remaining == 0:
-            break
+    for f in chosen_flat:
+        p_idx = int(np.searchsorted(flat_offsets[1:], f, side="right"))
+        within = int(f - flat_offsets[p_idx])
+        canary_dirac_indices.append((p_idx, within))
 
     # Generate or load inclusion mask: True = IN (signal injected), False = OUT (pure noise)
     mask_path = os.path.join(exp_dir, 'inclusion_mask.csv')
