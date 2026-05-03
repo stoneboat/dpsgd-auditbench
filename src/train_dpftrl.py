@@ -320,68 +320,75 @@ def train_dpftrl_whitebox(
     accum_grad: List[torch.Tensor] = [torch.zeros_like(p) for p in params]
     leaves_done = 0
 
-    pbar = tqdm(train_loader, desc="DP-FTRL", unit="batch")
-    for images, labels in pbar:
-        if leaves_done >= target_steps:
-            break
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+    pbar = tqdm(total=target_steps, desc="DP-FTRL", unit="leaf")
+    while leaves_done < target_steps:
+        for images, labels in train_loader:
+            if leaves_done >= target_steps:
+                break
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
-        # Augmentation multiplicity: B -> B*K with per-image augmentations.
-        aug = [_augment_per_image(images) for _ in range(aug_multiplicity)]
-        aug = torch.stack(aug).transpose(0, 1).reshape(-1, 3, 32, 32)
-        aug = normalize(aug)
-        aug_labels = labels.repeat_interleave(aug_multiplicity)
+            # Augmentation multiplicity: B -> B*K with per-image augmentations.
+            aug = [_augment_per_image(images) for _ in range(aug_multiplicity)]
+            aug = torch.stack(aug).transpose(0, 1).reshape(-1, 3, 32, 32)
+            aug = normalize(aug)
+            aug_labels = labels.repeat_interleave(aug_multiplicity)
 
-        # Forward + backward (per-sample grads via GradSampleModule).
-        for p in params:
-            if hasattr(p, "grad_sample"):
-                p.grad_sample = None
-            p.grad = None
-        outputs = model(aug)
-        loss_per_sample = criterion(outputs, aug_labels)
-        loss_per_sample.sum().backward()
+            # Forward + backward (per-sample grads via GradSampleModule).
+            for p in params:
+                if hasattr(p, "grad_sample"):
+                    p.grad_sample = None
+                p.grad = None
+            outputs = model(aug)
+            loss_per_sample = criterion(outputs, aug_labels)
+            loss_per_sample.sum().backward()
 
-        # Reduce B*K -> B by averaging over K augmentations.
-        for p in params:
-            gs = p.grad_sample
-            B_K = gs.shape[0]
-            B = B_K // aug_multiplicity
-            p.grad_sample = gs.view(B, aug_multiplicity, *gs.shape[1:]).mean(dim=1)
+            # Reduce B*K -> B by averaging over K augmentations.
+            for p in params:
+                gs = p.grad_sample
+                B_K = gs.shape[0]
+                B = B_K // aug_multiplicity
+                p.grad_sample = gs.view(B, aug_multiplicity, *gs.shape[1:]).mean(dim=1)
 
-        # Per-sample clip + sum (no noise here -- tree noise is added in state.step).
-        clipped_sum = _clip_and_sum_grad_samples(params, max_grad_norm=max_grad_norm)
-        for a, c in zip(accum_grad, clipped_sum):
-            a.add_(c)
-        samples_in_batch += images.shape[0]
+            # Per-sample clip + sum (no noise here -- tree noise is added in state.step).
+            clipped_sum = _clip_and_sum_grad_samples(params, max_grad_norm=max_grad_norm)
+            for a, c in zip(accum_grad, clipped_sum):
+                a.add_(c)
+            samples_in_batch += images.shape[0]
 
-        if samples_in_batch >= logical_batch_size:
-            # ---- one DP-FTRL step ----
-            noisy_G = state.step(accum_grad, leaves_done)
+            if samples_in_batch >= logical_batch_size:
+                # ---- one DP-FTRL step ----
+                noisy_G = state.step(accum_grad, leaves_done)
 
-            # FTRL update: theta = theta_init - lr * G_t_noisy.
-            with torch.no_grad():
-                for p, init, n in zip(params, theta_init, noisy_G):
-                    p.data.copy_(init - lr * n)
-
-            losses.append(float(loss_per_sample.mean().item()) * aug_multiplicity)
-            leaves_done += 1
-            samples_in_batch = 0
-            for a in accum_grad:
-                a.zero_()
-
-            # EMA on model parameters (TIMM-style warmup -- matches DP-SGD path).
-            if ema_model is not None:
-                global_step = ema_step_offset + leaves_done
-                effective_decay = min(ema_decay, (1.0 + global_step) / (10.0 + global_step))
+                # FTRL update: theta = theta_init - (lr / B) * G_t_noisy.
+                # accum_grad is a SUM of B clipped per-sample grads (sensitivity C
+                # per leaf, matching sigma_node calibration). Dividing by the
+                # logical batch size here puts the update on the same per-step
+                # scale as DP-SGD's mean-grad SGD step.
+                step_scale = lr / float(logical_batch_size)
                 with torch.no_grad():
-                    for p_ema, p in zip(ema_model.parameters(), params):
-                        p_ema.data.mul_(effective_decay).add_(p.data, alpha=1.0 - effective_decay)
-                    for b_ema, b in zip(ema_model.buffers(), model.buffers()):
-                        b_ema.data.copy_(b.data)
+                    for p, init, n in zip(params, theta_init, noisy_G):
+                        p.data.copy_(init - step_scale * n)
 
-            if leaves_done % 10 == 0:
-                pbar.set_postfix(step=leaves_done, loss=np.mean(losses[-10:]))
+                losses.append(float(loss_per_sample.mean().item()) * aug_multiplicity)
+                leaves_done += 1
+                samples_in_batch = 0
+                for a in accum_grad:
+                    a.zero_()
+                pbar.update(1)
+
+                # EMA on model parameters (TIMM-style warmup -- matches DP-SGD path).
+                if ema_model is not None:
+                    global_step = ema_step_offset + leaves_done
+                    effective_decay = min(ema_decay, (1.0 + global_step) / (10.0 + global_step))
+                    with torch.no_grad():
+                        for p_ema, p in zip(ema_model.parameters(), params):
+                            p_ema.data.mul_(effective_decay).add_(p.data, alpha=1.0 - effective_decay)
+                        for b_ema, b in zip(ema_model.buffers(), model.buffers()):
+                            b_ema.data.copy_(b.data)
+
+                if leaves_done % 10 == 0:
+                    pbar.set_postfix(step=leaves_done, loss=np.mean(losses[-10:]))
 
     return losses, state, leaves_done
 
