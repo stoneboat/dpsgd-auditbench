@@ -222,15 +222,15 @@ def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_p
                     
                     # Reshape [B, K, ...]
                     gs_view = gs.view(B_K // aug_multiplicity, aug_multiplicity, *feature_shape)
-                    
-                    # Average over K
-                    gs_avg = gs_view.mean(dim=1)
-                    
+
+                    # Sum over K augs. instead of mean
+                    gs_sum = gs_view.sum(dim=1)
+
                     # Replace grad_sample
-                    p.grad_sample = gs_avg
-            
+                    p.grad_sample = gs_sum
+
             # --- OPTIMIZER STEP ---
-            # BatchMemoryManager controls this. 
+            # BatchMemoryManager controls this.
             # If it's a partial batch, Opacus clips and accumulates.
             # If it's the end of logical batch, Opacus noises and updates.
             optimizer.step()
@@ -400,15 +400,17 @@ def train_whitebox(
                     
                     # Reshape [B, K, ...]
                     gs_view = gs.view(B_K // aug_multiplicity, aug_multiplicity, *feature_shape)
-                    
-                    # Average over K
-                    gs_avg = gs_view.mean(dim=1)
-                    
+
+                    # Sum over K augs (see the train() function above for the full
+                    # rationale). This makes per-logical-sample grad norm ~K * g_i so
+                    # clipping at C=1 reliably saturates and uses the full DP budget.
+                    gs_sum = gs_view.sum(dim=1)
+
                     # Replace grad_sample
-                    p.grad_sample = gs_avg
-            
+                    p.grad_sample = gs_sum
+
             # --- OPTIMIZER STEP ---
-            # BatchMemoryManager controls this. 
+            # BatchMemoryManager controls this.
             # If it's a partial batch, Opacus clips and accumulates.
             # If it's the end of logical batch, Opacus noises and updates.
             _whitebox_dp_step(
