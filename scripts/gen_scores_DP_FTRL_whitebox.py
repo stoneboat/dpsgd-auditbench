@@ -148,9 +148,13 @@ def main():
         json.dump(params, f, indent=2)
 
     logger.info("Loading data...")
+    # DP-FTRL has no Opacus BatchMemoryManager; build the loader with the
+    # physical batch size so each forward pass fits in GPU memory. The
+    # accumulation loop in train_dpftrl_whitebox composes physical batches
+    # back up to logical_batch_size before each tree-mechanism step.
     train_loader, test_dataset = get_data_loaders(
         data_dir=args.data_dir,
-        logical_batch_size=args.logical_batch_size,
+        logical_batch_size=args.max_physical_batch_size,
         num_workers=args.num_workers,
     )
     test_loader = torch.utils.data.DataLoader(
