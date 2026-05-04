@@ -22,6 +22,42 @@ import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 
+_RC = {
+    'font.family': 'DejaVu Sans',
+    'font.size': 11,
+    'axes.titlesize': 12,
+    'axes.labelsize': 11,
+    'axes.spines.top': False,
+    'axes.spines.right': False,
+    'axes.linewidth': 0.8,
+    'axes.grid': True,
+    'grid.color': '#cccccc',
+    'grid.linewidth': 0.5,
+    'grid.alpha': 0.7,
+    'xtick.major.size': 3,
+    'ytick.major.size': 3,
+    'xtick.major.width': 0.8,
+    'ytick.major.width': 0.8,
+    'legend.frameon': False,
+    'legend.fontsize': 10,
+    'figure.dpi': 120,
+}
+_STYLE = {
+    'upper':   {'color': '#555555', 'marker': '',  'linestyle': '--', 'linewidth': 1.5, 'markersize': 0,  'zorder': 1, 'label': 'Theoretical (upper bound)'},
+    'steinke': {'color': '#1f77b4', 'marker': 'o', 'linestyle': '-',  'linewidth': 1.4, 'markersize': 5,  'zorder': 2, 'label': 'Steinke et al. 2023'},
+    'fdp':     {'color': '#2ca02c', 'marker': 's', 'linestyle': '-',  'linewidth': 1.4, 'markersize': 5,  'zorder': 3, 'label': 'Mahloujifar et al. 2024 (f-DP)'},
+    'ndis':    {'color': '#d62728', 'marker': 'D', 'linestyle': '-',  'linewidth': 2.0, 'markersize': 6,  'zorder': 4, 'label': 'This paper'},
+}
+
+
+def _plot_method(ax, x, y, key):
+    s = _STYLE[key]
+    ax.plot(x, y,
+            color=s['color'], marker=s['marker'], linestyle=s['linestyle'],
+            linewidth=s['linewidth'], markersize=s['markersize'],
+            label=s['label'], zorder=s['zorder'],
+            markerfacecolor=s['color'], markeredgecolor='white', markeredgewidth=0.6)
+
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_dir = os.path.abspath(os.path.join(script_dir, '..'))
 src_dir = os.path.join(project_dir, 'src')
@@ -59,12 +95,6 @@ def audit_epoch(exp_dir, epoch, delta, significance):
         eps_upper = float('nan')
 
     # Steinke et al. 2023 and Mahloujifar et al. 2024.
-    # Match the protocol used in those papers' reported numbers: optimize c'
-    # post-hoc on the full m canaries with NO multiplicity correction
-    # (technically optimistic as a 95% LB, but it's what they publish, so this
-    # is the apples-to-apples comparison). The auditing.py default is
-    # Bonferroni (alpha/m) which is much more conservative; MultiSplit (held-
-    # out 50%) is honest but cuts effective m in half.
     auditor = CanaryScoreAuditor(in_sum, out_sum)
     eps_steinke, _ = auditor._epsilon_one_run_all_thresholds(
         significance=significance, delta=delta, one_sided=True, threshold=None,
@@ -75,10 +105,7 @@ def audit_epoch(exp_dir, epoch, delta, significance):
         use_fdp=True,
     )
 
-    # NDIS: use the bootstrap CI lower bound with pool_variance=True (the
-    # equal-variance case for the gradient-projection score). The earlier
-    # ndis_eps_from_delta_1d_brentq call on raw sample moments was a biased
-    # POINT estimate; ndis_eps_lower_bound_with_ci is the audit-valid LB.
+    # NDIS: use the bootstrap CI lower bound with pool_variance=True
     try:
         eps_ndis = ndis_eps_lower_bound_with_ci(
             in_ndis, out_ndis, delta=delta,
@@ -152,20 +179,21 @@ def run_single(exp_dir, delta, significance, fig_dir):
     print(f"\nResults saved to: {results_path}")
 
     # Plot
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(epoch_list, upper_bounds, 'b-o', label='Upper bound (RDP)', linewidth=2)
-    ax.plot(epoch_list, steinke_bounds, 'r-s', label='Steinke 2023 (one-run)', linewidth=2)
-    ax.plot(epoch_list, fdp_bounds, 'g-^', label='Mahloujifar 2024 (f-DP)', linewidth=2)
-    ax.plot(epoch_list, ndis_bounds, 'm-D', label='NDIS (ours)', linewidth=2)
-    ax.set_xlabel('Epoch', fontsize=12)
-    ax.set_ylabel('Epsilon', fontsize=12)
-    ax.set_title('Privacy Bounds Comparison: Upper (theoretical) vs Lower (empirical)', fontsize=14)
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig_path = os.path.join(fig_dir, 'privacy_bounds_comparison.png')
-    fig.savefig(fig_path, dpi=300, bbox_inches='tight')
-    print(f"Figure saved to: {fig_path}")
+    with plt.rc_context(_RC):
+        fig, ax = plt.subplots(figsize=(6.5, 4.2))
+        _plot_method(ax, epoch_list, upper_bounds,   'upper')
+        _plot_method(ax, epoch_list, steinke_bounds, 'steinke')
+        _plot_method(ax, epoch_list, fdp_bounds,     'fdp')
+        _plot_method(ax, epoch_list, ndis_bounds,    'ndis')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel(r'$\varepsilon$')
+        ax.set_ylim(bottom=0)
+        ax.legend(loc='upper left')
+        fig.tight_layout()
+        fig_path = os.path.join(fig_dir, 'privacy_bounds_comparison.png')
+        fig.savefig(fig_path, dpi=300, bbox_inches='tight')
+        fig.savefig(fig_path.replace('.png', '.pdf'), bbox_inches='tight')
+        print(f"Figure saved to: {fig_path} (and .pdf)")
 
 
 def run_multi(exp_dirs, delta, significance, fig_dir):
@@ -224,23 +252,33 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
                header='target_epsilon,upper_bound,steinke_2023,fdp_2024,ndis', comments='')
     print(f"\nResults saved to: {results_path}")
 
-    # Line plot (same style as single-experiment plot, but x-axis = target epsilon)
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(target_epsilons, upper_bounds, 'b-o', label='Upper bound (RDP)', linewidth=2)
-    ax.plot(target_epsilons, steinke_bounds, 'r-s', label='Steinke 2023 (one-run)', linewidth=2)
-    ax.plot(target_epsilons, fdp_bounds, 'g-^', label='Mahloujifar 2024 (f-DP)', linewidth=2)
-    ax.plot(target_epsilons, ndis_bounds, 'm-D', label='NDIS (ours)', linewidth=2)
-    ax.set_xlabel('Target Epsilon', fontsize=12)
-    ax.set_ylabel('Epsilon', fontsize=12)
-    ax.set_title('Privacy Bounds Comparison: Upper (theoretical) vs Lower (empirical)', fontsize=14)
-    ax.set_xticks(target_epsilons)
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
+    with plt.rc_context(_RC):
+        fig, ax = plt.subplots(figsize=(6.0, 4.2))
 
-    fig_path = os.path.join(fig_dir, 'privacy_bounds_comparison_multi_eps.png')
-    fig.savefig(fig_path, dpi=300, bbox_inches='tight')
-    print(f"Figure saved to: {fig_path}")
+        eps_min = min(target_epsilons)
+        eps_max = max(target_epsilons + upper_bounds)
+        ax.plot([0, eps_max * 1.05], [0, eps_max * 1.05],
+                color='#bbbbbb', linestyle=':', linewidth=1.0, zorder=0,
+                label=r'$y = x$')
+
+        _plot_method(ax, target_epsilons, upper_bounds,   'upper')
+        _plot_method(ax, target_epsilons, steinke_bounds, 'steinke')
+        _plot_method(ax, target_epsilons, fdp_bounds,     'fdp')
+        _plot_method(ax, target_epsilons, ndis_bounds,    'ndis')
+
+        ax.set_xlabel(r'Theoretical $\varepsilon$')
+        ax.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
+        ax.set_xticks(target_epsilons)
+        ax.set_xlim(0, eps_max * 1.05)
+        ax.set_ylim(0, eps_max * 1.05)
+        ax.set_aspect('equal', adjustable='box')
+        ax.legend(loc='upper left', handlelength=2.0)
+        fig.tight_layout()
+
+        fig_path = os.path.join(fig_dir, 'privacy_bounds_comparison_multi_eps.png')
+        fig.savefig(fig_path, dpi=300, bbox_inches='tight')
+        fig.savefig(fig_path.replace('.png', '.pdf'), bbox_inches='tight')
+        print(f"Figure saved to: {fig_path} (and .pdf)")
 
 
 def main():
