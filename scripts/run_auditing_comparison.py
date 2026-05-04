@@ -27,8 +27,12 @@ project_dir = os.path.abspath(os.path.join(script_dir, '..'))
 src_dir = os.path.join(project_dir, 'src')
 sys.path.append(src_dir)
 
-from auditing import CanaryScoreAuditor
-from whitebox_auditing.ndis_1d import ndis_eps_from_delta_1d_brentq, estimate_mean_variance
+from auditing import CanaryScoreAuditor, MultiSplit
+from whitebox_auditing.ndis_1d import (
+    ndis_eps_from_delta_1d_brentq,
+    ndis_eps_lower_bound_with_ci,
+    estimate_mean_variance,
+)
 
 
 def audit_epoch(exp_dir, epoch, delta, significance):
@@ -54,28 +58,35 @@ def audit_epoch(exp_dir, epoch, delta, significance):
     else:
         eps_upper = float('nan')
 
-    # Steinke et al. 2023
+    # Steinke et al. 2023 and Mahloujifar et al. 2024.
+    # Default threshold_strategy in auditing.py is Bonferroni, which divides
+    # significance by len(thresholds) ~ m = 5000 -> alpha effectively 1e-5
+    # for m=5000. Mahloujifar's reported numbers do not apply this correction
+    # (they post-hoc pick the best c'), so for parity we use a held-out split:
+    # half the canaries pick the threshold, half compute eps. No multiplicity
+    # correction needed because only one threshold is evaluated on the held-out
+    # half. MultiSplit reduces variance by averaging multiple random splits.
+    threshold_strategy = MultiSplit(num_samples=10, threshold_estimation_frac=0.5, seed=0)
     auditor = CanaryScoreAuditor(in_sum, out_sum)
-    eps_steinke = auditor.epsilon_one_run(significance=significance, delta=delta)
+    eps_steinke = auditor.epsilon_one_run(
+        significance=significance, delta=delta,
+        threshold_strategy=threshold_strategy,
+    )
+    eps_fdp = auditor.epsilon_one_run_fdp(
+        significance=significance, delta=delta,
+        threshold_strategy=threshold_strategy,
+    )
 
-    # Mahloujifar et al. 2024
-    eps_fdp = auditor.epsilon_one_run_fdp(significance=significance, delta=delta)
-
-    # NDIS
-    stats = estimate_mean_variance(in_ndis, out_ndis)
+    # NDIS: use the bootstrap CI lower bound with pool_variance=True (the
+    # equal-variance case for the gradient-projection score). The earlier
+    # ndis_eps_from_delta_1d_brentq call on raw sample moments was a biased
+    # POINT estimate; ndis_eps_lower_bound_with_ci is the audit-valid LB.
     try:
-        if stats['out_std'] < stats['in_std']:
-            eps_ndis = ndis_eps_from_delta_1d_brentq(
-                sigma1=stats['out_std'], sigma2=stats['in_std'],
-                mu1=stats['out_mean'], mu2=stats['in_mean'],
-                delta_target=delta,
-            )
-        else:
-            eps_ndis = ndis_eps_from_delta_1d_brentq(
-                sigma1=stats['in_std'], sigma2=stats['out_std'],
-                mu1=stats['in_mean'], mu2=stats['out_mean'],
-                delta_target=delta,
-            )
+        eps_ndis = ndis_eps_lower_bound_with_ci(
+            in_ndis, out_ndis, delta=delta,
+            alpha=significance, n_bootstrap=2000,
+            pool_variance=True,
+        )
     except (ValueError, RuntimeError) as e:
         print(f"  NDIS failed ({e}), setting to 0")
         eps_ndis = 0.0
