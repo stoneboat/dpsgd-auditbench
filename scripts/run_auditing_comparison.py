@@ -43,10 +43,10 @@ _RC = {
     'figure.dpi': 120,
 }
 _STYLE = {
-    'upper':   {'color': '#555555', 'marker': '',  'linestyle': '--', 'linewidth': 1.5, 'markersize': 0,  'zorder': 1, 'label': 'Theoretical (upper bound)'},
-    'steinke': {'color': '#1f77b4', 'marker': 'o', 'linestyle': '-',  'linewidth': 1.4, 'markersize': 5,  'zorder': 2, 'label': 'Steinke et al. 2023'},
-    'fdp':     {'color': '#2ca02c', 'marker': 's', 'linestyle': '-',  'linewidth': 1.4, 'markersize': 5,  'zorder': 3, 'label': 'Mahloujifar et al. 2024 (f-DP)'},
-    'ndis':    {'color': '#d62728', 'marker': 'D', 'linestyle': '-',  'linewidth': 2.0, 'markersize': 6,  'zorder': 4, 'label': 'This paper'},
+    'upper':   {'color': '#555555', 'marker': '',  'linestyle': ':',  'linewidth': 1.4, 'markersize': 0,  'zorder': 1, 'label': 'Theoretical (upper bound)'},
+    'steinke': {'color': '#888888', 'marker': 'o', 'linestyle': ':',  'linewidth': 1.4, 'markersize': 5,  'zorder': 2, 'label': 'Steinke et al. 2023'},
+    'fdp':     {'color': '#444444', 'marker': 's', 'linestyle': ':',  'linewidth': 1.4, 'markersize': 5,  'zorder': 3, 'label': 'Mahloujifar et al. 2024 (f-DP)'},
+    'ndis':    {'color': '#1f77b4', 'marker': 'D', 'linestyle': '-',  'linewidth': 2.4, 'markersize': 7,  'zorder': 4, 'label': 'This paper'},
 }
 
 
@@ -180,7 +180,7 @@ def run_single(exp_dir, delta, significance, fig_dir):
 
     # Plot
     with plt.rc_context(_RC):
-        fig, ax = plt.subplots(figsize=(6.5, 4.2))
+        fig, ax = plt.subplots(figsize=(10, 6))
         _plot_method(ax, epoch_list, upper_bounds,   'upper')
         _plot_method(ax, epoch_list, steinke_bounds, 'steinke')
         _plot_method(ax, epoch_list, fdp_bounds,     'fdp')
@@ -253,13 +253,7 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
     print(f"\nResults saved to: {results_path}")
 
     with plt.rc_context(_RC):
-        fig, ax = plt.subplots(figsize=(6.0, 4.2))
-
-        eps_min = min(target_epsilons)
-        eps_max = max(target_epsilons + upper_bounds)
-        ax.plot([0, eps_max * 1.05], [0, eps_max * 1.05],
-                color='#bbbbbb', linestyle=':', linewidth=1.0, zorder=0,
-                label=r'$y = x$')
+        fig, ax = plt.subplots(figsize=(10, 6))
 
         _plot_method(ax, target_epsilons, upper_bounds,   'upper')
         _plot_method(ax, target_epsilons, steinke_bounds, 'steinke')
@@ -269,10 +263,8 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
         ax.set_xlabel(r'Theoretical $\varepsilon$')
         ax.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
         ax.set_xticks(target_epsilons)
-        ax.set_xlim(0, eps_max * 1.05)
-        ax.set_ylim(0, eps_max * 1.05)
-        ax.set_aspect('equal', adjustable='box')
-        ax.legend(loc='upper left', handlelength=2.0)
+        ax.set_ylim(bottom=0)
+        ax.legend(loc='upper left', handlelength=2.5)
         fig.tight_layout()
 
         fig_path = os.path.join(fig_dir, 'privacy_bounds_comparison_multi_eps.png')
