@@ -208,16 +208,18 @@ def tree_sigma_for_eps(
 ) -> float:
     """Per-node Gaussian sigma so the *whole* tree release is (eps, delta)-DP.
 
-    A single-record change flips contributions on log_2(T) ancestor nodes,
-    so the L2 sensitivity of the full release is sqrt(log_2 T). The release
-    is therefore a Gaussian mechanism with that sensitivity; calibrate sigma
-    via the analytic Gaussian DP formula (Balle & Wang 2018).
+    Our Honaker construction adds independent N(0, sigma^2) noise at every
+    level of the tree -- the log_2(T) internal levels AND the leaf level
+    (level 0). A single-record change therefore flips contributions on
+    log_2(T) + 1 ancestor nodes, and the L2 sensitivity of the full release
+    is sqrt(log_2(T) + 1). Calibrate sigma via the analytic Gaussian DP
+    formula (Balle & Wang 2018).
     """
     if not (0.0 < delta < 1.0):
         raise ValueError(f"delta must be in (0, 1), got {delta}.")
     if target_eps <= 0.0:
         raise ValueError(f"target_eps must be positive, got {target_eps}.")
-    L = max(1, num_levels(T))
+    L = max(1, num_levels(T)) + 1   # +1 for the noisy leaf level
     sens = math.sqrt(L)
 
     # delta is monotonically decreasing in sigma; bisect on sigma.
@@ -242,7 +244,7 @@ def tree_eps_for_sigma(
     """Inverse: tightest eps for the tree mechanism at given per-node sigma."""
     if sigma <= 0.0:
         raise ValueError(f"sigma must be positive, got {sigma}.")
-    L = max(1, num_levels(T))
+    L = max(1, num_levels(T)) + 1   # +1 for the noisy leaf level
     sens = math.sqrt(L)
     mu_gdp = sens / sigma
 

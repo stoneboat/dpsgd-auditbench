@@ -40,6 +40,7 @@ Audit setup:
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Dict, List, Optional, Tuple
 
@@ -50,6 +51,13 @@ import torchvision.transforms as transforms
 from tqdm import tqdm
 
 from train import _augment_per_image  # reuse per-image augmentation
+
+_logger = logging.getLogger(__name__)
+# Throttle pre-clip grad-norm telemetry. Logged from _clip_and_sum_grad_samples,
+# which is called once per physical batch. With ~32 physical batches per leaf,
+# N=50 ~= once or twice per leaf. Set to 0 to disable.
+_GRAD_NORM_LOG_EVERY = 50
+_grad_norm_call_count = [0]
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +103,24 @@ def _clip_and_sum_grad_samples(
         sq = (flat * flat).sum(dim=1)
         per_sample_sq = sq if per_sample_sq is None else per_sample_sq + sq
     norms = per_sample_sq.clamp_min(1e-12).sqrt()
+
+    # Pre-clip telemetry (throttled): tells us whether C is saturating or wasted.
+    if _GRAD_NORM_LOG_EVERY > 0:
+        _grad_norm_call_count[0] += 1
+        if _grad_norm_call_count[0] % _GRAD_NORM_LOG_EVERY == 1:
+            n_np = norms.detach().cpu().numpy()
+            _logger.info(
+                "grad_norms B=%d C=%.2f mean=%.4f median=%.4f p90=%.4f p99=%.4f "
+                "frac_>=C=%.3f frac_<0.5C=%.3f",
+                int(n_np.shape[0]), float(max_grad_norm),
+                float(np.mean(n_np)),
+                float(np.median(n_np)),
+                float(np.percentile(n_np, 90)),
+                float(np.percentile(n_np, 99)),
+                float(np.mean(n_np >= max_grad_norm)),
+                float(np.mean(n_np < 0.5 * max_grad_norm)),
+            )
+
     scaling = (max_grad_norm / norms).clamp_max(1.0)   # [B]
 
     summed: List[torch.Tensor] = []

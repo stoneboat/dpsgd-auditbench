@@ -1,3 +1,4 @@
+import logging
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
@@ -6,10 +7,49 @@ import numpy as np
 from opacus.utils.batch_memory_manager import BatchMemoryManager
 from tqdm import tqdm
 
+_logger = logging.getLogger(__name__)
+# Throttle pre-clip grad-norm telemetry: log once per N physical-batch calls
+# to _whitebox_dp_step. With ~32 physical batches per logical batch, N=50
+# gives ~1-2 lines per logical step. Set to 0 to disable.
+_GRAD_NORM_LOG_EVERY = 50
+_grad_norm_call_count = [0]
+
+
+def _log_grad_sample_norms(optimizer):
+    """Pre-clip per-sample grad norm distribution. Tells us whether the C=1
+    clipping budget is saturating (signal-rich regime) or being wasted (most
+    samples have norm << C, so the noise floor dominates)."""
+    if optimizer.grad_samples is None or len(optimizer.grad_samples) == 0:
+        return
+    per_param_sq = []
+    B = None
+    for gs in optimizer.grad_samples:
+        if gs is None:
+            continue
+        flat = gs.reshape(gs.shape[0], -1)
+        per_param_sq.append((flat * flat).sum(dim=1))
+        B = gs.shape[0]
+    if not per_param_sq:
+        return
+    norms = torch.stack(per_param_sq, dim=0).sum(dim=0).sqrt().detach().cpu().numpy()
+    C = float(getattr(optimizer, "max_grad_norm", 1.0))
+    _logger.info(
+        "grad_norms B=%d C=%.2f mean=%.4f median=%.4f p90=%.4f p99=%.4f "
+        "frac_>=C=%.3f frac_<0.5C=%.3f",
+        B, C,
+        float(np.mean(norms)),
+        float(np.median(norms)),
+        float(np.percentile(norms, 90)),
+        float(np.percentile(norms, 99)),
+        float(np.mean(norms >= C)),
+        float(np.mean(norms < 0.5 * C)),
+    )
+
 
 _PER_IMAGE_AUG = transforms_v2.Compose([
-    transforms_v2.RandomCrop(32, padding=4, padding_mode='reflect'),
+    transforms_v2.RandomCrop(32, padding=20, padding_mode='reflect'),
     transforms_v2.RandomHorizontalFlip(p=0.5),
+    transforms_v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
 ])
 
 
@@ -76,6 +116,13 @@ def _whitebox_dp_step(
 
     if optimizer.grad_samples is None or len(optimizer.grad_samples) == 0:
         return optimizer.step()
+
+    # Pre-clip telemetry (throttled). Must run BEFORE clip_and_accumulate
+    # because the latter consumes/clears grad_samples.
+    if _GRAD_NORM_LOG_EVERY > 0:
+        _grad_norm_call_count[0] += 1
+        if _grad_norm_call_count[0] % _GRAD_NORM_LOG_EVERY == 1:
+            _log_grad_sample_norms(optimizer)
 
     optimizer.clip_and_accumulate()
 
@@ -223,11 +270,8 @@ def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_p
                     # Reshape [B, K, ...]
                     gs_view = gs.view(B_K // aug_multiplicity, aug_multiplicity, *feature_shape)
 
-                    # Sum over K augs. instead of mean
-                    gs_sum = gs_view.sum(dim=1)
-
-                    # Replace grad_sample
-                    p.grad_sample = gs_sum
+                    # Mean over K augs (De 2022 / Sander 2023 / Mahloujifar 2024 recipe).
+                    p.grad_sample = gs_view.mean(dim=1)
 
             # --- OPTIMIZER STEP ---
             # BatchMemoryManager controls this.
@@ -401,13 +445,8 @@ def train_whitebox(
                     # Reshape [B, K, ...]
                     gs_view = gs.view(B_K // aug_multiplicity, aug_multiplicity, *feature_shape)
 
-                    # Sum over K augs (see the train() function above for the full
-                    # rationale). This makes per-logical-sample grad norm ~K * g_i so
-                    # clipping at C=1 reliably saturates and uses the full DP budget.
-                    gs_sum = gs_view.sum(dim=1)
-
-                    # Replace grad_sample
-                    p.grad_sample = gs_sum
+                    # Mean over K augs (De 2022 / Sander 2023 / Mahloujifar 2024 recipe).
+                    p.grad_sample = gs_view.mean(dim=1)
 
             # --- OPTIMIZER STEP ---
             # BatchMemoryManager controls this.
