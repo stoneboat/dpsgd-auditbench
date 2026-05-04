@@ -27,7 +27,7 @@ project_dir = os.path.abspath(os.path.join(script_dir, '..'))
 src_dir = os.path.join(project_dir, 'src')
 sys.path.append(src_dir)
 
-from auditing import CanaryScoreAuditor, MultiSplit
+from auditing import CanaryScoreAuditor
 from whitebox_auditing.ndis_1d import (
     ndis_eps_from_delta_1d_brentq,
     ndis_eps_lower_bound_with_ci,
@@ -59,22 +59,20 @@ def audit_epoch(exp_dir, epoch, delta, significance):
         eps_upper = float('nan')
 
     # Steinke et al. 2023 and Mahloujifar et al. 2024.
-    # Default threshold_strategy in auditing.py is Bonferroni, which divides
-    # significance by len(thresholds) ~ m = 5000 -> alpha effectively 1e-5
-    # for m=5000. Mahloujifar's reported numbers do not apply this correction
-    # (they post-hoc pick the best c'), so for parity we use a held-out split:
-    # half the canaries pick the threshold, half compute eps. No multiplicity
-    # correction needed because only one threshold is evaluated on the held-out
-    # half. MultiSplit reduces variance by averaging multiple random splits.
-    threshold_strategy = MultiSplit(num_samples=10, threshold_estimation_frac=0.5, seed=0)
+    # Match the protocol used in those papers' reported numbers: optimize c'
+    # post-hoc on the full m canaries with NO multiplicity correction
+    # (technically optimistic as a 95% LB, but it's what they publish, so this
+    # is the apples-to-apples comparison). The auditing.py default is
+    # Bonferroni (alpha/m) which is much more conservative; MultiSplit (held-
+    # out 50%) is honest but cuts effective m in half.
     auditor = CanaryScoreAuditor(in_sum, out_sum)
-    eps_steinke = auditor.epsilon_one_run(
-        significance=significance, delta=delta,
-        threshold_strategy=threshold_strategy,
+    eps_steinke, _ = auditor._epsilon_one_run_all_thresholds(
+        significance=significance, delta=delta, one_sided=True, threshold=None,
+        use_fdp=False,
     )
-    eps_fdp = auditor.epsilon_one_run_fdp(
-        significance=significance, delta=delta,
-        threshold_strategy=threshold_strategy,
+    eps_fdp, _ = auditor._epsilon_one_run_all_thresholds(
+        significance=significance, delta=delta, one_sided=True, threshold=None,
+        use_fdp=True,
     )
 
     # NDIS: use the bootstrap CI lower bound with pool_variance=True (the
