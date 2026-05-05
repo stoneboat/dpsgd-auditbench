@@ -13,6 +13,9 @@ Usage:
 
   # Multiple experiment directories (one per epsilon), final-epoch bar chart:
   python scripts/run_auditing_comparison.py --exp-dirs ./data/exp_eps1 ./data/exp_eps2 ./data/exp_eps4 ./data/exp_eps8
+
+  # Sample-complexity sweep on a single experiment:
+  python scripts/run_auditing_comparison.py --complexity --exp-dir ./data/mislabeled-canaries-<seed>-5000-0.5-cifar10
 """
 
 import sys
@@ -24,9 +27,9 @@ import matplotlib.pyplot as plt
 
 _RC = {
     'font.family': 'DejaVu Sans',
-    'font.size': 11,
+    'font.size': 14,
     'axes.titlesize': 12,
-    'axes.labelsize': 11,
+    'axes.labelsize': 14,
     'axes.spines.top': False,
     'axes.spines.right': False,
     'axes.linewidth': 0.8,
@@ -39,13 +42,14 @@ _RC = {
     'xtick.major.width': 0.8,
     'ytick.major.width': 0.8,
     'legend.frameon': False,
-    'legend.fontsize': 10,
+    'legend.fontsize': 14,
     'figure.dpi': 120,
 }
+
 _STYLE = {
-    'upper':   {'color': '#555555', 'marker': '',  'linestyle': ':',  'linewidth': 1.4, 'markersize': 0,  'zorder': 1, 'label': 'Theoretical (upper bound)'},
-    'steinke': {'color': '#888888', 'marker': 'o', 'linestyle': ':',  'linewidth': 1.4, 'markersize': 5,  'zorder': 2, 'label': 'Steinke et al. 2023'},
-    'fdp':     {'color': '#444444', 'marker': 's', 'linestyle': ':',  'linewidth': 1.4, 'markersize': 5,  'zorder': 3, 'label': 'Mahloujifar et al. 2024 (f-DP)'},
+    'upper':   {'color': '#555555', 'marker': '',  'linestyle': (0, (3, 5, 1, 5)),  'linewidth': 1.4, 'markersize': 0,  'zorder': 1, 'label': 'Theoretical (upper bound)'},
+    'steinke': {'color': '#ff7f0e', 'marker': 'o', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 2, 'label': 'Steinke et al. 2023'},
+    'fdp':     {'color': '#2ca02c', 'marker': 's', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 3, 'label': 'Mahloujifar et al. 2024 (f-DP)'},
     'ndis':    {'color': '#1f77b4', 'marker': 'D', 'linestyle': '-',  'linewidth': 2.4, 'markersize': 7,  'zorder': 4, 'label': 'This paper'},
 }
 
@@ -293,32 +297,137 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
         print(f"Figure saved to: {fig_path} (and .pdf)")
 
 
+def run_complexity(exp_dir, delta, significance, fig_dir):
+    """Plot empirical eps vs total canary budget (sample-complexity sweep)."""
+    final_epoch = get_final_epoch(exp_dir)
+    target_eps = get_target_epsilon(exp_dir)
+    if final_epoch is None:
+        print(f"Error: no score files in {exp_dir}")
+        sys.exit(1)
+
+    in_sum_path = _resolve_score_path(exp_dir, 'sum', 'in', final_epoch)
+    out_sum_path = _resolve_score_path(exp_dir, 'sum', 'out', final_epoch)
+    in_ndis_path = os.path.join(exp_dir, f'in_scores_ndis_{final_epoch:06d}.csv')
+    out_ndis_path = os.path.join(exp_dir, f'out_scores_ndis_{final_epoch:06d}.csv')
+
+    in_sum = np.loadtxt(in_sum_path, delimiter=',')
+    out_sum = np.loadtxt(out_sum_path, delimiter=',')
+    in_ndis = np.loadtxt(in_ndis_path, delimiter=',')
+    out_ndis = np.loadtxt(out_ndis_path, delimiter=',')
+
+    total_budgets = [100, 200, 400, 600, 1000, 1500, 2000, 3500, 5000]
+    full_budget = len(in_sum) + len(out_sum)
+
+    results = {key: [] for key in ['steinke', 'fdp', 'ndis']}
+    n_trials = 50
+
+    print(f"Running sample complexity on total budget for epoch {final_epoch} "
+          f"(in={len(in_sum)}, out={len(out_sum)})...")
+
+    for budget in total_budgets:
+        trial_data = {key: [] for key in results.keys()}
+
+        for _ in range(n_trials):
+            if budget < full_budget:
+                mask = np.random.rand(budget) < 0.5
+                n_in = int(np.sum(mask))
+                n_out = budget - n_in
+                n_in = max(2, min(n_in, len(in_sum)))
+                n_out = max(2, min(n_out, len(out_sum)))
+            else:
+                # Use the full available pool when budget meets/exceeds it.
+                n_in = len(in_sum)
+                n_out = len(out_sum)
+
+            idx_in = np.random.choice(len(in_sum), n_in, replace=False)
+            idx_out = np.random.choice(len(out_sum), n_out, replace=False)
+            s_in, s_out = in_sum[idx_in], out_sum[idx_out]
+            n_in_scores, n_out_scores = in_ndis[idx_in], out_ndis[idx_out]
+
+            auditor = CanaryScoreAuditor(s_in, s_out)
+            eps_s, _ = auditor._epsilon_one_run_all_thresholds(
+                significance, delta, True, None, use_fdp=False,
+            )
+            eps_f, _ = auditor._epsilon_one_run_all_thresholds(
+                significance, delta, True, None, use_fdp=True,
+            )
+            eps_n = ndis_eps_lower_bound_with_ci(
+                n_in_scores, n_out_scores, delta=delta,
+                alpha=significance, pool_variance=False,
+            )
+
+            trial_data['steinke'].append(eps_s)
+            trial_data['fdp'].append(eps_f)
+            trial_data['ndis'].append(eps_n)
+
+        for key in results.keys():
+            results[key].append(np.mean(trial_data[key]))
+        print(f"  Total Budget {budget:4d} completed (avg split: {n_in}/{n_out}).")
+
+    # Save numeric results
+    arr = np.column_stack([
+        total_budgets,
+        results['steinke'],
+        results['fdp'],
+        results['ndis'],
+    ])
+    results_path = os.path.join(fig_dir, 'sample_complexity.csv')
+    np.savetxt(results_path, arr, delimiter=',',
+               header='total_budget,steinke_2023,fdp_2024,ndis', comments='')
+    print(f"\nResults saved to: {results_path}")
+
+    with plt.rc_context(_RC):
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+        ax.grid(True, which="major", ls="-", alpha=0.2)
+        ax.grid(True, which="minor", ls=":", alpha=0.1)
+
+        if target_eps is not None:
+            ax.axhline(y=target_eps, color='#555555', ls='--', lw=1.2,
+                       label='Theoretical Bound')
+        _plot_method(ax, total_budgets, results['steinke'], 'steinke')
+        _plot_method(ax, total_budgets, results['fdp'],     'fdp')
+        _plot_method(ax, total_budgets, results['ndis'],    'ndis')
+
+        ax.set_xscale('log')
+        ax.set_xticks(total_budgets)
+        ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
+
+        ax.set_xlabel('Number of Canaries ($n$)', fontweight='bold')
+        ax.set_ylabel(r'Empirical $\varepsilon$ (lower bound)', fontweight='bold')
+        ax.set_ylim(0, 8.5)
+        ax.legend(loc='lower right', fontsize=9, frameon=True)
+
+        plt.tight_layout()
+
+        fig_path = os.path.join(fig_dir, 'sample_complexity_plot.png')
+        plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+        plt.savefig(fig_path.replace('.png', '.pdf'), bbox_inches='tight')
+        print(f"Figure saved to: {fig_path} (and .pdf)")
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Run 3 auditing methods on whitebox scores')
-    parser.add_argument('--exp-dir', type=str, default=None,
-                        help='Single experiment directory (per-epoch line plot)')
-    parser.add_argument('--exp-dirs', type=str, nargs='+', default=None,
-                        help='Multiple experiment directories (final-epoch bar chart)')
+    parser = argparse.ArgumentParser(description='Run auditing methods comparison')
+    parser.add_argument('--exp-dir', type=str, help='Single experiment directory')
+    parser.add_argument('--exp-dirs', type=str, nargs='+', help='Multiple experiment directories')
+    parser.add_argument('--complexity', action='store_true', help='Run sample complexity analysis')
     parser.add_argument('--delta', type=float, default=1e-5)
-    parser.add_argument('--significance', type=float, default=0.05,
-                        help='Significance level for paper methods (95%% confidence)')
-    parser.add_argument('--fig-dir', type=str, default=None,
-                        help='Directory to save figures (default: <project>/fig)')
+    parser.add_argument('--significance', type=float, default=0.05)
+    parser.add_argument('--fig-dir', type=str, default=None)
     args = parser.parse_args()
 
     if args.fig_dir is None:
         args.fig_dir = os.path.join(project_dir, 'fig')
     os.makedirs(args.fig_dir, exist_ok=True)
 
-    if args.exp_dirs:
+    if args.complexity and args.exp_dir:
+        run_complexity(args.exp_dir, args.delta, args.significance, args.fig_dir)
+    elif args.exp_dirs:
         run_multi(args.exp_dirs, args.delta, args.significance, args.fig_dir)
     elif args.exp_dir:
-        if not os.path.isdir(args.exp_dir):
-            print(f"Error: experiment directory not found: {args.exp_dir}")
-            sys.exit(1)
         run_single(args.exp_dir, args.delta, args.significance, args.fig_dir)
     else:
-        parser.error("Provide either --exp-dir or --exp-dirs")
+        parser.error("Provide --exp-dir or --exp-dirs. Add --complexity for sample size analysis.")
 
 
 if __name__ == '__main__':
