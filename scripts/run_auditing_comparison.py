@@ -50,8 +50,22 @@ _STYLE = {
     'upper':   {'color': '#555555', 'marker': '',  'linestyle': (0, (3, 5, 1, 5)),  'linewidth': 1.4, 'markersize': 0,  'zorder': 1, 'label': 'Theoretical (upper bound)'},
     'steinke': {'color': '#ff7f0e', 'marker': 'o', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 2, 'label': 'Steinke et al. 2023'},
     'fdp':     {'color': '#2ca02c', 'marker': 's', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 3, 'label': 'Mahloujifar et al. 2024 (f-DP)'},
-    'ndis':    {'color': '#1f77b4', 'marker': 'D', 'linestyle': '-',  'linewidth': 2.4, 'markersize': 7,  'zorder': 4, 'label': 'This paper'},
+    # NDIS lower-bound variants (this paper). One style per method.
+    'ndis_parametric_bonferroni':      {'color': '#1f77b4', 'marker': 'D', 'linestyle': '-',  'linewidth': 2.0, 'markersize': 6, 'zorder': 5, 'label': 'NDIS: parametric Bonferroni'},
+    'ndis_bootstrap_bonferroni':       {'color': '#9467bd', 'marker': '^', 'linestyle': '-',  'linewidth': 2.0, 'markersize': 6, 'zorder': 6, 'label': 'NDIS: bootstrap Bonferroni'},
+    'ndis_bootstrap_simultaneous_box': {'color': '#17becf', 'marker': 'v', 'linestyle': '-',  'linewidth': 2.0, 'markersize': 6, 'zorder': 7, 'label': 'NDIS: simultaneous box'},
+    'ndis_bootstrap_ellipsoid':        {'color': '#e377c2', 'marker': '*', 'linestyle': '-',  'linewidth': 2.0, 'markersize': 8, 'zorder': 8, 'label': 'NDIS: bootstrap ellipsoid'},
+    'ndis_bootstrap_eps_quantile':     {'color': '#8c564b', 'marker': 'x', 'linestyle': ':',  'linewidth': 2.0, 'markersize': 7, 'zorder': 9, 'label': 'NDIS: eps-quantile (legacy)'},
 }
+
+NDIS_METHODS = (
+    'parametric_bonferroni',
+    'bootstrap_bonferroni',
+    'bootstrap_simultaneous_box',
+    'bootstrap_ellipsoid',
+    'bootstrap_eps_quantile',
+)
+NDIS_KEYS = tuple(f'ndis_{m}' for m in NDIS_METHODS)
 
 
 def _plot_method(ax, x, y, key):
@@ -71,7 +85,7 @@ from auditing import CanaryScoreAuditor
 from whitebox_auditing.ndis_1d import (
     ndis_eps_from_delta_1d_brentq,
     ndis_eps_lower_bound_with_ci,
-    estimate_mean_variance,
+    estimate_mean_variance, ndis_eps_lb, ndis_eps_lb_all,
 )
 
 
@@ -90,8 +104,12 @@ def _resolve_score_path(exp_dir, kind, side, epoch):
     return None
 
 
-def audit_epoch(exp_dir, epoch, delta, significance):
-    """Run all 3 auditing methods for a given epoch. Returns dict of results."""
+def audit_epoch(exp_dir, epoch, delta, significance, method=None):
+    """Run all auditing methods for a given epoch. Returns dict of results.
+
+    `method` is ignored (kept for backwards compatibility); all NDIS
+    lower-bound variants are computed on a single shared bootstrap pass.
+    """
     in_sum_path = _resolve_score_path(exp_dir, 'sum', 'in', epoch)
     out_sum_path = _resolve_score_path(exp_dir, 'sum', 'out', epoch)
     in_ndis_path = os.path.join(exp_dir, f'in_scores_ndis_{epoch:06d}.csv')
@@ -106,6 +124,13 @@ def audit_epoch(exp_dir, epoch, delta, significance):
     out_sum = np.loadtxt(out_sum_path, delimiter=',')
     in_ndis = np.loadtxt(in_ndis_path, delimiter=',')
     out_ndis = np.loadtxt(out_ndis_path, delimiter=',')
+
+    # Pooled empirical std vs theoretical
+    emp_std = np.std(np.concatenate([in_ndis, out_ndis]), ddof=1)
+    mu_sep  = np.mean(in_ndis) - np.mean(out_ndis)
+    print(f"emp_std={emp_std:.4f}, mu_sep={mu_sep:.4f}, "
+          f"theoretical sigma_node={...}")
+
 
     # Theoretical upper bound
     if os.path.isfile(privacy_path):
@@ -125,22 +150,24 @@ def audit_epoch(exp_dir, epoch, delta, significance):
         use_fdp=True,
     )
 
-    # NDIS: use the bootstrap CI lower bound with pool_variance=True
+    # NDIS: run all lower-bound variants on one shared bootstrap pass.
+    ndis_results = {f'ndis_{m}': 0.0 for m in NDIS_METHODS}
     try:
-        eps_ndis = ndis_eps_lower_bound_with_ci(
+        all_out = ndis_eps_lb_all(
             in_ndis, out_ndis, delta=delta,
             alpha=significance, n_bootstrap=2000,
-            pool_variance=False,
+            pool_variance=True,
         )
+        for m in NDIS_METHODS:
+            ndis_results[f'ndis_{m}'] = float(all_out[m]['eps_lb'])
     except (ValueError, RuntimeError) as e:
-        print(f"  NDIS failed ({e}), setting to 0")
-        eps_ndis = 0.0
+        print(f"  NDIS failed ({e}), setting all variants to 0")
 
     return {
         'upper': eps_upper,
         'steinke': eps_steinke,
         'fdp': eps_fdp,
-        'ndis': eps_ndis,
+        **ndis_results,
     }
 
 
@@ -180,39 +207,40 @@ def run_single(exp_dir, delta, significance, fig_dir):
 
     print(f"Found score files for epochs: {epochs}")
 
-    epoch_list, upper_bounds, steinke_bounds, fdp_bounds, ndis_bounds = [], [], [], [], []
+    series = {k: [] for k in ('epoch', 'upper', 'steinke', 'fdp', *NDIS_KEYS)}
 
     for epoch in epochs:
         result = audit_epoch(exp_dir, epoch, delta, significance)
         if result is None:
             print(f"  Epoch {epoch}: missing score files, skipping")
             continue
-        epoch_list.append(epoch)
-        upper_bounds.append(result['upper'])
-        steinke_bounds.append(result['steinke'])
-        fdp_bounds.append(result['fdp'])
-        ndis_bounds.append(result['ndis'])
+        series['epoch'].append(epoch)
+        for k in ('upper', 'steinke', 'fdp', *NDIS_KEYS):
+            series[k].append(result[k])
+        ndis_str = ', '.join(f"{k.replace('ndis_', '')[:6]}={result[k]:.3f}" for k in NDIS_KEYS)
         print(f"  Epoch {epoch:4d}: upper={result['upper']:.3f}, "
-              f"steinke={result['steinke']:.3f}, fdp={result['fdp']:.3f}, ndis={result['ndis']:.3f}")
+              f"steinke={result['steinke']:.3f}, fdp={result['fdp']:.3f}, {ndis_str}")
 
     # Save results
-    results = np.column_stack([epoch_list, upper_bounds, steinke_bounds, fdp_bounds, ndis_bounds])
+    cols = ('epoch', 'upper', 'steinke', 'fdp', *NDIS_KEYS)
+    results = np.column_stack([series[c] for c in cols])
     results_path = os.path.join(exp_dir, 'auditing_results.csv')
     np.savetxt(results_path, results, delimiter=',',
-               header='epoch,upper_bound,steinke_2023,fdp_2024,ndis', comments='')
+               header=','.join(cols), comments='')
     print(f"\nResults saved to: {results_path}")
 
     # Plot
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(10, 6))
-        _plot_method(ax, epoch_list, upper_bounds,   'upper')
-        _plot_method(ax, epoch_list, steinke_bounds, 'steinke')
-        _plot_method(ax, epoch_list, fdp_bounds,     'fdp')
-        _plot_method(ax, epoch_list, ndis_bounds,    'ndis')
+        _plot_method(ax, series['epoch'], series['upper'],   'upper')
+        _plot_method(ax, series['epoch'], series['steinke'], 'steinke')
+        _plot_method(ax, series['epoch'], series['fdp'],     'fdp')
+        for k in NDIS_KEYS:
+            _plot_method(ax, series['epoch'], series[k], k)
         ax.set_xlabel('Epoch')
         ax.set_ylabel(r'$\varepsilon$')
         ax.set_ylim(bottom=0)
-        ax.legend(loc='upper left')
+        ax.legend(loc='upper left', fontsize=10)
         fig.tight_layout()
         fig_path = os.path.join(fig_dir, 'privacy_bounds_comparison.png')
         fig.savefig(fig_path, dpi=300, bbox_inches='tight')
@@ -221,12 +249,8 @@ def run_single(exp_dir, delta, significance, fig_dir):
 
 
 def run_multi(exp_dirs, delta, significance, fig_dir):
-    """Bar chart comparing final-epoch empirical eps across multiple target epsilons."""
-    target_epsilons = []
-    upper_bounds = []
-    steinke_bounds = []
-    fdp_bounds = []
-    ndis_bounds = []
+    """Compare final-epoch empirical eps across multiple target epsilons."""
+    series = {k: [] for k in ('target', 'upper', 'steinke', 'fdp', *NDIS_KEYS)}
 
     for exp_dir in exp_dirs:
         if not os.path.isdir(exp_dir):
@@ -248,47 +272,44 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
             print(f"Warning: missing score files for epoch {final_epoch} in {exp_dir}, skipping")
             continue
 
-        target_epsilons.append(target_eps)
-        upper_bounds.append(result['upper'])
-        steinke_bounds.append(result['steinke'])
-        fdp_bounds.append(result['fdp'])
-        ndis_bounds.append(result['ndis'])
+        series['target'].append(target_eps)
+        for k in ('upper', 'steinke', 'fdp', *NDIS_KEYS):
+            series[k].append(result[k])
 
+        ndis_str = ', '.join(f"{k.replace('ndis_', '')[:6]}={result[k]:.3f}" for k in NDIS_KEYS)
         print(f"  eps={target_eps}: epoch={final_epoch}, upper={result['upper']:.3f}, "
-              f"steinke={result['steinke']:.3f}, fdp={result['fdp']:.3f}, ndis={result['ndis']:.3f}")
+              f"steinke={result['steinke']:.3f}, fdp={result['fdp']:.3f}, {ndis_str}")
 
-    if not target_epsilons:
+    if not series['target']:
         print("Error: no valid experiments found")
         sys.exit(1)
 
     # Sort by target epsilon
-    order = np.argsort(target_epsilons)
-    target_epsilons = [target_epsilons[i] for i in order]
-    upper_bounds = [upper_bounds[i] for i in order]
-    steinke_bounds = [steinke_bounds[i] for i in order]
-    fdp_bounds = [fdp_bounds[i] for i in order]
-    ndis_bounds = [ndis_bounds[i] for i in order]
+    order = np.argsort(series['target'])
+    for k in series:
+        series[k] = [series[k][i] for i in order]
 
     # Save results
-    results = np.column_stack([target_epsilons, upper_bounds, steinke_bounds, fdp_bounds, ndis_bounds])
+    cols = ('target', 'upper', 'steinke', 'fdp', *NDIS_KEYS)
+    results = np.column_stack([series[c] for c in cols])
     results_path = os.path.join(fig_dir, 'auditing_comparison_final.csv')
     np.savetxt(results_path, results, delimiter=',',
-               header='target_epsilon,upper_bound,steinke_2023,fdp_2024,ndis', comments='')
+               header=','.join(cols), comments='')
     print(f"\nResults saved to: {results_path}")
 
     with plt.rc_context(_RC):
-        fig, ax = plt.subplots(figsize=(10, 6))
-
-        _plot_method(ax, target_epsilons, upper_bounds,   'upper')
-        _plot_method(ax, target_epsilons, steinke_bounds, 'steinke')
-        _plot_method(ax, target_epsilons, fdp_bounds,     'fdp')
-        _plot_method(ax, target_epsilons, ndis_bounds,    'ndis')
+        fig, ax = plt.subplots(figsize=(11, 6.5))
+        _plot_method(ax, series['target'], series['upper'],   'upper')
+        _plot_method(ax, series['target'], series['steinke'], 'steinke')
+        _plot_method(ax, series['target'], series['fdp'],     'fdp')
+        for k in NDIS_KEYS:
+            _plot_method(ax, series['target'], series[k], k)
 
         ax.set_xlabel(r'Theoretical $\varepsilon$')
         ax.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
-        ax.set_xticks(target_epsilons)
+        ax.set_xticks(series['target'])
         ax.set_ylim(bottom=0)
-        ax.legend(loc='upper left', handlelength=2.5)
+        ax.legend(loc='upper left', handlelength=2.5, fontsize=10)
         fig.tight_layout()
 
         fig_path = os.path.join(fig_dir, 'privacy_bounds_comparison_multi_eps.png')
@@ -318,14 +339,15 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
     total_budgets = [100, 200, 400, 600, 1000, 1500, 2000, 3500, 5000]
     full_budget = len(in_sum) + len(out_sum)
 
-    results = {key: [] for key in ['steinke', 'fdp', 'ndis']}
+    metric_keys = ('steinke', 'fdp', *NDIS_KEYS)
+    results = {k: [] for k in metric_keys}
     n_trials = 50
 
     print(f"Running sample complexity on total budget for epoch {final_epoch} "
           f"(in={len(in_sum)}, out={len(out_sum)})...")
 
     for budget in total_budgets:
-        trial_data = {key: [] for key in results.keys()}
+        trial_data = {k: [] for k in metric_keys}
 
         for _ in range(n_trials):
             if budget < full_budget:
@@ -335,7 +357,6 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
                 n_in = max(2, min(n_in, len(in_sum)))
                 n_out = max(2, min(n_out, len(out_sum)))
             else:
-                # Use the full available pool when budget meets/exceeds it.
                 n_in = len(in_sum)
                 n_out = len(out_sum)
 
@@ -351,34 +372,33 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
             eps_f, _ = auditor._epsilon_one_run_all_thresholds(
                 significance, delta, True, None, use_fdp=True,
             )
-            eps_n = ndis_eps_lower_bound_with_ci(
-                n_in_scores, n_out_scores, delta=delta,
-                alpha=significance, pool_variance=False,
-            )
+            try:
+                ndis_out = ndis_eps_lb_all(
+                    n_in_scores, n_out_scores, delta=delta,
+                    alpha=significance, pool_variance=True,
+                )
+            except (ValueError, RuntimeError):
+                ndis_out = None
 
             trial_data['steinke'].append(eps_s)
             trial_data['fdp'].append(eps_f)
-            trial_data['ndis'].append(eps_n)
+            for m in NDIS_METHODS:
+                v = float(ndis_out[m]['eps_lb']) if ndis_out is not None else 0.0
+                trial_data[f'ndis_{m}'].append(v)
 
-        for key in results.keys():
-            results[key].append(np.mean(trial_data[key]))
+        for k in metric_keys:
+            results[k].append(np.mean(trial_data[k]))
         print(f"  Total Budget {budget:4d} completed (avg split: {n_in}/{n_out}).")
 
-    # Save numeric results
-    arr = np.column_stack([
-        total_budgets,
-        results['steinke'],
-        results['fdp'],
-        results['ndis'],
-    ])
+    cols = ('total_budget', *metric_keys)
+    arr = np.column_stack([total_budgets, *[results[k] for k in metric_keys]])
     results_path = os.path.join(fig_dir, 'sample_complexity.csv')
     np.savetxt(results_path, arr, delimiter=',',
-               header='total_budget,steinke_2023,fdp_2024,ndis', comments='')
+               header=','.join(cols), comments='')
     print(f"\nResults saved to: {results_path}")
 
     with plt.rc_context(_RC):
-        fig, ax = plt.subplots(figsize=(8, 5))
-
+        fig, ax = plt.subplots(figsize=(9, 5.5))
         ax.grid(True, which="major", ls="-", alpha=0.2)
         ax.grid(True, which="minor", ls=":", alpha=0.1)
 
@@ -387,7 +407,8 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
                        label='Theoretical Bound')
         _plot_method(ax, total_budgets, results['steinke'], 'steinke')
         _plot_method(ax, total_budgets, results['fdp'],     'fdp')
-        _plot_method(ax, total_budgets, results['ndis'],    'ndis')
+        for k in NDIS_KEYS:
+            _plot_method(ax, total_budgets, results[k], k)
 
         ax.set_xscale('log')
         ax.set_xticks(total_budgets)

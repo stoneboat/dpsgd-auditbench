@@ -510,7 +510,149 @@ def ndis_eps_lb_bootstrap_ellipsoid(
     }
 
 
-# ---- (E) Single dispatcher --------------------------------------------------
+# ---- (E) Run all methods with one shared bootstrap pass ---------------------
+
+NDIS_LB_METHODS = (
+    'parametric_bonferroni',
+    'bootstrap_bonferroni',
+    'bootstrap_simultaneous_box',
+    'bootstrap_ellipsoid',
+    'bootstrap_eps_quantile',
+)
+
+
+def ndis_eps_lb_all(
+    in_scores, out_scores, delta: float, *,
+    alpha: float = 0.05, n_bootstrap: int = 2000,
+    pool_variance: bool = False,
+    rng: Optional[np.random.Generator] = None,
+    methods=NDIS_LB_METHODS,
+):
+    """Run every NDIS eps lower-bound method, sharing one bootstrap pass.
+
+    Returns a dict keyed by method name. Each value is the per-method
+    result dict (same shape as the individual constructors), so callers
+    can do `out[method]['eps_lb']` to extract the scalar bound or inspect
+    the diagnostic fields (worst-case theta, CR description, etc.).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    in_scores = np.asarray(in_scores, dtype=float)
+    out_scores = np.asarray(out_scores, dtype=float)
+    results = {}
+
+    needs_param_boot = any(m in methods for m in (
+        'bootstrap_bonferroni', 'bootstrap_simultaneous_box',
+        'bootstrap_ellipsoid', 'bootstrap_eps_quantile',
+    ))
+    samples = (_bootstrap_param_samples(in_scores, out_scores, n_bootstrap, rng)
+               if needs_param_boot else None)
+    theta_hat = np.array([
+        np.mean(in_scores), np.std(in_scores, ddof=1),
+        np.mean(out_scores), np.std(out_scores, ddof=1),
+    ])
+
+    if 'parametric_bonferroni' in methods:
+        results['parametric_bonferroni'] = ndis_eps_lb_parametric_bonferroni(
+            in_scores, out_scores, delta, alpha=alpha, pool_variance=pool_variance,
+        )
+
+    if 'bootstrap_bonferroni' in methods:
+        n_dim = 4
+        a_marg = alpha / n_dim
+        lo = np.quantile(samples, a_marg / 2.0, axis=0)
+        hi = np.quantile(samples, 1.0 - a_marg / 2.0, axis=0)
+        eps_lb, theta_min = _minimize_eps_over_box(
+            lo, hi, delta, pool_variance=pool_variance,
+        )
+        results['bootstrap_bonferroni'] = {
+            'eps_lb': eps_lb, 'theta_min': theta_min,
+            'box_lo': lo, 'box_hi': hi,
+            'method': 'bootstrap_bonferroni',
+        }
+
+    if 'bootstrap_simultaneous_box' in methods:
+        s = samples.std(axis=0, ddof=1)
+        s = np.where(s > 0, s, 1.0)
+        M = np.max(np.abs(samples - theta_hat[None, :]) / s[None, :], axis=1)
+        q = float(np.quantile(M, 1.0 - alpha))
+        lo = theta_hat - q * s
+        hi = theta_hat + q * s
+        eps_lb, theta_min = _minimize_eps_over_box(
+            lo, hi, delta, pool_variance=pool_variance,
+        )
+        results['bootstrap_simultaneous_box'] = {
+            'eps_lb': eps_lb, 'theta_min': theta_min,
+            'box_lo': lo, 'box_hi': hi,
+            'q': q, 'theta_hat': theta_hat,
+            'method': 'bootstrap_simultaneous_box',
+        }
+
+    if 'bootstrap_ellipsoid' in methods:
+        Sigma = np.cov(samples, rowvar=False)
+        Sigma = Sigma + 1e-12 * np.eye(4) * max(np.trace(Sigma) / 4.0, 1e-12)
+        Sigma_inv = np.linalg.inv(Sigma)
+        r2 = chi2.ppf(1.0 - alpha, df=4)
+
+        def constraint_fn(theta, _r2=r2, _Sinv=Sigma_inv, _th=theta_hat):
+            d = theta - _th
+            return _r2 - float(d @ _Sinv @ d)
+
+        cons = ({'type': 'ineq', 'fun': constraint_fn},)
+        bounds = [(-np.inf, np.inf), (1e-9, np.inf),
+                  (-np.inf, np.inf), (1e-9, np.inf)]
+
+        def obj(theta, _delta=delta, _pv=pool_variance):
+            return _eps_of_theta(theta, _delta, pool_variance=_pv)
+
+        best_eps = float(obj(theta_hat))
+        best_theta = theta_hat.copy()
+        try:
+            L = np.linalg.cholesky(Sigma)
+        except np.linalg.LinAlgError:
+            L = np.eye(4) * np.sqrt(np.diag(Sigma).clip(min=1e-12))
+        n_starts = 12
+        starts = [theta_hat]
+        for _ in range(max(0, n_starts - 1)):
+            z = rng.standard_normal(4)
+            nrm = np.linalg.norm(z)
+            if nrm > 0:
+                z = z / nrm * rng.uniform(0.0, math.sqrt(r2))
+            starts.append(theta_hat + L @ z)
+        for x0 in starts:
+            try:
+                res = minimize(obj, x0=x0, method='SLSQP', bounds=bounds,
+                               constraints=cons,
+                               options={'maxiter': 200, 'ftol': 1e-9})
+                if res.success and res.fun < best_eps:
+                    best_eps = float(res.fun)
+                    best_theta = res.x
+            except Exception:
+                pass
+        results['bootstrap_ellipsoid'] = {
+            'eps_lb': max(0.0, best_eps), 'theta_min': best_theta,
+            'theta_hat': theta_hat, 'Sigma': Sigma, 'r2': r2,
+            'method': 'bootstrap_ellipsoid',
+        }
+
+    if 'bootstrap_eps_quantile' in methods:
+        eps_samples = np.empty(n_bootstrap, dtype=float)
+        for i in range(n_bootstrap):
+            eps_samples[i] = _ndis_eps_from_moments(
+                in_mean=samples[i, 0], in_std=samples[i, 1],
+                out_mean=samples[i, 2], out_std=samples[i, 3],
+                delta=delta, pool_variance=pool_variance,
+            )
+        results['bootstrap_eps_quantile'] = {
+            'eps_lb': float(np.quantile(eps_samples, alpha)),
+            'eps_samples': eps_samples,
+            'method': 'bootstrap_eps_quantile',
+        }
+
+    return results
+
+
+# ---- Single dispatcher ------------------------------------------------------
 
 def ndis_eps_lb(
     in_scores, out_scores, delta: float, *,
