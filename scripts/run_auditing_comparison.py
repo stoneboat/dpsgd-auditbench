@@ -130,7 +130,7 @@ def audit_epoch(exp_dir, epoch, delta, significance):
         eps_ndis = ndis_eps_lower_bound_with_ci(
             in_ndis, out_ndis, delta=delta,
             alpha=significance, n_bootstrap=2000,
-            pool_variance=True,
+            pool_variance=False,
         )
     except (ValueError, RuntimeError) as e:
         print(f"  NDIS failed ({e}), setting to 0")
