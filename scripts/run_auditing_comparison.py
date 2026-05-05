@@ -71,15 +71,31 @@ from whitebox_auditing.ndis_1d import (
 )
 
 
+def _resolve_score_path(exp_dir, kind, side, epoch):
+    """Resolve raw-score path: prefer `_sum_` (DP-SGD), fall back to `_optimal_`
+    (DP-FTRL ancestor-sum). Both are scalar per-canary scores with the same
+    in-vs-out semantics for the Steinke/Mahloujifar one-run estimators.
+    """
+    candidates = [
+        os.path.join(exp_dir, f'{side}_scores_{kind}_{epoch:06d}.csv'),
+        os.path.join(exp_dir, f'{side}_scores_optimal_{epoch:06d}.csv'),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
 def audit_epoch(exp_dir, epoch, delta, significance):
     """Run all 3 auditing methods for a given epoch. Returns dict of results."""
-    in_sum_path = os.path.join(exp_dir, f'in_scores_sum_{epoch:06d}.csv')
-    out_sum_path = os.path.join(exp_dir, f'out_scores_sum_{epoch:06d}.csv')
+    in_sum_path = _resolve_score_path(exp_dir, 'sum', 'in', epoch)
+    out_sum_path = _resolve_score_path(exp_dir, 'sum', 'out', epoch)
     in_ndis_path = os.path.join(exp_dir, f'in_scores_ndis_{epoch:06d}.csv')
     out_ndis_path = os.path.join(exp_dir, f'out_scores_ndis_{epoch:06d}.csv')
     privacy_path = os.path.join(exp_dir, f'privacy_params_{epoch:06d}.csv')
 
-    if not all(os.path.isfile(p) for p in [in_sum_path, out_sum_path, in_ndis_path, out_ndis_path]):
+    paths = [in_sum_path, out_sum_path, in_ndis_path, out_ndis_path]
+    if not all(p is not None and os.path.isfile(p) for p in paths):
         return None
 
     in_sum = np.loadtxt(in_sum_path, delimiter=',')
@@ -125,11 +141,14 @@ def audit_epoch(exp_dir, epoch, delta, significance):
 
 
 def get_final_epoch(exp_dir):
-    """Find the largest epoch with score files."""
+    """Find the largest epoch with score files. Accept either `_sum_`
+    (DP-SGD) or `_optimal_` (DP-FTRL) raw-score filenames.
+    """
     epochs = sorted(set(
         int(f.split('_')[-1].replace('.csv', ''))
         for f in os.listdir(exp_dir)
-        if f.startswith('in_scores_sum_') and f.endswith('.csv')
+        if (f.startswith('in_scores_sum_') or f.startswith('in_scores_optimal_'))
+        and f.endswith('.csv')
     ))
     return epochs[-1] if epochs else None
 
@@ -148,10 +167,11 @@ def run_single(exp_dir, delta, significance, fig_dir):
     epochs = sorted(set(
         int(f.split('_')[-1].replace('.csv', ''))
         for f in os.listdir(exp_dir)
-        if f.startswith('in_scores_sum_') and f.endswith('.csv')
+        if (f.startswith('in_scores_sum_') or f.startswith('in_scores_optimal_'))
+        and f.endswith('.csv')
     ))
     if not epochs:
-        print(f"Error: no in_scores_sum_*.csv files found in {exp_dir}")
+        print(f"Error: no in_scores_(sum|optimal)_*.csv files found in {exp_dir}")
         sys.exit(1)
 
     print(f"Found score files for epochs: {epochs}")
