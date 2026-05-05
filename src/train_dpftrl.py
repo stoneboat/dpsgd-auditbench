@@ -11,11 +11,6 @@ and the FTRL update at step t is
 
     theta_t  =  theta_init  -  lr * G_t_noisy.
 
-Privacy: the released sequence (G_1_noisy, ..., G_T_noisy) is a function of
-the underlying tree-of-Gaussians, which has L2 sensitivity sqrt(log_2 T) to
-a single canary contributing magnitude C to one leaf. Per-node sigma is
-calibrated by `tree_mechanism.tree_sigma_for_eps`.
-
 Audit setup:
   * Each canary i has a fixed dirac direction (`canary_dirac_indices[i]` =
     a (param_idx, flat_idx) pair) and a fixed leaf t_star_i in [0, T).
@@ -33,9 +28,6 @@ Audit setup:
         of the fresh noise tensor at canary i's coord (~log T floats per
         canary, ~hundreds of KB).
     At the end, we sum ancestor partial sums + ancestor noises per canary.
-  * For comparison with prior work (Steinke 2023 / Mahloujifar 2024) we
-    also record the "telescoping" score = projection of G_T_noisy on each
-    canary direction at the final step.
 """
 
 from __future__ import annotations
@@ -138,8 +130,6 @@ def _clip_and_sum_grad_samples(
 # ---------------------------------------------------------------------------
 # DP-FTRL state -- streaming Honaker tree + audit recording.
 # ---------------------------------------------------------------------------
-
-
 class DPFTRLState:
     def __init__(
         self,
@@ -170,12 +160,10 @@ class DPFTRLState:
         self.in_mask = np.asarray(canary_inclusion_mask, dtype=bool)
         self.canary_scale = float(canary_scale)
 
-        # Per-leaf inclusion lookup.
         self._canaries_at_leaf: Dict[int, List[int]] = {}
         for i, t in enumerate(self.leaf_of):
             self._canaries_at_leaf.setdefault(int(t), []).append(i)
 
-        # Coord lookup per parameter (for fast index_add).
         self._coords_by_param: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         by_param: Dict[int, List[Tuple[int, int]]] = {}
         for i, (p_idx, flat_idx) in enumerate(canary_dirac_indices):
@@ -185,13 +173,8 @@ class DPFTRLState:
             ids   = torch.tensor([i for _, i in lst], device=device, dtype=torch.long)
             self._coords_by_param[p_idx] = (flats, ids)
 
-        # Audit records (CPU, computed at the end).
         self.leaf_proj  = np.zeros((self.T, self.m), dtype=np.float32)
         self.node_noise_proj: Dict[Tuple[int, int], np.ndarray] = {}
-
-        # Telescoping score (running snapshot at each step; only the last
-        # value matters for the standard Steinke-style comparison).
-        self.telescope_score = torch.zeros(self.m, device=device)
 
     # ----------------------------------------------------------------------
     def _project_to_canaries(self, tensors: List[torch.Tensor]) -> np.ndarray:
@@ -210,23 +193,11 @@ class DPFTRLState:
                 leaf_grad[p_idx].view(-1)[flat_idx] += self.canary_scale
 
     def step(self, leaf_grad: List[torch.Tensor], t: int) -> List[torch.Tensor]:
-        """Advance the streaming tree by one leaf. `t` is 0-indexed leaf #.
-
-        Side-effects: updates clean_G, canonical_noise, audit records, and
-        telescoping score. Returns the noisy cumulative gradient G_t_noisy.
-        """
-        # 1) Inject canary signals into the leaf BEFORE anything else.
         self._inject_canaries(leaf_grad, t)
-
-        # 2) Record the (now canary-injected) leaf gradient's per-canary projection.
         self.leaf_proj[t, :] = self._project_to_canaries(leaf_grad)
-
-        # 3) Update running clean gradient sum.
         for c, g in zip(self.clean_G, leaf_grad):
             c.add_(g)
 
-        # 4) Update canonical noise: drop noises of nodes that just rolled up,
-        #    generate fresh noise for nodes that were just activated.
         added = _bit_decomposition_set(t + 1) - _bit_decomposition_set(t)
         removed = _bit_decomposition_set(t) - _bit_decomposition_set(t + 1)
         for node in removed:
@@ -238,17 +209,9 @@ class DPFTRLState:
             self.noise_per_active[node] = noise
             for canon, n_t in zip(self.canonical_noise, noise):
                 canon.add_(n_t)
-            # Record this node's noise projection on every canary.
             self.node_noise_proj[node] = self._project_to_canaries(noise)
 
-        # 5) Compute G_t_noisy (lazy: just clean_G + canonical_noise).
         noisy_G = [c + n for c, n in zip(self.clean_G, self.canonical_noise)]
-
-        # 6) Telescoping audit snapshot (the LAST value at t = T-1 is the one we report).
-        self.telescope_score = torch.zeros(self.m, device=self.device)
-        for p_idx, (flats, ids) in self._coords_by_param.items():
-            self.telescope_score.index_add_(0, ids, noisy_G[p_idx].view(-1)[flats])
-
         return noisy_G
 
     # ----------------------------------------------------------------------
@@ -283,14 +246,10 @@ class DPFTRLState:
                 scores[i] += clean_part + noise_part
         return scores
 
-    def telescope_scores(self) -> np.ndarray:
-        return self.telescope_score.detach().cpu().numpy().astype(np.float64)
-
 
 # ---------------------------------------------------------------------------
 # Main training loop
 # ---------------------------------------------------------------------------
-
 
 def train_dpftrl_whitebox(
     model: nn.Module,
@@ -385,12 +344,6 @@ def train_dpftrl_whitebox(
             if samples_in_batch >= logical_batch_size:
                 # ---- one DP-FTRL step ----
                 noisy_G = state.step(accum_grad, leaves_done)
-
-                # FTRL update: theta = theta_init - (lr / B) * G_t_noisy.
-                # accum_grad is a SUM of B clipped per-sample grads (sensitivity C
-                # per leaf, matching sigma_node calibration). Dividing by the
-                # logical batch size here puts the update on the same per-step
-                # scale as DP-SGD's mean-grad SGD step.
                 step_scale = lr / float(logical_batch_size)
                 with torch.no_grad():
                     for p, init, n in zip(params, theta_init, noisy_G):

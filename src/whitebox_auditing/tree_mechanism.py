@@ -1,24 +1,4 @@
-"""Clean simulator for the binary-tree (a.k.a. Honaker / DPCP) Gaussian
-mechanism over a stream of T scalar leaves.
-
-Use case: auditing DP-FTRL-style training, where the released signal is a
-noisy *prefix sum* of per-step gradients, and noise is correlated across
-prefix queries because adjacent prefixes share most of their tree nodes.
-
-Per-step model:
-    leaves[i] in R, sensitivity 1 (a single canary contributes mu to leaf
-    `t_star` and 0 elsewhere).
-    Each tree node value = (sum of its leaf descendants) + N(0, sigma^2),
-    independent across nodes.
-
-Privacy: a single-record neighboring change flips contributions on the
-log_2(T) ancestor nodes of the canary's leaf. Net L2 sensitivity =
-sqrt(log_2 T), so the whole mechanism is a Gaussian mechanism with
-sensitivity sqrt(log_2 T) and noise sigma.
-
-Score conventions match `laplace_composition.py` so the same auditors
-(`CanaryScoreAuditor`, `ndis_eps_from_delta_1d_brentq`) drop in.
-"""
+"""Clean simulator for the binary-tree (a.k.a. Honaker / DPCP) Gaussian mechanism over a stream of T scalar leaves."""
 
 from __future__ import annotations
 
@@ -41,11 +21,6 @@ def num_levels(T: int) -> int:
 
 def prefix_decomposition(t: int) -> List[Tuple[int, int]]:
     """Canonical set of tree nodes covering the prefix [0..t] (inclusive).
-
-    Returns a list of (level, idx) tuples, where level=0 are leaves, level=L
-    is the root of a 2^L-leaf subtree, and idx is the within-level position.
-    The returned ranges are pairwise disjoint and union to [0..t]; the size
-    of the list equals popcount(t+1) in {0, ..., ceil(log2 T)}.
     """
     if t < 0:
         return []
@@ -60,15 +35,8 @@ def prefix_decomposition(t: int) -> List[Tuple[int, int]]:
     return nodes
 
 
-def tree_release(
-    leaves: np.ndarray,
-    sigma: float,
-    rng: np.random.Generator,
-) -> Dict[Tuple[int, int], float]:
-    """Build the noised binary tree over `leaves`. Returns a dict keyed by
-    (level, idx) mapping to the noised partial sum.
-
-    Memory: O(T) (sum across levels = 2T - 1 for T a power of two).
+def tree_release(leaves: np.ndarray, sigma: float, rng: np.random.Generator) -> Dict[Tuple[int, int], float]:
+    """Build the noised binary tree over `leaves`.
     """
     T = _next_pow2(len(leaves))
     padded = np.zeros(T, dtype=float)
@@ -79,11 +47,6 @@ def tree_release(
     noise0 = rng.normal(loc=0.0, scale=sigma, size=T)
     for i in range(T):
         tree[(0, i)] = float(padded[i] + noise0[i])
-
-    # Levels 1..L: each node = sum of its two children's *clean* leaf totals
-    # plus a fresh independent N(0, sigma^2). Tracking clean partial sums
-    # separately keeps the noise truly independent across levels (the
-    # standard Honaker construction).
     clean = padded.copy()
     L = num_levels(T)
     for level in range(1, L + 1):
@@ -105,14 +68,6 @@ def prefix_sum_at(tree: Dict[Tuple[int, int], float], t: int) -> float:
 # ---------------------------------------------------------------------------
 # Vectorized simulators (no full tree construction needed for the audit).
 # ---------------------------------------------------------------------------
-#
-# When auditing, we only care about the noisy prefix sum at one or a few
-# observation times t. The covering node set has popcount(t+1) elements;
-# their *aggregate* noise is N(0, popcount(t+1) * sigma^2). So for n
-# independent runs we can sample the score directly without materializing
-# the tree.
-
-
 def num_covering_nodes(t: int) -> int:
     """popcount(t+1): number of tree nodes in the canonical prefix [0..t]."""
     return bin(t + 1).count("1")
@@ -120,27 +75,12 @@ def num_covering_nodes(t: int) -> int:
 
 def ancestors(t: int, T: int) -> List[Tuple[int, int]]:
     """All log_2(T) + 1 tree nodes on the leaf-to-root path from leaf `t`.
-
-    A canary contributing magnitude C to leaf `t` perturbs every ancestor's
-    partial sum by exactly C (because each ancestor sums all leaves in its
-    subtree, and `t` lives in every ancestor's subtree by definition).
-    The set returned therefore identifies every node that carries a copy of
-    the canary signal, which is exactly the set the SNR-optimal audit
-    statistic averages over.
     """
     L = num_levels(_next_pow2(T))
     return [(level, t >> level) for level in range(L + 1)]
 
 
-def sample_optimal_audit_scores(
-    t_star: int,
-    sigma: float,
-    n: int,
-    rng: np.random.Generator,
-    *,
-    T: int,
-    canary_mu: float = 0.0,
-) -> np.ndarray:
+def sample_optimal_audit_scores(t_star: int, sigma: float, n: int, rng: np.random.Generator, *, T: int, canary_mu: float = 0.0,) -> np.ndarray:
     """SNR-optimal audit statistic: sum of noisy values over ancestors of `t_star`.
 
     The canary contributes `canary_mu` to leaf `t_star`, and every one of
@@ -154,14 +94,7 @@ def sample_optimal_audit_scores(
     return canary_mu * L + rng.normal(0.0, sigma * math.sqrt(L), size=n)
 
 
-def sample_prefix_scores(
-    t_star: int,
-    sigma: float,
-    n: int,
-    rng: np.random.Generator,
-    *,
-    canary_mu: float = 0.0,
-    leaf_baseline: float = 0.0,
+def sample_prefix_scores(t_star: int, sigma: float, n: int, rng: np.random.Generator, *, canary_mu: float = 0.0, leaf_baseline: float = 0.0,
 ) -> np.ndarray:
     """Simulate the noisy prefix sum at time t_star for `n` independent runs.
 
@@ -188,8 +121,6 @@ def sample_prefix_scores(
 # ---------------------------------------------------------------------------
 # Privacy accounting: per-node sigma calibrated to (eps, delta).
 # ---------------------------------------------------------------------------
-
-
 def _balle_wang_delta(eps: float, mu_gdp: float) -> float:
     """Tight (eps, delta) for the Gaussian mechanism with parameter
     mu_gdp = sensitivity / sigma. Balle & Wang (2018), Theorem 8.
@@ -203,18 +134,7 @@ def _balle_wang_delta(eps: float, mu_gdp: float) -> float:
     return phi(-a + 0.5 * mu_gdp) - math.exp(eps) * phi(-a - 0.5 * mu_gdp)
 
 
-def tree_sigma_for_eps(
-    target_eps: float, T: int, delta: float, *, sigma_max: float = 1e6
-) -> float:
-    """Per-node Gaussian sigma so the *whole* tree release is (eps, delta)-DP.
-
-    Our Honaker construction adds independent N(0, sigma^2) noise at every
-    level of the tree -- the log_2(T) internal levels AND the leaf level
-    (level 0). A single-record change therefore flips contributions on
-    log_2(T) + 1 ancestor nodes, and the L2 sensitivity of the full release
-    is sqrt(log_2(T) + 1). Calibrate sigma via the analytic Gaussian DP
-    formula (Balle & Wang 2018).
-    """
+def tree_sigma_for_eps(target_eps: float, T: int, delta: float, *, sigma_max: float = 1e6) -> float:
     if not (0.0 < delta < 1.0):
         raise ValueError(f"delta must be in (0, 1), got {delta}.")
     if target_eps <= 0.0:
@@ -222,9 +142,7 @@ def tree_sigma_for_eps(
     L = max(1, num_levels(T)) + 1   # +1 for the noisy leaf level
     sens = math.sqrt(L)
 
-    # delta is monotonically decreasing in sigma; bisect on sigma.
     lo, hi = 1e-6, sigma_max
-    # Ensure delta(hi) < delta_target.
     while _balle_wang_delta(target_eps, sens / hi) > delta:
         hi *= 2.0
         if hi > sigma_max * 1024:
@@ -238,9 +156,7 @@ def tree_sigma_for_eps(
     return hi
 
 
-def tree_eps_for_sigma(
-    sigma: float, T: int, delta: float, *, eps_max: float = 100.0
-) -> float:
+def tree_eps_for_sigma(sigma: float, T: int, delta: float, *, eps_max: float = 100.0) -> float:
     """Inverse: tightest eps for the tree mechanism at given per-node sigma."""
     if sigma <= 0.0:
         raise ValueError(f"sigma must be positive, got {sigma}.")
@@ -261,28 +177,10 @@ def tree_eps_for_sigma(
             hi = mid
     return hi
 
-
 # ---------------------------------------------------------------------------
 # NDIS Gaussian-vs-Gaussian parameters at one prefix observation point.
 # ---------------------------------------------------------------------------
-
-
-def ndis_gaussian_params(
-    t_star: int, sigma: float, mu: float = 1.0
-) -> dict:
-    """Single-observation NDIS parameters for the Gaussian tree mechanism.
-
-    Score = noisy prefix sum at t_star.
-        Out canary: score ~ N(0,            k * sigma^2)
-        In canary:  score ~ N(mu,           k * sigma^2)
-    where k = popcount(t_star + 1) is the number of covering nodes.
-
-    The two distributions have *equal variance*, so NDIS reduces to the
-    Balle-Wang one-shot Gaussian with mu_gdp = mu / (sigma * sqrt(k)).
-    Provided here for parity with `laplace_composition.ndis_gaussian_params`;
-    pass directly into `ndis_eps_from_delta_1d_brentq` (which handles the
-    equal-variance limit by detecting sigma1 == sigma2).
-    """
+def ndis_gaussian_params(t_star: int, sigma: float, mu: float = 1.0) -> dict:
     k = num_covering_nodes(t_star)
     s = sigma * math.sqrt(k)
     return {

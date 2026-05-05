@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
-"""Generate in/out audit scores for white-box DP-FTRL auditing.
+"""Generate in/out audit scores for DP-FTRL on ScatterLinear (Path B).
 
-Trains a DP-FTRL model (centralized, tree-aggregated Gaussian noise) with gradient-space dirac canaries on CIFAR-10
+Trains a Tramer-Boneh-style ScatterLinear (kymatio scattering features + a
+linear classifier) under DP-FTRL with tree-aggregated Gaussian noise, and
+emits per-canary white-box audit scores. Designed for single-pass training
+(T = N / B leaves) so each canary fires at exactly one leaf, matching the
+white-box auditing protocol implemented in `src/train_dpftrl.py` without any
+modification to that file.
+
+This script is independent of `gen_scores_DP_FTRL_whitebox.py` (the WRN /
+Path C job); both can be submitted in parallel.
 """
 
 import sys
@@ -10,7 +18,6 @@ import math
 import json
 import secrets
 import argparse
-import logging
 import numpy as np
 import torch
 
@@ -19,9 +26,9 @@ project_dir = os.path.abspath(os.path.join(script_dir, ".."))
 src_dir = os.path.join(project_dir, "src")
 sys.path.append(src_dir)
 
-from utils import setup_logging, save_checkpoint, find_latest_checkpoint, load_checkpoint
+from utils import setup_logging
 from dataset import get_data_loaders
-from network_arch import WideResNet
+from scatter_network import ScatterLinear
 from train_dpftrl import train_dpftrl_whitebox, test
 from whitebox_auditing.tree_mechanism import (
     tree_sigma_for_eps,
@@ -31,24 +38,27 @@ from whitebox_auditing.tree_mechanism import (
 
 
 # ==========================================
-# Default Hyperparameters (parity with DP-SGD recipe)
+# Defaults: single-pass DP-FTRL on CIFAR-10 with ScatterLinear.
+#   N=50000, B=500  -> T = 100 leaves (one full pass).
 # ==========================================
-DEFAULT_LOGICAL_BATCH_SIZE = 4096
-DEFAULT_MAX_PHYSICAL_BATCH_SIZE = 128
-DEFAULT_AUG_MULTIPLICITY = 16
+DEFAULT_LOGICAL_BATCH_SIZE = 500
+DEFAULT_MAX_PHYSICAL_BATCH_SIZE = 500
+DEFAULT_AUG_MULTIPLICITY = 1
 DEFAULT_MAX_GRAD_NORM = 1.0
 DEFAULT_EPSILON = 8.0
 DEFAULT_DELTA = 1e-5
-DEFAULT_TARGET_STEPS = 2500
-DEFAULT_EMA_DECAY = 0.9999
-DEFAULT_LR = 4.0
-DEFAULT_CKPT_INTERVAL = 20
+DEFAULT_TARGET_STEPS = 100
+DEFAULT_EMA_DECAY = 0.0
+DEFAULT_LR = 1.0
 DEFAULT_CANARY_COUNT = 5000
 DEFAULT_PKEEP = 0.5
+DEFAULT_J = 2
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate scores for DP-FTRL auditing")
+    parser = argparse.ArgumentParser(
+        description="Generate scores for DP-FTRL auditing on ScatterLinear (single-pass).",
+    )
     parser.add_argument("--logical-batch-size", type=int, default=DEFAULT_LOGICAL_BATCH_SIZE)
     parser.add_argument("--max-physical-batch-size", type=int, default=DEFAULT_MAX_PHYSICAL_BATCH_SIZE)
     parser.add_argument("--aug-multiplicity", type=int, default=DEFAULT_AUG_MULTIPLICITY)
@@ -57,12 +67,13 @@ def main():
     parser.add_argument("--delta", type=float, default=DEFAULT_DELTA)
     parser.add_argument("--target-steps", type=int, default=DEFAULT_TARGET_STEPS,
                         help="Total DP-FTRL leaves; tree depth = ceil(log_2 target_steps).")
-    parser.add_argument("--ema-decay", type=float, default=DEFAULT_EMA_DECAY)
+    parser.add_argument("--ema-decay", type=float, default=DEFAULT_EMA_DECAY,
+                        help="EMA decay; <=0 disables EMA (default for single-pass).")
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
-    parser.add_argument("--ckpt-interval", type=int, default=DEFAULT_CKPT_INTERVAL,
-                        help="Score-snapshot interval, measured in DP-FTRL leaves.")
     parser.add_argument("--canary-count", type=int, default=DEFAULT_CANARY_COUNT)
     parser.add_argument("--pkeep", type=float, default=DEFAULT_PKEEP)
+    parser.add_argument("--scattering-J", type=int, default=DEFAULT_J,
+                        help="Number of scales for the kymatio scattering transform.")
     parser.add_argument("--database-seed", type=str, default=None)
     parser.add_argument("--data-dir", type=str, default="./data")
     parser.add_argument("--log-dir", type=str, default="./logs")
@@ -83,12 +94,10 @@ def main():
 
     exp_dir = os.path.join(
         args.data_dir,
-        f"dpftrl-canaries-{DATABSEED}-{args.canary_count}-{args.pkeep}-cifar10",
+        f"dpftrl-scatter-canaries-{DATABSEED}-{args.canary_count}-{args.pkeep}-cifar10",
     )
     os.makedirs(exp_dir, exist_ok=True)
     logger.info(f"Experiment directory: {exp_dir}")
-    ckpt_dir = os.path.join(exp_dir, "ckpt")
-    os.makedirs(ckpt_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Run experiment on device: {device}")
@@ -101,7 +110,6 @@ def main():
     rng = np.random.default_rng(torch_seed)
     logger.info(f"Set random seeds (torch, numpy) to: {torch_seed}")
 
-    # Calibrate per-node sigma for the whole tree mechanism.
     sigma_node = tree_sigma_for_eps(args.epsilon, args.target_steps, args.delta)
     eps_check = tree_eps_for_sigma(sigma_node, args.target_steps, args.delta)
     logger.info(
@@ -109,8 +117,9 @@ def main():
         f"sigma_node={sigma_node:.4f}, target eps={args.epsilon}, eps roundtrip={eps_check:.4f}"
     )
 
-    params = {
-        "mechanism": "DP-FTRL (tree-aggregated Gaussian)",
+    params_summary = {
+        "mechanism": "DP-FTRL (tree-aggregated Gaussian) on ScatterLinear",
+        "model": f"ScatterLinear (kymatio J={args.scattering_J})",
         "logical_batch_size": args.logical_batch_size,
         "max_physical_batch_size": args.max_physical_batch_size,
         "aug_multiplicity": args.aug_multiplicity,
@@ -122,13 +131,13 @@ def main():
         "sigma_node": sigma_node,
         "ema_decay": args.ema_decay,
         "lr": args.lr,
-        "ckpt_interval": args.ckpt_interval,
         "canary_count": args.canary_count,
         "pkeep": args.pkeep,
+        "scattering_J": args.scattering_J,
         "database_seed": DATABSEED,
     }
     with open(os.path.join(exp_dir, "hparams.json"), "w") as f:
-        json.dump(params, f, indent=2)
+        json.dump(params_summary, f, indent=2)
 
     logger.info("Loading data...")
     train_loader, test_dataset = get_data_loaders(
@@ -140,26 +149,27 @@ def main():
         test_dataset, batch_size=1024, shuffle=False, num_workers=args.num_workers
     )
 
-    logger.info("Creating model...")
-    model = WideResNet(depth=16, widen_factor=4).to(device)
+    logger.info("Creating ScatterLinear model...")
+    model = ScatterLinear(num_classes=10, image_size=32, J=args.scattering_J).to(device)
+    logger.info(f"  feat_dim = {model.feat_dim}")
 
     if args.ema_decay > 0:
-        ema_model = WideResNet(depth=16, widen_factor=4).to(device).eval()
+        ema_model = ScatterLinear(num_classes=10, image_size=32, J=args.scattering_J).to(device).eval()
         with torch.no_grad():
             for p_ema, p in zip(ema_model.parameters(), model.parameters()):
                 p_ema.data.copy_(p.data)
         for p in ema_model.parameters():
             p.requires_grad_(False)
-        logger.info(f"EMA enabled with decay {args.ema_decay} (TIMM warmup)")
+        logger.info(f"EMA enabled with decay {args.ema_decay}")
     else:
         ema_model = None
-        logger.info("EMA disabled")
+        logger.info("EMA disabled (single-pass default)")
 
-    params_list = list(model.parameters())
+    params_list = [p for p in model.parameters() if p.requires_grad]
     total_coords = sum(p.numel() for p in params_list)
     if args.canary_count > total_coords:
         raise ValueError(
-            f"canary_count={args.canary_count} > total model coords {total_coords}"
+            f"canary_count={args.canary_count} > learnable coords {total_coords}"
         )
     flat_offsets = np.cumsum([0] + [p.numel() for p in params_list])
     chosen_flat = rng.choice(total_coords, size=args.canary_count, replace=False)
@@ -173,7 +183,6 @@ def main():
                np.array(canary_dirac_indices, dtype=int), delimiter=",", fmt="%d",
                header="param_idx,flat_idx", comments="")
 
-    # Inclusion mask (Bernoulli(pkeep)) -- single coin flip per canary.
     mask_path = os.path.join(exp_dir, "inclusion_mask.csv")
     if os.path.isfile(mask_path):
         inclusion_mask = np.loadtxt(mask_path, delimiter=",").astype(bool)
@@ -183,7 +192,6 @@ def main():
         np.savetxt(mask_path, inclusion_mask.astype(int), delimiter=",", fmt="%d")
         logger.info(f"Inclusion mask saved to: {mask_path}")
 
-    # Canary leaf assignment: each canary fires at exactly one leaf.
     leaves_path = os.path.join(exp_dir, "canary_leaves.csv")
     if os.path.isfile(leaves_path):
         canary_leaves = np.loadtxt(leaves_path, delimiter=",").astype(np.int64)
@@ -199,7 +207,7 @@ def main():
 
     canary_scale = float(args.max_grad_norm)
 
-    logger.info("Starting DP-FTRL training...")
+    logger.info("Starting DP-FTRL training (ScatterLinear, single-pass)...")
     logger.info(f"  T (leaves): {args.target_steps}")
     logger.info(f"  LR: {args.lr}")
     logger.info(f"  Logical batch size: {args.logical_batch_size}")
