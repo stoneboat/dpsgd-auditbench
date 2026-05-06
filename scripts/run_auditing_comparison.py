@@ -11,10 +11,10 @@ Usage:
   # Single experiment directory:
   python scripts/run_auditing_comparison.py --exp-dir ./data/mislabeled-canaries-<seed>-5000-0.5-cifar10
 
-  # Multiple experiment directories (one per epsilon), final-epoch bar chart:
+  # Multiple experiment directories (one per epsilon), final-epoch bar chart & ablation:
   python scripts/run_auditing_comparison.py --exp-dirs ./data/exp_eps1 ./data/exp_eps2 ./data/exp_eps4 ./data/exp_eps8
 
-  # Sample-complexity sweep on a single experiment:
+  # Sample-complexity sweep on a single experiment (Generates Main + Ablation plots):
   python scripts/run_auditing_comparison.py --complexity --exp-dir ./data/mislabeled-canaries-<seed>-5000-0.5-cifar10
 """
 
@@ -42,7 +42,7 @@ _RC = {
     'xtick.major.width': 0.8,
     'ytick.major.width': 0.8,
     'legend.frameon': False,
-    'legend.fontsize': 14,
+    'legend.fontsize': 11,
     'figure.dpi': 120,
 }
 
@@ -50,9 +50,9 @@ _STYLE = {
     'upper':   {'color': '#555555', 'marker': '',  'linestyle': (0, (3, 5, 1, 5)),  'linewidth': 1.4, 'markersize': 0,  'zorder': 1, 'label': 'Theoretical (upper bound)'},
     'steinke': {'color': '#ff7f0e', 'marker': 'o', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 2, 'label': 'Steinke et al. 2023'},
     'fdp':     {'color': '#2ca02c', 'marker': 's', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 3, 'label': 'Mahloujifar et al. 2024 (f-DP)'},
-    # NDIS lower-bound variants (this paper). One style per method.
-    'ndis_parametric_bonferroni': {'color': '#1f77b4', 'marker': 'D', 'linestyle': '-', 'linewidth': 2.0, 'markersize': 6, 'zorder': 5, 'label': 'NDIS: parametric Bonferroni'},
-    'ndis_bootstrap_ellipsoid':   {'color': '#e377c2', 'marker': '*', 'linestyle': '-', 'linewidth': 2.0, 'markersize': 8, 'zorder': 8, 'label': 'NDIS: bootstrap ellipsoid'},
+    # NDIS lower-bound variants
+    'ndis_parametric_bonferroni': {'color': '#02A1BA', 'marker': 'D', 'linestyle': '-', 'linewidth': 2.0, 'markersize': 6, 'zorder': 5, 'label': 'This paper'},
+    'ndis_bootstrap_ellipsoid':   {'color': '#1f77b4', 'marker': '*', 'linestyle': '-', 'linewidth': 2.4, 'markersize': 10, 'zorder': 8, 'label': 'This paper'},
 }
 
 NDIS_METHODS = (
@@ -70,6 +70,7 @@ def _plot_method(ax, x, y, key):
             label=s['label'], zorder=s['zorder'],
             markerfacecolor=s['color'], markeredgecolor='white', markeredgewidth=0.6)
 
+
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_dir = os.path.abspath(os.path.join(script_dir, '..'))
 src_dir = os.path.join(project_dir, 'src')
@@ -83,10 +84,6 @@ from whitebox_auditing.ndis_1d import (
 
 
 def _resolve_score_path(exp_dir, kind, side, epoch):
-    """Resolve raw-score path: prefer `_sum_` (DP-SGD), fall back to `_optimal_`
-    (DP-FTRL ancestor-sum). Both are scalar per-canary scores with the same
-    in-vs-out semantics for the Steinke/Mahloujifar one-run estimators.
-    """
     candidates = [
         os.path.join(exp_dir, f'{side}_scores_{kind}_{epoch:06d}.csv'),
         os.path.join(exp_dir, f'{side}_scores_optimal_{epoch:06d}.csv'),
@@ -98,11 +95,6 @@ def _resolve_score_path(exp_dir, kind, side, epoch):
 
 
 def audit_epoch(exp_dir, epoch, delta, significance, method=None):
-    """Run all auditing methods for a given epoch. Returns dict of results.
-
-    `method` is ignored (kept for backwards compatibility); all NDIS
-    lower-bound variants are computed on a single shared bootstrap pass.
-    """
     in_sum_path = _resolve_score_path(exp_dir, 'sum', 'in', epoch)
     out_sum_path = _resolve_score_path(exp_dir, 'sum', 'out', epoch)
     in_ndis_path = os.path.join(exp_dir, f'in_scores_ndis_{epoch:06d}.csv')
@@ -118,32 +110,24 @@ def audit_epoch(exp_dir, epoch, delta, significance, method=None):
     in_ndis = np.loadtxt(in_ndis_path, delimiter=',')
     out_ndis = np.loadtxt(out_ndis_path, delimiter=',')
 
-    # Pooled empirical std vs theoretical
     emp_std = np.std(np.concatenate([in_ndis, out_ndis]), ddof=1)
     mu_sep  = np.mean(in_ndis) - np.mean(out_ndis)
-    print(f"emp_std={emp_std:.4f}, mu_sep={mu_sep:.4f}, "
-          f"theoretical sigma_node={...}")
+    print(f"emp_std={emp_std:.4f}, mu_sep={mu_sep:.4f}")
 
-
-    # Theoretical upper bound
     if os.path.isfile(privacy_path):
         pp = np.loadtxt(privacy_path, delimiter=',', skiprows=1)
         eps_upper = float(pp[0]) if pp.ndim == 1 else float(pp[0, 0])
     else:
         eps_upper = float('nan')
 
-    # Steinke et al. 2023 and Mahloujifar et al. 2024.
     auditor = CanaryScoreAuditor(in_sum, out_sum)
     eps_steinke, _ = auditor._epsilon_one_run_all_thresholds(
-        significance=significance, delta=delta, one_sided=True, threshold=None,
-        use_fdp=False,
+        significance=significance, delta=delta, one_sided=True, threshold=None, use_fdp=False,
     )
     eps_fdp, _ = auditor._epsilon_one_run_all_thresholds(
-        significance=significance, delta=delta, one_sided=True, threshold=None,
-        use_fdp=True,
+        significance=significance, delta=delta, one_sided=True, threshold=None, use_fdp=True,
     )
 
-    # NDIS: run all lower-bound variants on one shared bootstrap pass.
     ndis_results = {f'ndis_{m}': 0.0 for m in NDIS_METHODS}
     try:
         all_out = ndis_eps_lb_all(
@@ -165,9 +149,6 @@ def audit_epoch(exp_dir, epoch, delta, significance, method=None):
 
 
 def get_final_epoch(exp_dir):
-    """Find the largest epoch with score files. Accept either `_sum_`
-    (DP-SGD) or `_optimal_` (DP-FTRL) raw-score filenames.
-    """
     epochs = sorted(set(
         int(f.split('_')[-1].replace('.csv', ''))
         for f in os.listdir(exp_dir)
@@ -178,7 +159,6 @@ def get_final_epoch(exp_dir):
 
 
 def get_target_epsilon(exp_dir):
-    """Read target epsilon from hparams.json."""
     hparams_path = os.path.join(exp_dir, 'hparams.json')
     if os.path.isfile(hparams_path):
         with open(hparams_path) as f:
@@ -214,7 +194,6 @@ def run_single(exp_dir, delta, significance, fig_dir):
         print(f"  Epoch {epoch:4d}: upper={result['upper']:.3f}, "
               f"steinke={result['steinke']:.3f}, fdp={result['fdp']:.3f}, {ndis_str}")
 
-    # Save results
     cols = ('epoch', 'upper', 'steinke', 'fdp', *NDIS_KEYS)
     results = np.column_stack([series[c] for c in cols])
     results_path = os.path.join(exp_dir, 'auditing_results.csv')
@@ -222,19 +201,20 @@ def run_single(exp_dir, delta, significance, fig_dir):
                header=','.join(cols), comments='')
     print(f"\nResults saved to: {results_path}")
 
-    # Plot
+    # Plot (Only plotting Ellipsoid for the NDIS method to keep it clean)
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(10, 6))
         _plot_method(ax, series['epoch'], series['upper'],   'upper')
         _plot_method(ax, series['epoch'], series['steinke'], 'steinke')
         _plot_method(ax, series['epoch'], series['fdp'],     'fdp')
-        for k in NDIS_KEYS:
-            _plot_method(ax, series['epoch'], series[k], k)
+        _plot_method(ax, series['epoch'], series['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid')
+
         ax.set_xlabel('Epoch')
         ax.set_ylabel(r'$\varepsilon$')
         ax.set_ylim(bottom=0)
         ax.legend(loc='upper left', fontsize=10)
         fig.tight_layout()
+
         fig_path = os.path.join(fig_dir, 'privacy_bounds_comparison.png')
         fig.savefig(fig_path, dpi=300, bbox_inches='tight')
         fig.savefig(fig_path.replace('.png', '.pdf'), bbox_inches='tight')
@@ -277,12 +257,10 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
         print("Error: no valid experiments found")
         sys.exit(1)
 
-    # Sort by target epsilon
     order = np.argsort(series['target'])
     for k in series:
         series[k] = [series[k][i] for i in order]
 
-    # Save results
     cols = ('target', 'upper', 'steinke', 'fdp', *NDIS_KEYS)
     results = np.column_stack([series[c] for c in cols])
     results_path = os.path.join(fig_dir, 'auditing_comparison_final.csv')
@@ -290,13 +268,15 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
                header=','.join(cols), comments='')
     print(f"\nResults saved to: {results_path}")
 
+    # ==========================================
+    # 1. Main Plot: Comparison with all methods (Ellipsoid only for NDIS)
+    # ==========================================
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(11, 6.5))
         _plot_method(ax, series['target'], series['upper'],   'upper')
         _plot_method(ax, series['target'], series['steinke'], 'steinke')
         _plot_method(ax, series['target'], series['fdp'],     'fdp')
-        for k in NDIS_KEYS:
-            _plot_method(ax, series['target'], series[k], k)
+        _plot_method(ax, series['target'], series['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid')
 
         ax.set_xlabel(r'Theoretical $\varepsilon$')
         ax.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
@@ -308,7 +288,28 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
         fig_path = os.path.join(fig_dir, 'privacy_bounds_comparison_multi_eps.png')
         fig.savefig(fig_path, dpi=300, bbox_inches='tight')
         fig.savefig(fig_path.replace('.png', '.pdf'), bbox_inches='tight')
-        print(f"Figure saved to: {fig_path} (and .pdf)")
+        print(f"Main figure saved to: {fig_path} (and .pdf)")
+
+    # ==========================================
+    # 2. Ablation Plot: CR Geometry Comparison
+    # ==========================================
+    with plt.rc_context(_RC):
+        fig_abl, ax_abl = plt.subplots(figsize=(11, 6.5))
+        _plot_method(ax_abl, series['target'], series['upper'], 'upper')
+        _plot_method(ax_abl, series['target'], series['ndis_parametric_bonferroni'], 'ndis_parametric_bonferroni')
+        _plot_method(ax_abl, series['target'], series['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid')
+
+        ax_abl.set_xlabel(r'Theoretical $\varepsilon$')
+        ax_abl.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
+        ax_abl.set_xticks(series['target'])
+        ax_abl.set_ylim(bottom=0)
+        ax_abl.legend(loc='upper left', handlelength=2.5, fontsize=10)
+        fig_abl.tight_layout()
+
+        ablation_fig_path = os.path.join(fig_dir, 'ablation_cr_geometry_multi_eps.png')
+        fig_abl.savefig(ablation_fig_path, dpi=300, bbox_inches='tight')
+        fig_abl.savefig(ablation_fig_path.replace('.png', '.pdf'), bbox_inches='tight')
+        print(f"Ablation figure saved to: {ablation_fig_path} (and .pdf)")
 
 
 def run_complexity(exp_dir, delta, significance, fig_dir):
@@ -329,7 +330,7 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
     in_ndis = np.loadtxt(in_ndis_path, delimiter=',')
     out_ndis = np.loadtxt(out_ndis_path, delimiter=',')
 
-    total_budgets = [100, 200, 400, 600, 1000, 1500, 2000, 3500, 5000]
+    total_budgets = [50, 100, 200, 400, 600, 1000, 1500, 2000, 3500, 5000]
     full_budget = len(in_sum) + len(out_sum)
 
     metric_keys = ('steinke', 'fdp', *NDIS_KEYS)
@@ -390,6 +391,9 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
                header=','.join(cols), comments='')
     print(f"\nResults saved to: {results_path}")
 
+    # ==========================================
+    # 1. Main Plot: Competitors vs NDIS Ellipsoid
+    # ==========================================
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(9, 5.5))
         ax.grid(True, which="major", ls="-", alpha=0.2)
@@ -400,8 +404,7 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
                        label='Theoretical Bound')
         _plot_method(ax, total_budgets, results['steinke'], 'steinke')
         _plot_method(ax, total_budgets, results['fdp'],     'fdp')
-        for k in NDIS_KEYS:
-            _plot_method(ax, total_budgets, results[k], k)
+        _plot_method(ax, total_budgets, results['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid')
 
         ax.set_xscale('log')
         ax.set_xticks(total_budgets)
@@ -410,14 +413,43 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
         ax.set_xlabel('Number of Canaries ($n$)', fontweight='bold')
         ax.set_ylabel(r'Empirical $\varepsilon$ (lower bound)', fontweight='bold')
         ax.set_ylim(0, 8.5)
-        ax.legend(loc='lower right', fontsize=9, frameon=True)
-
+        ax.legend(loc='lower right', fontsize=10, frameon=True)
         plt.tight_layout()
 
-        fig_path = os.path.join(fig_dir, 'sample_complexity_plot.png')
+        fig_path = os.path.join(fig_dir, 'sample_complexity_main.png')
         plt.savefig(fig_path, dpi=300, bbox_inches='tight')
         plt.savefig(fig_path.replace('.png', '.pdf'), bbox_inches='tight')
-        print(f"Figure saved to: {fig_path} (and .pdf)")
+        print(f"Main Sample Complexity Figure saved to: {fig_path} (and .pdf)")
+
+    # ==========================================
+    # 2. Ablation Plot: CR Geometry Comparison
+    # ==========================================
+    with plt.rc_context(_RC):
+        fig_abl, ax_abl = plt.subplots(figsize=(9, 5.5))
+        ax_abl.grid(True, which="major", ls="-", alpha=0.2)
+        ax_abl.grid(True, which="minor", ls=":", alpha=0.1)
+
+        if target_eps is not None:
+            ax_abl.axhline(y=target_eps, color='#555555', ls='--', lw=1.2,
+                           label='Theoretical Bound')
+
+        _plot_method(ax_abl, total_budgets, results['ndis_parametric_bonferroni'], 'ndis_parametric_bonferroni')
+        _plot_method(ax_abl, total_budgets, results['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid')
+
+        ax_abl.set_xscale('log')
+        ax_abl.set_xticks(total_budgets)
+        ax_abl.get_xaxis().set_major_formatter(plt.ScalarFormatter())
+
+        ax_abl.set_xlabel('Number of Canaries ($n$)', fontweight='bold')
+        ax_abl.set_ylabel(r'Empirical $\varepsilon$ (lower bound)', fontweight='bold')
+        ax_abl.set_ylim(0, 8.5)
+        ax_abl.legend(loc='lower right', fontsize=10, frameon=True)
+        plt.tight_layout()
+
+        ablation_fig_path = os.path.join(fig_dir, 'ablation_cr_sample_complexity.png')
+        plt.savefig(ablation_fig_path, dpi=300, bbox_inches='tight')
+        plt.savefig(ablation_fig_path.replace('.png', '.pdf'), bbox_inches='tight')
+        print(f"Ablation Sample Complexity Figure saved to: {ablation_fig_path} (and .pdf)")
 
 
 def main():
