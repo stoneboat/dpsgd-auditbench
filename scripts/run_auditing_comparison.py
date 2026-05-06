@@ -47,12 +47,11 @@ _RC = {
 }
 
 _STYLE = {
-    'upper':   {'color': '#555555', 'marker': '',  'linestyle': (0, (3, 5, 1, 5)),  'linewidth': 1.4, 'markersize': 0,  'zorder': 1, 'label': 'Theoretical Upper Bound'},
-    'steinke': {'color': '#ff7f0e', 'marker': 'o', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 2, 'label': 'Steinke et al. (2023)'},
-    'fdp':     {'color': '#2ca02c', 'marker': 's', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 3, 'label': 'Mahloujifar et al. (2024)'},
-
-    # NDIS variants (Main Plot defaults to "This paper")
-    'ndis_parametric_bonferroni': {'color': '#02A1BA', 'marker': 'D', 'linestyle': '-', 'linewidth': 2.0, 'markersize': 6, 'zorder': 5, 'label': 'This paper (Parametric Bonferroni)'},
+    'upper':   {'color': '#555555', 'marker': '',  'linestyle': (0, (3, 5, 1, 5)),  'linewidth': 1.4, 'markersize': 0,  'zorder': 1, 'label': 'Theoretical (upper bound)'},
+    'steinke': {'color': '#ff7f0e', 'marker': 'o', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 2, 'label': 'Steinke et al. 2023'},
+    'fdp':     {'color': '#2ca02c', 'marker': 's', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 3, 'label': 'Mahloujifar et al. 2024 (f-DP)'},
+    # NDIS lower-bound variants
+    'ndis_parametric_bonferroni': {'color': '#02A1BA', 'marker': 'D', 'linestyle': '-', 'linewidth': 2.0, 'markersize': 6, 'zorder': 5, 'label': 'This paper'},
     'ndis_bootstrap_ellipsoid':   {'color': '#00497D', 'marker': '*', 'linestyle': '-', 'linewidth': 2.4, 'markersize': 10, 'zorder': 8, 'label': 'This paper'},
 }
 
@@ -170,6 +169,7 @@ def get_target_epsilon(exp_dir):
 
 
 def run_single(exp_dir, delta, significance, fig_dir):
+    """Original per-epoch line plot for a single experiment."""
     epochs = sorted(set(
         int(f.split('_')[-1].replace('.csv', ''))
         for f in os.listdir(exp_dir)
@@ -203,7 +203,7 @@ def run_single(exp_dir, delta, significance, fig_dir):
                header=','.join(cols), comments='')
     print(f"\nResults saved to: {results_path}")
 
-    # Main Plot (Defaults to "This paper")
+    # Plot (Only plotting Ellipsoid for the NDIS method to keep it clean)
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(10, 6))
         _plot_method(ax, series['epoch'], series['upper'],   'upper')
@@ -224,6 +224,7 @@ def run_single(exp_dir, delta, significance, fig_dir):
 
 
 def run_multi(exp_dirs, delta, significance, fig_dir):
+    """Compare final-epoch empirical eps across multiple target epsilons."""
     series = {k: [] for k in ('target', 'upper', 'steinke', 'fdp', *NDIS_KEYS)}
 
     for exp_dir in exp_dirs:
@@ -270,7 +271,7 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
     print(f"\nResults saved to: {results_path}")
 
     # ==========================================
-    # 1. Main Plot (Defaults to "This paper")
+    # 1. Main Plot: Comparison with all methods (Ellipsoid only for NDIS)
     # ==========================================
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(11, 6.5))
@@ -292,7 +293,7 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
         print(f"Main figure saved to: {fig_path} (and .pdf)")
 
     # ==========================================
-    # 2. Ablation Plot (Overrides to specific CR geometries)
+    # 2. Ablation Plot: CR Geometry Comparison
     # ==========================================
     with plt.rc_context(_RC):
         fig_abl, ax_abl = plt.subplots(figsize=(11, 6.5))
@@ -316,6 +317,7 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
 
 
 def run_complexity(exp_dir, delta, significance, fig_dir):
+    """Plot empirical eps vs total canary budget (sample-complexity sweep)."""
     final_epoch = get_final_epoch(exp_dir)
     target_eps = get_target_epsilon(exp_dir)
     if final_epoch is None:
@@ -394,7 +396,7 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
     print(f"\nResults saved to: {results_path}")
 
     # ==========================================
-    # 1. Main Plot (Defaults to "This paper")
+    # 1. Main Plot: Competitors vs NDIS Ellipsoid
     # ==========================================
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(9, 5.5))
@@ -424,7 +426,7 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
         print(f"Main Sample Complexity Figure saved to: {fig_path} (and .pdf)")
 
     # ==========================================
-    # 2. Ablation Plot (Overrides to specific CR geometries)
+    # 2. Ablation Plot: CR Geometry Comparison
     # ==========================================
     with plt.rc_context(_RC):
         fig_abl, ax_abl = plt.subplots(figsize=(9, 5.5))
