@@ -167,37 +167,6 @@ def _ndis_eps_from_moments(in_mean: float, in_std: float, out_mean: float, out_s
         return 0.0
 
 
-def ndis_eps_lower_bound_with_ci(in_scores, out_scores, delta: float, *, alpha: float = 0.05, n_bootstrap: int = 2000, pool_variance: bool = True, rng: Optional[np.random.Generator] = None, return_samples: bool = False):
-    """Bootstrap (1-alpha)-confidence lower bound on the NDIS eps.
-    Resamples (in_scores, out_scores) with replacement, computes the NDIS
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-    in_scores = np.asarray(in_scores, dtype=float)
-    out_scores = np.asarray(out_scores, dtype=float)
-    n_in, n_out = len(in_scores), len(out_scores)
-    if n_in < 2 or n_out < 2:
-        raise ValueError(f"Need >=2 samples in each group; got n_in={n_in}, n_out={n_out}.")
-
-    eps_samples = np.empty(n_bootstrap, dtype=float)
-    for k in range(n_bootstrap):
-        in_b = rng.choice(in_scores, size=n_in, replace=True)
-        out_b = rng.choice(out_scores, size=n_out, replace=True)
-        eps_samples[k] = _ndis_eps_from_moments(
-            in_mean=float(np.mean(in_b)),
-            in_std=float(np.std(in_b, ddof=1)),
-            out_mean=float(np.mean(out_b)),
-            out_std=float(np.std(out_b, ddof=1)),
-            delta=delta,
-            pool_variance=pool_variance,
-        )
-
-    eps_lb = float(np.quantile(eps_samples, alpha))
-    if return_samples:
-        return eps_lb, eps_samples
-    return eps_lb
-
-
 # ---------------------------------------------------------------------------
 # Confidence-region -> worst-case-eps lower bounds
 # ---------------------------------------------------------------------------
@@ -334,7 +303,7 @@ def ndis_eps_lb_parametric_bonferroni(
     }
 
 
-# ---- (B) Bootstrap-percentile Bonferroni rectangle --------------------------
+# ---- (B) Joint-bootstrap ellipsoid (Mahalanobis) CR -------------------------
 
 def _bootstrap_param_samples(
     in_scores: np.ndarray, out_scores: np.ndarray,
@@ -352,87 +321,6 @@ def _bootstrap_param_samples(
         out[b, 3] = np.std(ob, ddof=1)
     return out
 
-
-def ndis_eps_lb_bootstrap_bonferroni(
-    in_scores, out_scores, delta: float, *,
-    alpha: float = 0.05, n_bootstrap: int = 2000,
-    pool_variance: bool = False, n_dim: int = 4,
-    rng: Optional[np.random.Generator] = None,
-):
-    """Lower bound via bootstrap percentile CIs + Bonferroni rectangle.
-
-    Each marginal CI is the (alpha/(2 n_dim), 1 - alpha/(2 n_dim))
-    bootstrap-percentile CI; their hyperrectangle has joint coverage
-    >= 1 - alpha by Bonferroni (asymptotically). Returns the minimum
-    NDIS eps over the rectangle.
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-    in_scores = np.asarray(in_scores, dtype=float)
-    out_scores = np.asarray(out_scores, dtype=float)
-    samples = _bootstrap_param_samples(in_scores, out_scores, n_bootstrap, rng)
-
-    a_marg = alpha / n_dim
-    lo = np.quantile(samples, a_marg / 2.0, axis=0)
-    hi = np.quantile(samples, 1.0 - a_marg / 2.0, axis=0)
-    eps_lb, theta_min = _minimize_eps_over_box(lo, hi, delta, pool_variance=pool_variance)
-    return {
-        'eps_lb': eps_lb,
-        'theta_min': theta_min,
-        'box_lo': lo, 'box_hi': hi,
-        'method': 'bootstrap_bonferroni',
-        'samples': samples,
-    }
-
-
-# ---- (C) Simultaneous bootstrap (max-norm) box -- sharper than Bonferroni ----
-
-def ndis_eps_lb_bootstrap_simultaneous_box(
-    in_scores, out_scores, delta: float, *,
-    alpha: float = 0.05, n_bootstrap: int = 2000,
-    pool_variance: bool = False,
-    rng: Optional[np.random.Generator] = None,
-):
-    """Lower bound via a simultaneous (max-norm) bootstrap rectangle.
-
-    Bootstrap the parameter vector and form the hyperrectangle
-        { theta : max_j |theta_j - hat theta_j| / s_j  <=  q }
-    where s_j is the bootstrap std of coordinate j and q is the
-    (1-alpha) quantile of M_b := max_j |theta_b,j - hat theta_j| / s_j
-    over bootstrap replicates. By construction this rectangle has
-    joint bootstrap coverage exactly 1-alpha, so it is uniformly
-    tighter than the Bonferroni rectangle for the same alpha (no
-    union-bound slack).
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-    in_scores = np.asarray(in_scores, dtype=float)
-    out_scores = np.asarray(out_scores, dtype=float)
-    n_in, n_out = len(in_scores), len(out_scores)
-    theta_hat = np.array([
-        np.mean(in_scores), np.std(in_scores, ddof=1),
-        np.mean(out_scores), np.std(out_scores, ddof=1),
-    ])
-
-    samples = _bootstrap_param_samples(in_scores, out_scores, n_bootstrap, rng)
-    s = samples.std(axis=0, ddof=1)
-    s = np.where(s > 0, s, 1.0)
-    M = np.max(np.abs(samples - theta_hat[None, :]) / s[None, :], axis=1)
-    q = float(np.quantile(M, 1.0 - alpha))
-    lo = theta_hat - q * s
-    hi = theta_hat + q * s
-    eps_lb, theta_min = _minimize_eps_over_box(lo, hi, delta, pool_variance=pool_variance)
-    return {
-        'eps_lb': eps_lb,
-        'theta_min': theta_min,
-        'box_lo': lo, 'box_hi': hi,
-        'q': q, 'theta_hat': theta_hat,
-        'method': 'bootstrap_simultaneous_box',
-        'samples': samples,
-    }
-
-
-# ---- (D) Joint-bootstrap ellipsoid (Mahalanobis) CR -------------------------
 
 def ndis_eps_lb_bootstrap_ellipsoid(
     in_scores, out_scores, delta: float, *,
@@ -510,14 +398,11 @@ def ndis_eps_lb_bootstrap_ellipsoid(
     }
 
 
-# ---- (E) Run all methods with one shared bootstrap pass ---------------------
+# ---- (C) Run all methods with one shared bootstrap pass ---------------------
 
 NDIS_LB_METHODS = (
     'parametric_bonferroni',
-    'bootstrap_bonferroni',
-    'bootstrap_simultaneous_box',
     'bootstrap_ellipsoid',
-    'bootstrap_eps_quantile',
 )
 
 
@@ -541,54 +426,17 @@ def ndis_eps_lb_all(
     out_scores = np.asarray(out_scores, dtype=float)
     results = {}
 
-    needs_param_boot = any(m in methods for m in (
-        'bootstrap_bonferroni', 'bootstrap_simultaneous_box',
-        'bootstrap_ellipsoid', 'bootstrap_eps_quantile',
-    ))
-    samples = (_bootstrap_param_samples(in_scores, out_scores, n_bootstrap, rng)
-               if needs_param_boot else None)
-    theta_hat = np.array([
-        np.mean(in_scores), np.std(in_scores, ddof=1),
-        np.mean(out_scores), np.std(out_scores, ddof=1),
-    ])
-
     if 'parametric_bonferroni' in methods:
         results['parametric_bonferroni'] = ndis_eps_lb_parametric_bonferroni(
             in_scores, out_scores, delta, alpha=alpha, pool_variance=pool_variance,
         )
 
-    if 'bootstrap_bonferroni' in methods:
-        n_dim = 4
-        a_marg = alpha / n_dim
-        lo = np.quantile(samples, a_marg / 2.0, axis=0)
-        hi = np.quantile(samples, 1.0 - a_marg / 2.0, axis=0)
-        eps_lb, theta_min = _minimize_eps_over_box(
-            lo, hi, delta, pool_variance=pool_variance,
-        )
-        results['bootstrap_bonferroni'] = {
-            'eps_lb': eps_lb, 'theta_min': theta_min,
-            'box_lo': lo, 'box_hi': hi,
-            'method': 'bootstrap_bonferroni',
-        }
-
-    if 'bootstrap_simultaneous_box' in methods:
-        s = samples.std(axis=0, ddof=1)
-        s = np.where(s > 0, s, 1.0)
-        M = np.max(np.abs(samples - theta_hat[None, :]) / s[None, :], axis=1)
-        q = float(np.quantile(M, 1.0 - alpha))
-        lo = theta_hat - q * s
-        hi = theta_hat + q * s
-        eps_lb, theta_min = _minimize_eps_over_box(
-            lo, hi, delta, pool_variance=pool_variance,
-        )
-        results['bootstrap_simultaneous_box'] = {
-            'eps_lb': eps_lb, 'theta_min': theta_min,
-            'box_lo': lo, 'box_hi': hi,
-            'q': q, 'theta_hat': theta_hat,
-            'method': 'bootstrap_simultaneous_box',
-        }
-
     if 'bootstrap_ellipsoid' in methods:
+        samples = _bootstrap_param_samples(in_scores, out_scores, n_bootstrap, rng)
+        theta_hat = np.array([
+            np.mean(in_scores), np.std(in_scores, ddof=1),
+            np.mean(out_scores), np.std(out_scores, ddof=1),
+        ])
         Sigma = np.cov(samples, rowvar=False)
         Sigma = Sigma + 1e-12 * np.eye(4) * max(np.trace(Sigma) / 4.0, 1e-12)
         Sigma_inv = np.linalg.inv(Sigma)
@@ -635,20 +483,6 @@ def ndis_eps_lb_all(
             'method': 'bootstrap_ellipsoid',
         }
 
-    if 'bootstrap_eps_quantile' in methods:
-        eps_samples = np.empty(n_bootstrap, dtype=float)
-        for i in range(n_bootstrap):
-            eps_samples[i] = _ndis_eps_from_moments(
-                in_mean=samples[i, 0], in_std=samples[i, 1],
-                out_mean=samples[i, 2], out_std=samples[i, 3],
-                delta=delta, pool_variance=pool_variance,
-            )
-        results['bootstrap_eps_quantile'] = {
-            'eps_lb': float(np.quantile(eps_samples, alpha)),
-            'eps_samples': eps_samples,
-            'method': 'bootstrap_eps_quantile',
-        }
-
     return results
 
 
@@ -664,35 +498,16 @@ def ndis_eps_lb(
 
     method in {
         'parametric_bonferroni',
-        'bootstrap_bonferroni',
-        'bootstrap_simultaneous_box',
         'bootstrap_ellipsoid',
-        'bootstrap_eps_quantile',     # current method, eps-quantile of bootstrap
     }
     """
     if method == 'parametric_bonferroni':
         return ndis_eps_lb_parametric_bonferroni(
             in_scores, out_scores, delta, alpha=alpha, pool_variance=pool_variance,
         )
-    if method == 'bootstrap_bonferroni':
-        return ndis_eps_lb_bootstrap_bonferroni(
-            in_scores, out_scores, delta, alpha=alpha,
-            n_bootstrap=n_bootstrap, pool_variance=pool_variance, rng=rng,
-        )
-    if method == 'bootstrap_simultaneous_box':
-        return ndis_eps_lb_bootstrap_simultaneous_box(
-            in_scores, out_scores, delta, alpha=alpha,
-            n_bootstrap=n_bootstrap, pool_variance=pool_variance, rng=rng,
-        )
     if method == 'bootstrap_ellipsoid':
         return ndis_eps_lb_bootstrap_ellipsoid(
             in_scores, out_scores, delta, alpha=alpha,
             n_bootstrap=n_bootstrap, pool_variance=pool_variance, rng=rng,
         )
-    if method == 'bootstrap_eps_quantile':
-        eps_lb = ndis_eps_lower_bound_with_ci(
-            in_scores, out_scores, delta=delta, alpha=alpha,
-            n_bootstrap=n_bootstrap, pool_variance=pool_variance, rng=rng,
-        )
-        return {'eps_lb': float(eps_lb), 'method': 'bootstrap_eps_quantile'}
     raise ValueError(f"unknown method: {method}")

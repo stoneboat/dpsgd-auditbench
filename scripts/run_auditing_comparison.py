@@ -51,19 +51,13 @@ _STYLE = {
     'steinke': {'color': '#ff7f0e', 'marker': 'o', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 2, 'label': 'Steinke et al. 2023'},
     'fdp':     {'color': '#2ca02c', 'marker': 's', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 3, 'label': 'Mahloujifar et al. 2024 (f-DP)'},
     # NDIS lower-bound variants (this paper). One style per method.
-    'ndis_parametric_bonferroni':      {'color': '#1f77b4', 'marker': 'D', 'linestyle': '-',  'linewidth': 2.0, 'markersize': 6, 'zorder': 5, 'label': 'NDIS: parametric Bonferroni'},
-    'ndis_bootstrap_bonferroni':       {'color': '#9467bd', 'marker': '^', 'linestyle': '-',  'linewidth': 2.0, 'markersize': 6, 'zorder': 6, 'label': 'NDIS: bootstrap Bonferroni'},
-    'ndis_bootstrap_simultaneous_box': {'color': '#17becf', 'marker': 'v', 'linestyle': '-',  'linewidth': 2.0, 'markersize': 6, 'zorder': 7, 'label': 'NDIS: simultaneous box'},
-    'ndis_bootstrap_ellipsoid':        {'color': '#e377c2', 'marker': '*', 'linestyle': '-',  'linewidth': 2.0, 'markersize': 8, 'zorder': 8, 'label': 'NDIS: bootstrap ellipsoid'},
-    'ndis_bootstrap_eps_quantile':     {'color': '#8c564b', 'marker': 'x', 'linestyle': ':',  'linewidth': 2.0, 'markersize': 7, 'zorder': 9, 'label': 'NDIS: eps-quantile (legacy)'},
+    'ndis_parametric_bonferroni': {'color': '#1f77b4', 'marker': 'D', 'linestyle': '-', 'linewidth': 2.0, 'markersize': 6, 'zorder': 5, 'label': 'NDIS: parametric Bonferroni'},
+    'ndis_bootstrap_ellipsoid':   {'color': '#e377c2', 'marker': '*', 'linestyle': '-', 'linewidth': 2.0, 'markersize': 8, 'zorder': 8, 'label': 'NDIS: bootstrap ellipsoid'},
 }
 
 NDIS_METHODS = (
     'parametric_bonferroni',
-    'bootstrap_bonferroni',
-    'bootstrap_simultaneous_box',
     'bootstrap_ellipsoid',
-    'bootstrap_eps_quantile',
 )
 NDIS_KEYS = tuple(f'ndis_{m}' for m in NDIS_METHODS)
 
@@ -84,7 +78,6 @@ sys.path.append(src_dir)
 from auditing import CanaryScoreAuditor
 from whitebox_auditing.ndis_1d import (
     ndis_eps_from_delta_1d_brentq,
-    ndis_eps_lower_bound_with_ci,
     estimate_mean_variance, ndis_eps_lb, ndis_eps_lb_all,
 )
 
