@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=dpftrl_scatter
 #SBATCH --account=gts-vzikas3
-#SBATCH --partition=gpu-h200
+#SBATCH --partition=gpu-a100
 #SBATCH --gres=gpu:1
 #SBATCH --mem=40G
 #SBATCH --time=01:00:00
@@ -18,30 +18,30 @@ conda activate /storage/scratch1/6/aagrawal609/conda_envs/dpsgd_bench
 
 # === Epsilon values (parity with DP-SGD / DP-FTRL-WRN sweeps) ===
 EPSILONS=(1 2 4 8)
-EPS=${EPSILONS[$SLURM_ARRAY_TASK_ID]}
 
-echo "Running DP-FTRL+ScatterLinear with target epsilon=${EPS} (array task ${SLURM_ARRAY_TASK_ID})"
+if [ $SLURM_ARRAY_TASK_ID -lt 4 ]; then
+    # Tasks 0, 1, 2, 3 handle the actual audit sweep
+    EPS=${EPSILONS[$SLURM_ARRAY_TASK_ID]}
+    echo "Running Audit for Epsilon: $EPS"
+    python scripts/gen_scores_DP_FTRL_scatter.py \
+        --target-steps 128 \
+        --logical-batch-size 380 \
+        --max-physical-batch-size 390 \
+        --aug-multiplicity 1 \
+        --canary-count 5000 \
+        --pkeep 0.5 \
+        --epsilon ${EPS} \
+        --lr 1.0 \
+        --data-dir ./data \
+        --log-dir ./logs
 
-# Single-pass DP-FTRL on CIFAR-10:
-#   N=50000, B=500  ->  T = 100 leaves (one full pass).
-# Each canary fires at exactly one leaf; matches Kairouz Theorem 4.1
-# single-firing semantics, with per-leaf SNR-optimal ancestor-sum scoring.
-python scripts/gen_scores_DP_FTRL_scatter.py \
-    --target-steps 100 \
-    --logical-batch-size 500 \
-    --max-physical-batch-size 500 \
-    --aug-multiplicity 1 \
-    --canary-count 5000 \
-    --pkeep 0.5 \
-    --epsilon ${EPS} \
-    --lr 1.0 \
-    --data-dir ./data \
-    --log-dir ./logs
-
-python scripts/gen_scores_DP_FTRL_scatter.py \
-    --target-steps 100 \
-    --logical-batch-size 500 \
-    --max-physical-batch-size 500 \
+else
+    # Task 4 handles the baseline only
+    echo "Running Baseline (Canary Count 0)"
+    python scripts/gen_scores_DP_FTRL_scatter.py \
+    --target-steps 128 \
+    --logical-batch-size 390 \
+    --max-physical-batch-size 390 \
     --aug-multiplicity 1 \
     --canary-count 0 \
     --pkeep 0.5 \
@@ -49,3 +49,4 @@ python scripts/gen_scores_DP_FTRL_scatter.py \
     --lr 1.0 \
     --data-dir ./data \
     --log-dir ./logs
+fi

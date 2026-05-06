@@ -240,9 +240,11 @@ class DPFTRLState:
                 b = min(a + size - 1, leaves_done - 1)
                 if a > b:
                     continue
-                clean_part = cum[b + 1, i] - cum[a, i]
                 node_noise = self.node_noise_proj.get((level, idx), None)
-                noise_part = float(node_noise[i]) if node_noise is not None else 0.0
+                if node_noise is None:
+                    continue
+                clean_part = cum[b + 1, i] - cum[a, i]
+                noise_part = float(node_noise[i])
                 scores[i] += clean_part + noise_part
         return scores
 
