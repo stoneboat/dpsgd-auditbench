@@ -27,9 +27,9 @@ import matplotlib.pyplot as plt
 
 _RC = {
     'font.family': 'DejaVu Sans',
-    'font.size': 14,
-    'axes.titlesize': 12,
-    'axes.labelsize': 14,
+    'font.size': 18,
+    'axes.titlesize': 18,
+    'axes.labelsize': 18,
     'axes.spines.top': False,
     'axes.spines.right': False,
     'axes.linewidth': 0.8,
@@ -42,17 +42,18 @@ _RC = {
     'xtick.major.width': 0.8,
     'ytick.major.width': 0.8,
     'legend.frameon': False,
-    'legend.fontsize': 11,
+    'legend.fontsize': 14,
     'figure.dpi': 120,
 }
 
 _STYLE = {
-    'upper':   {'color': '#555555', 'marker': '',  'linestyle': (0, (3, 5, 1, 5)),  'linewidth': 1.4, 'markersize': 0,  'zorder': 1, 'label': 'Theoretical (upper bound)'},
-    'steinke': {'color': '#ff7f0e', 'marker': 'o', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 2, 'label': 'Steinke et al. 2023'},
-    'fdp':     {'color': '#2ca02c', 'marker': 's', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 3, 'label': 'Mahloujifar et al. 2024 (f-DP)'},
-    # NDIS lower-bound variants
-    'ndis_parametric_bonferroni': {'color': '#02A1BA', 'marker': 'D', 'linestyle': '-', 'linewidth': 2.0, 'markersize': 6, 'zorder': 5, 'label': 'This paper'},
-    'ndis_bootstrap_ellipsoid':   {'color': '#1f77b4', 'marker': '*', 'linestyle': '-', 'linewidth': 2.4, 'markersize': 10, 'zorder': 8, 'label': 'This paper'},
+    'upper':   {'color': '#555555', 'marker': '',  'linestyle': (0, (3, 5, 1, 5)),  'linewidth': 1.4, 'markersize': 0,  'zorder': 1, 'label': 'Theoretical Upper Bound'},
+    'steinke': {'color': '#ff7f0e', 'marker': 'o', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 2, 'label': 'Steinke et al. (2023)'},
+    'fdp':     {'color': '#2ca02c', 'marker': 's', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 3, 'label': 'Mahloujifar et al. (2024)'},
+
+    # NDIS variants (Main Plot defaults to "This paper")
+    'ndis_parametric_bonferroni': {'color': '#02A1BA', 'marker': 'D', 'linestyle': '-', 'linewidth': 2.0, 'markersize': 6, 'zorder': 5, 'label': 'This paper (Parametric Bonferroni)'},
+    'ndis_bootstrap_ellipsoid':   {'color': '#e377c2', 'marker': '*', 'linestyle': '-', 'linewidth': 2.4, 'markersize': 10, 'zorder': 8, 'label': 'This paper'},
 }
 
 NDIS_METHODS = (
@@ -62,12 +63,14 @@ NDIS_METHODS = (
 NDIS_KEYS = tuple(f'ndis_{m}' for m in NDIS_METHODS)
 
 
-def _plot_method(ax, x, y, key):
+def _plot_method(ax, x, y, key, label_override=None):
+    """Plots a method series, allowing for dynamic legend names via label_override."""
     s = _STYLE[key]
+    label = label_override if label_override is not None else s['label']
     ax.plot(x, y,
             color=s['color'], marker=s['marker'], linestyle=s['linestyle'],
             linewidth=s['linewidth'], markersize=s['markersize'],
-            label=s['label'], zorder=s['zorder'],
+            label=label, zorder=s['zorder'],
             markerfacecolor=s['color'], markeredgecolor='white', markeredgewidth=0.6)
 
 
@@ -167,7 +170,6 @@ def get_target_epsilon(exp_dir):
 
 
 def run_single(exp_dir, delta, significance, fig_dir):
-    """Original per-epoch line plot for a single experiment."""
     epochs = sorted(set(
         int(f.split('_')[-1].replace('.csv', ''))
         for f in os.listdir(exp_dir)
@@ -201,7 +203,7 @@ def run_single(exp_dir, delta, significance, fig_dir):
                header=','.join(cols), comments='')
     print(f"\nResults saved to: {results_path}")
 
-    # Plot (Only plotting Ellipsoid for the NDIS method to keep it clean)
+    # Main Plot (Defaults to "This paper")
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(10, 6))
         _plot_method(ax, series['epoch'], series['upper'],   'upper')
@@ -222,7 +224,6 @@ def run_single(exp_dir, delta, significance, fig_dir):
 
 
 def run_multi(exp_dirs, delta, significance, fig_dir):
-    """Compare final-epoch empirical eps across multiple target epsilons."""
     series = {k: [] for k in ('target', 'upper', 'steinke', 'fdp', *NDIS_KEYS)}
 
     for exp_dir in exp_dirs:
@@ -269,7 +270,7 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
     print(f"\nResults saved to: {results_path}")
 
     # ==========================================
-    # 1. Main Plot: Comparison with all methods (Ellipsoid only for NDIS)
+    # 1. Main Plot (Defaults to "This paper")
     # ==========================================
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(11, 6.5))
@@ -291,13 +292,15 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
         print(f"Main figure saved to: {fig_path} (and .pdf)")
 
     # ==========================================
-    # 2. Ablation Plot: CR Geometry Comparison
+    # 2. Ablation Plot (Overrides to specific CR geometries)
     # ==========================================
     with plt.rc_context(_RC):
         fig_abl, ax_abl = plt.subplots(figsize=(11, 6.5))
         _plot_method(ax_abl, series['target'], series['upper'], 'upper')
+
         _plot_method(ax_abl, series['target'], series['ndis_parametric_bonferroni'], 'ndis_parametric_bonferroni')
-        _plot_method(ax_abl, series['target'], series['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid')
+        # Explicit override for the ablation plot only
+        _plot_method(ax_abl, series['target'], series['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid', label_override='This paper (Bootstrap Ellipsoid)')
 
         ax_abl.set_xlabel(r'Theoretical $\varepsilon$')
         ax_abl.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
@@ -313,7 +316,6 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
 
 
 def run_complexity(exp_dir, delta, significance, fig_dir):
-    """Plot empirical eps vs total canary budget (sample-complexity sweep)."""
     final_epoch = get_final_epoch(exp_dir)
     target_eps = get_target_epsilon(exp_dir)
     if final_epoch is None:
@@ -392,7 +394,7 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
     print(f"\nResults saved to: {results_path}")
 
     # ==========================================
-    # 1. Main Plot: Competitors vs NDIS Ellipsoid
+    # 1. Main Plot (Defaults to "This paper")
     # ==========================================
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(9, 5.5))
@@ -401,7 +403,7 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
 
         if target_eps is not None:
             ax.axhline(y=target_eps, color='#555555', ls='--', lw=1.2,
-                       label='Theoretical Bound')
+                       label='Theoretical Upper Bound')
         _plot_method(ax, total_budgets, results['steinke'], 'steinke')
         _plot_method(ax, total_budgets, results['fdp'],     'fdp')
         _plot_method(ax, total_budgets, results['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid')
@@ -422,7 +424,7 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
         print(f"Main Sample Complexity Figure saved to: {fig_path} (and .pdf)")
 
     # ==========================================
-    # 2. Ablation Plot: CR Geometry Comparison
+    # 2. Ablation Plot (Overrides to specific CR geometries)
     # ==========================================
     with plt.rc_context(_RC):
         fig_abl, ax_abl = plt.subplots(figsize=(9, 5.5))
@@ -431,10 +433,11 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
 
         if target_eps is not None:
             ax_abl.axhline(y=target_eps, color='#555555', ls='--', lw=1.2,
-                           label='Theoretical Bound')
+                           label='Theoretical Upper Bound')
 
         _plot_method(ax_abl, total_budgets, results['ndis_parametric_bonferroni'], 'ndis_parametric_bonferroni')
-        _plot_method(ax_abl, total_budgets, results['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid')
+        # Explicit override for the ablation plot only
+        _plot_method(ax_abl, total_budgets, results['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid', label_override='This paper (Bootstrap Ellipsoid)')
 
         ax_abl.set_xscale('log')
         ax_abl.set_xticks(total_budgets)
