@@ -53,7 +53,7 @@ _STYLE = {
 
     # NDIS variants (Main Plot defaults to "This paper")
     'ndis_parametric_bonferroni': {'color': '#02A1BA', 'marker': 'D', 'linestyle': '-', 'linewidth': 2.0, 'markersize': 6, 'zorder': 5, 'label': 'This paper (Parametric Bonferroni)'},
-    'ndis_bootstrap_ellipsoid':   {'color': '#e377c2', 'marker': '*', 'linestyle': '-', 'linewidth': 2.4, 'markersize': 10, 'zorder': 8, 'label': 'This paper'},
+    'ndis_bootstrap_ellipsoid':   {'color': '#00497D', 'marker': '*', 'linestyle': '-', 'linewidth': 2.4, 'markersize': 10, 'zorder': 8, 'label': 'This paper'},
 }
 
 NDIS_METHODS = (
