@@ -206,6 +206,8 @@ def main():
     start_epoch = 1
     total_steps = 0
     sum_scores = None
+    last_completed_epoch = None
+    last_completed_total_steps = 0
 
     checkpoint_result = find_latest_checkpoint(ckpt_dir)
     if checkpoint_result is not None:
@@ -345,6 +347,8 @@ def main():
             f"Epsilon: {epsilon:.2f}, Delta: {args.delta}, Steps: {num_steps}, Total Steps: {total_steps}"
         )
         final_test_acc = test_acc
+        last_completed_epoch = epoch
+        last_completed_total_steps = total_steps
 
         if epoch % args.ckpt_interval == 0:
             save_checkpoint(
@@ -405,6 +409,38 @@ def main():
                 handler.stream.flush()
 
     logger.info("Training complete!")
+
+    # Always flush canary scores at end of training. Without this, runs whose
+    # last completed epoch is not divisible by --ckpt-interval (e.g.
+    # target_steps=50, steps_per_epoch=12 -> stops at epoch 5, never aligns
+    # with --ckpt-interval=20) would finish without writing any *_scores_*.csv.
+    if (
+        sum_scores is not None
+        and last_completed_epoch is not None
+        and last_completed_epoch % args.ckpt_interval != 0
+    ):
+        epoch = last_completed_epoch
+        total_steps = last_completed_total_steps
+        epsilon = privacy_engine.get_epsilon(delta=args.delta)
+        in_sum = sum_scores[inclusion_mask]
+        out_sum = sum_scores[~inclusion_mask]
+        in_scores_ndis  = sum_scores[inclusion_mask]  / np.sqrt(total_steps)
+        out_scores_ndis = sum_scores[~inclusion_mask] / np.sqrt(total_steps)
+        np.savetxt(os.path.join(exp_dir, f'in_scores_sum_{epoch:06d}.csv'),  in_sum,  delimiter=',')
+        np.savetxt(os.path.join(exp_dir, f'out_scores_sum_{epoch:06d}.csv'), out_sum, delimiter=',')
+        np.savetxt(os.path.join(exp_dir, f'in_scores_ndis_{epoch:06d}.csv'),  in_scores_ndis,  delimiter=',')
+        np.savetxt(os.path.join(exp_dir, f'out_scores_ndis_{epoch:06d}.csv'), out_scores_ndis, delimiter=',')
+        np.savetxt(
+            os.path.join(exp_dir, f'privacy_params_{epoch:06d}.csv'),
+            [[epsilon, args.delta]],
+            delimiter=',', header='current_eps,delta', comments='',
+        )
+        np.savetxt(os.path.join(exp_dir, f'sum_scores_{epoch:06d}.csv'), sum_scores, delimiter=',')
+        logger.info(
+            f"Saved final scores at epoch {epoch} (total_steps={total_steps}): "
+            f"in_sum({n_in}), out_sum({n_out}), in_ndis({n_in}), out_ndis({n_out})"
+        )
+
     save_checkpoint(
         model, optimizer, args.epochs, final_test_acc, ckpt_dir, logger, global_step=total_steps
     )
