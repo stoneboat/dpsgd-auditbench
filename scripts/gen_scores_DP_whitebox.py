@@ -273,6 +273,10 @@ def main():
         within = int(f - flat_offsets[p_idx])
         canary_dirac_indices.append((p_idx, within))
 
+    directions_path = os.path.join(exp_dir, 'canary_directions.csv')
+    np.savetxt(directions_path, np.array(canary_dirac_indices), delimiter=',', fmt='%d', header='param_idx,coord_idx')
+    logger.info(f"Canary indices saved to: {directions_path}")
+
     # Generate or load inclusion mask: True = IN (signal injected), False = OUT (pure noise)
     mask_path = os.path.join(exp_dir, 'inclusion_mask.csv')
     if os.path.isfile(mask_path):

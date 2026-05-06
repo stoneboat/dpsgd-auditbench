@@ -24,6 +24,7 @@ import json
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
+from canary_score_diagnostics import within_run_orthogonality_check
 
 _RC = {
     'font.family': 'DejaVu Sans',
@@ -240,7 +241,7 @@ def run_single(exp_dir, delta, significance, fig_dir):
 def run_multi(exp_dirs, delta, significance, fig_dir):
     """Compare final-epoch empirical eps across multiple target epsilons."""
     series = {k: [] for k in ('target', 'upper', 'steinke', 'fdp', *NDIS_KEYS)}
-
+    ortho_results = []
     for exp_dir in exp_dirs:
         if not os.path.isdir(exp_dir):
             print(f"Warning: {exp_dir} not found, skipping")
@@ -265,6 +266,21 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
         for k in ('upper', 'steinke', 'fdp', *NDIS_KEYS):
             series[k].append(result[k])
 
+        dirs_path = os.path.join(exp_dir, 'canary_directions.csv')
+        if os.path.isfile(dirs_path):
+            indices = np.loadtxt(dirs_path, delimiter=',', skiprows=1)
+            m = len(indices)
+            num_unique = len(np.unique(indices, axis=0))
+            collisions = m - num_unique
+            ortho_results.append({
+                'target': target_eps,
+                'm': m,
+                'collisions': collisions,
+                'orthogonal': collisions == 0
+            })
+        else:
+            ortho_results.append(None)
+
         ndis_str = ', '.join(f"{k.replace('ndis_', '')[:14]}={result[k]:.3f}" for k in NDIS_KEYS)
         print(f"  eps={target_eps}: epoch={final_epoch}, upper={result['upper']:.3f}, "
               f"steinke={result['steinke']:.3f}, fdp={result['fdp']:.3f}, {ndis_str}")
@@ -283,6 +299,20 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
     np.savetxt(results_path, results, delimiter=',',
                header=','.join(cols), comments='')
     print(f"\nResults saved to: {results_path}")
+
+
+    if any(ortho_results):
+        print("\n" + "="*60)
+        print("CANARY INDEPENDENCE DIAGNOSTIC (DIRAC ORTHOGONALITY)")
+        print("-" * 60)
+        print(f"{'Target Eps':>10} | {'Canaries (m)':>12} | {'Collisions':>10} | {'Status'}")
+        print("-" * 60)
+        for res in ortho_results:
+            if res:
+                status = "PASS (IID)" if res['orthogonal'] else "FAIL (CORRELATED)"
+                print(f"{res['target']:10.2f} | {res['m']:12d} | {res['collisions']:10d} | {status}")
+        print("="*60)
+        print("Note: Dirac canaries are perfectly orthogonal if collisions = 0.")
 
     # ==========================================
     # 1. Main Plot: Comparison with all methods (Ellipsoid only for NDIS)
