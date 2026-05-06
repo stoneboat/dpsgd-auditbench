@@ -7,7 +7,7 @@
 #SBATCH --time=01:00:00
 #SBATCH --output=logs/dpftrl_scatter_%j.out
 #SBATCH --error=logs/dpftrl_scatter_%j.err
-#SBATCH --array=0-3
+#SBATCH --array=0-4
 
 # === Module and env setup ===
 module load anaconda3
@@ -34,6 +34,18 @@ python scripts/gen_scores_DP_FTRL_scatter.py \
     --canary-count 5000 \
     --pkeep 0.5 \
     --epsilon ${EPS} \
+    --lr 1.0 \
+    --data-dir ./data \
+    --log-dir ./logs
+
+python scripts/gen_scores_DP_FTRL_scatter.py \
+    --target-steps 100 \
+    --logical-batch-size 500 \
+    --max-physical-batch-size 500 \
+    --aug-multiplicity 1 \
+    --canary-count 0 \
+    --pkeep 0.5 \
+    --epsilon 8 \
     --lr 1.0 \
     --data-dir ./data \
     --log-dir ./logs
