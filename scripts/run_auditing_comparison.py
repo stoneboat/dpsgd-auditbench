@@ -29,7 +29,7 @@ from canary_score_diagnostics import within_run_orthogonality_check
 _RC = {
     'font.family': 'DejaVu Sans',
     'font.size': 18,
-    'axes.titlesize': 18,
+    'axes.titlesize': 14,
     'axes.labelsize': 18,
     'axes.spines.top': False,
     'axes.spines.right': False,
@@ -229,7 +229,7 @@ def run_single(exp_dir, delta, significance, fig_dir):
         ax.set_xlabel('Epoch')
         ax.set_ylabel(r'$\varepsilon$')
         ax.set_ylim(bottom=0)
-        ax.legend(loc='upper left', fontsize=10)
+        ax.legend(loc='upper left', fontsize=14)
         fig.tight_layout()
 
         fig_path = os.path.join(fig_dir, 'privacy_bounds_comparison.png')
@@ -328,7 +328,7 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
         ax.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
         ax.set_xticks(series['target'])
         ax.set_ylim(bottom=0)
-        ax.legend(loc='upper left', handlelength=2.5, fontsize=10)
+        ax.legend(loc='upper left', handlelength=2.5, fontsize=14)
         fig.tight_layout()
 
         fig_path = os.path.join(fig_dir, 'privacy_bounds_comparison_multi_eps.png')
@@ -351,7 +351,7 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
         ax_abl.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
         ax_abl.set_xticks(series['target'])
         ax_abl.set_ylim(bottom=0)
-        ax_abl.legend(loc='upper left', handlelength=2.5, fontsize=10)
+        ax_abl.legend(loc='upper left', handlelength=2.5, fontsize=14)
         fig_abl.tight_layout()
 
         ablation_fig_path = os.path.join(fig_dir, 'ablation_cr_geometry_multi_eps.png')
@@ -460,10 +460,10 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
         ax.set_xticks(total_budgets)
         ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
 
-        ax.set_xlabel('Number of Canaries ($n$)', fontweight='bold')
-        ax.set_ylabel(r'Empirical $\varepsilon$ (lower bound)', fontweight='bold')
+        ax.set_xlabel('Number of Canaries ($n$)')
+        ax.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
         ax.set_ylim(0, 8.5)
-        ax.legend(loc='lower right', fontsize=10, frameon=True)
+        ax.legend(loc='lower right', fontsize=14, frameon=True)
         plt.tight_layout()
 
         fig_path = os.path.join(fig_dir, 'sample_complexity_main.png')
@@ -494,7 +494,7 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
         ax_abl.set_xlabel('Number of Canaries ($n$)', fontweight='bold')
         ax_abl.set_ylabel(r'Empirical $\varepsilon$ (lower bound)', fontweight='bold')
         ax_abl.set_ylim(0, 8.5)
-        ax_abl.legend(loc='lower right', fontsize=10, frameon=True)
+        ax_abl.legend(loc='lower right', fontsize=14, frameon=True)
         plt.tight_layout()
 
         ablation_fig_path = os.path.join(fig_dir, 'ablation_cr_sample_complexity.png')
