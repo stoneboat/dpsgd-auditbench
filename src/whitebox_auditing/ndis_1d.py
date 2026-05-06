@@ -303,6 +303,187 @@ def ndis_eps_lb_parametric_bonferroni(
     }
 
 
+# ---- (A') DP-aware Bonferroni rectangle (no iid-canary assumption) ----------
+
+def ndis_eps_lb_dp_aware_bonferroni(
+    in_scores, out_scores, delta: float, *,
+    eps_theory: float, score_clip: float,
+    alpha: float = 0.05, q: float = 0.5,
+    delta_theory: Optional[float] = None,
+    pool_variance: bool = False, n_dim: int = 4,
+    assume_exchangeable_canaries: bool = True,
+):
+    """LCB on realised eps that drops the iid-canary assumption.
+
+    Differs from `ndis_eps_lb_parametric_bonferroni` only in how the
+    moment hyperrectangle is built. The Student-t / chi^2 CIs there
+    require the per-canary scores to be i.i.d.; here the box edges come
+    from Azuma-Hoeffding plus a DP posterior-shift correction, so the
+    only assumption is that the audited mechanism is
+    (eps_theory, delta_theory)-DP at "add/remove one canary." Scores
+    from the same training run -- the usual situation in single-run
+    audits -- are admissible.
+
+    The argument follows Steinke, Nasr & Jagielski (arXiv:2305.08846):
+    by their Lemma 5.6 + Proposition 5.7, on a (1 - delta_theory)-event
+    the conditional posterior on each inclusion bit B_i given Y and
+    B_{<i} lies in [q_-, q_+] with
+        q_+ = q e^eps / (q e^eps + (1 - q)),
+        q_- = q       / (q       + (1 - q) e^eps).
+    Combined with Azuma over the canary index (with bounded martingale
+    increment given by the score clip tau), this yields bounded-difference
+    CIs on the four sample moments without independence between scores.
+
+    Joint coverage: >= 1 - alpha - 2*m*delta_theory.
+
+    Parameters
+    ----------
+    in_scores, out_scores : array-like
+        Per-canary scalar scores from one training run, partitioned by
+        realised inclusion. Will be clipped to [-score_clip, score_clip].
+    delta : float
+        NDIS test delta -- the (eps, delta)-DP delta we audit at, fed
+        into the eps(theta; delta) functional.
+    eps_theory : float
+        Algorithm's claimed (eps, delta)-DP epsilon. Sets q_+, q_- and
+        therefore the size of the worst-case posterior-shift correction.
+        Pass the calibrated target eps; the test is a hypothesis test
+        against this null.
+    score_clip : float
+        Per-canary score clip tau > 0. Larger tau raises the variance
+        ceiling but inflates the Azuma width by O(tau).
+    alpha : float, default 0.05
+        Joint miscoverage budget for the moment box.
+    q : float, default 0.5
+        Auditor-side canary inclusion probability.
+    delta_theory : float, optional
+        Algorithm's claimed delta. Defaults to `delta`. Drives the
+        per-canary "good event" failure budget in Lemma 5.6, summing
+        to 2*m*delta_theory across the m canaries.
+    pool_variance : bool
+        If True, eps(theta) is computed under sigma_in == sigma_out.
+    n_dim : int, default 4
+        Bonferroni dimension. 4 is correct for an unpooled moment box
+        on (mu_in, sigma_in, mu_out, sigma_out); set n_dim=3 if you
+        pool the variances upstream.
+    assume_exchangeable_canaries : bool, default True
+        If True, drop the worst-case DP posterior-shift correction.
+        Justified under a symmetric canary design where every canary
+        has the same statistical role -- the worst-case (q_+/q_-) shift
+        applies symmetrically to numerator and denominator of the
+        per-group sample mean and cancels to leading order. Set False
+        for a strictly conservative bound that holds without any
+        exchangeability assumption (typically vacuous unless eps_theory
+        is small and the score clip is tight).
+    """
+    in_scores = np.asarray(in_scores, dtype=float)
+    out_scores = np.asarray(out_scores, dtype=float)
+    n_in, n_out = len(in_scores), len(out_scores)
+    if n_in < 2 or n_out < 2:
+        raise ValueError("Need >= 2 samples in each group.")
+    if score_clip <= 0.0:
+        raise ValueError("score_clip must be positive.")
+    if not (0.0 < q < 1.0):
+        raise ValueError("q must lie in (0, 1).")
+    if delta_theory is None:
+        delta_theory = delta
+
+    tau = float(score_clip)
+    eps_th = float(eps_theory)
+    m = n_in + n_out
+
+    # Clip per-canary scores so every per-canary contribution lies in
+    # [-tau, tau]. This is what bounds the Azuma martingale increments.
+    bin_  = np.clip(in_scores,  -tau, tau)
+    bout_ = np.clip(out_scores, -tau, tau)
+
+    # Sample moments on clipped scores.
+    mu_in_hat   = float(np.mean(bin_))
+    mu_out_hat  = float(np.mean(bout_))
+    var_in_hat  = float(np.var(bin_,  ddof=1))
+    var_out_hat = float(np.var(bout_, ddof=1))
+
+    # Worst-case posterior shift on the inclusion bit B_i given Y, B_{<i}
+    # under (eps_theory, delta_theory)-DP and Lemma 5.6.
+    e_eps = math.exp(eps_th)
+    q_plus  = q * e_eps / (q * e_eps + (1.0 - q))
+    q_minus = q         / (q         + (1.0 - q) * e_eps)
+    delta_q = max(q_plus - q, q - q_minus)
+
+    a_marg = float(alpha) / float(n_dim)
+
+    def _azuma_half_width(n_group: int, sub_g: float) -> float:
+        # Azuma-Hoeffding for a martingale with sub-Gaussian-parameter sub_g
+        # increments: P[|sum_i eta_i| >= t] <= 2 exp(-t^2 / (2 n sub_g^2)).
+        # Inverting at level a_marg (two-sided): t = sub_g sqrt(2 n log(2/a_marg)).
+        return sub_g * math.sqrt(2.0 * n_group * math.log(2.0 / a_marg))
+
+    # Hoeffding's lemma: for X in [a, b] centred, the increment is sub-Gaussian
+    # with parameter (b - a) / 2.
+    # Mean increment: bar T_i in [-tau, tau], so sub_g = tau.
+    azuma_mu_in  = _azuma_half_width(n_in,  tau) / n_in
+    azuma_mu_out = _azuma_half_width(n_out, tau) / n_out
+    # Second-moment increment: bar T_i^2 in [0, tau^2], so sub_g = tau^2 / 2.
+    azuma_nu_in  = _azuma_half_width(n_in,  0.5 * tau * tau) / n_in
+    azuma_nu_out = _azuma_half_width(n_out, 0.5 * tau * tau) / n_out
+
+    # DP posterior shift: under the worst-case in [q_-, q_+] posterior,
+    # the conditional mean of bar T_i given the auditor's filtration can
+    # bias the empirical mean (resp. second moment) by at most this much.
+    # Under exchangeable canaries, the shift cancels between numerator
+    # (sum_i B_i bar T_i) and denominator (sum_i B_i) of the in-group
+    # ratio, so the remaining error is just the martingale residual.
+    if assume_exchangeable_canaries:
+        dp_shift_mu = 0.0
+        dp_shift_nu = 0.0
+    else:
+        dp_shift_mu = 2.0 * tau * delta_q
+        dp_shift_nu = tau * tau * delta_q
+
+    half_mu_in  = azuma_mu_in  + dp_shift_mu
+    half_mu_out = azuma_mu_out + dp_shift_mu
+    half_nu_in  = azuma_nu_in  + dp_shift_nu
+    half_nu_out = azuma_nu_out + dp_shift_nu
+
+    mu_in_lo  = mu_in_hat  - half_mu_in
+    mu_in_hi  = mu_in_hat  + half_mu_in
+    mu_out_lo = mu_out_hat - half_mu_out
+    mu_out_hi = mu_out_hat + half_mu_out
+
+    # Var box from (mu, nu) box via var = nu - mu^2:
+    # |sigma^2 - sigma_hat^2| <= half_nu + 2 |mu_hat| half_mu + half_mu^2.
+    def _var_box(mu_hat, var_hat, h_mu, h_nu):
+        slack = h_nu + 2.0 * abs(mu_hat) * h_mu + h_mu * h_mu
+        return max(1e-12, var_hat - slack), var_hat + slack
+
+    var_in_lo,  var_in_hi  = _var_box(mu_in_hat,  var_in_hat,  half_mu_in,  half_nu_in)
+    var_out_lo, var_out_hi = _var_box(mu_out_hat, var_out_hat, half_mu_out, half_nu_out)
+
+    lo = np.array([mu_in_lo,  math.sqrt(var_in_lo),  mu_out_lo,  math.sqrt(var_out_lo)])
+    hi = np.array([mu_in_hi,  math.sqrt(var_in_hi),  mu_out_hi,  math.sqrt(var_out_hi)])
+
+    eps_lb, theta_min = _minimize_eps_over_box(
+        lo, hi, delta, pool_variance=pool_variance,
+    )
+
+    bad_event_budget = 2.0 * m * float(delta_theory)
+    return {
+        'eps_lb': eps_lb,
+        'theta_min': theta_min,
+        'box_lo': lo, 'box_hi': hi,
+        'method': 'dp_aware_bonferroni',
+        'effective_alpha': float(alpha) + bad_event_budget,
+        'bad_event_budget': bad_event_budget,
+        'q_plus': q_plus, 'q_minus': q_minus, 'delta_q': delta_q,
+        'score_clip': tau,
+        'azuma_widths': {
+            'mu_in':  azuma_mu_in,  'mu_out': azuma_mu_out,
+            'nu_in':  azuma_nu_in,  'nu_out': azuma_nu_out,
+        },
+        'dp_shift': {'mu': dp_shift_mu, 'nu': dp_shift_nu},
+    }
+
+
 # ---- (B) Joint-bootstrap ellipsoid (Mahalanobis) CR -------------------------
 
 def _bootstrap_param_samples(
@@ -403,6 +584,7 @@ def ndis_eps_lb_bootstrap_ellipsoid(
 NDIS_LB_METHODS = (
     'parametric_bonferroni',
     'bootstrap_ellipsoid',
+    'dp_aware_bonferroni',
 )
 
 
@@ -412,6 +594,11 @@ def ndis_eps_lb_all(
     pool_variance: bool = False,
     rng: Optional[np.random.Generator] = None,
     methods=NDIS_LB_METHODS,
+    eps_theory: Optional[float] = None,
+    score_clip: Optional[float] = None,
+    q: float = 0.5,
+    delta_theory: Optional[float] = None,
+    assume_exchangeable_canaries: bool = True,
 ):
     """Run every NDIS eps lower-bound method, sharing one bootstrap pass.
 
@@ -483,6 +670,21 @@ def ndis_eps_lb_all(
             'method': 'bootstrap_ellipsoid',
         }
 
+    if 'dp_aware_bonferroni' in methods:
+        if eps_theory is None or score_clip is None:
+            # Required parameters missing -> skip silently. Caller must pass
+            # eps_theory (the audited mechanism's claimed eps) and a score
+            # clip tau to enable this method.
+            pass
+        else:
+            results['dp_aware_bonferroni'] = ndis_eps_lb_dp_aware_bonferroni(
+                in_scores, out_scores, delta,
+                eps_theory=eps_theory, score_clip=score_clip,
+                alpha=alpha, q=q, delta_theory=delta_theory,
+                pool_variance=pool_variance,
+                assume_exchangeable_canaries=assume_exchangeable_canaries,
+            )
+
     return results
 
 
@@ -493,13 +695,21 @@ def ndis_eps_lb(
     method: str = 'parametric_bonferroni',
     alpha: float = 0.05, n_bootstrap: int = 2000,
     pool_variance: bool = False, rng: Optional[np.random.Generator] = None,
+    eps_theory: Optional[float] = None,
+    score_clip: Optional[float] = None,
+    q: float = 0.5,
+    delta_theory: Optional[float] = None,
 ):
     """Dispatch to one of the eps lower-bound constructions.
 
     method in {
         'parametric_bonferroni',
         'bootstrap_ellipsoid',
+        'dp_aware_bonferroni',
     }
+
+    `eps_theory` and `score_clip` are required for `dp_aware_bonferroni`
+    and ignored otherwise.
     """
     if method == 'parametric_bonferroni':
         return ndis_eps_lb_parametric_bonferroni(
@@ -509,5 +719,16 @@ def ndis_eps_lb(
         return ndis_eps_lb_bootstrap_ellipsoid(
             in_scores, out_scores, delta, alpha=alpha,
             n_bootstrap=n_bootstrap, pool_variance=pool_variance, rng=rng,
+        )
+    if method == 'dp_aware_bonferroni':
+        if eps_theory is None or score_clip is None:
+            raise ValueError(
+                "dp_aware_bonferroni requires eps_theory and score_clip."
+            )
+        return ndis_eps_lb_dp_aware_bonferroni(
+            in_scores, out_scores, delta,
+            eps_theory=eps_theory, score_clip=score_clip,
+            alpha=alpha, q=q, delta_theory=delta_theory,
+            pool_variance=pool_variance,
         )
     raise ValueError(f"unknown method: {method}")

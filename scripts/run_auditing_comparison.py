@@ -58,8 +58,12 @@ _STYLE = {
 NDIS_METHODS = (
     'parametric_bonferroni',
     'bootstrap_ellipsoid',
+    'dp_aware_bonferroni',
 )
 NDIS_KEYS = tuple(f'ndis_{m}' for m in NDIS_METHODS)
+# Methods that should appear in plots. dp_aware_bonferroni is a diagnostic
+# (drops the iid-canary assumption) and is print-only, not plotted.
+NDIS_PLOT_METHODS = ('parametric_bonferroni', 'bootstrap_ellipsoid')
 
 
 def _plot_method(ax, x, y, key, label_override=None):
@@ -96,7 +100,7 @@ def _resolve_score_path(exp_dir, kind, side, epoch):
     return None
 
 
-def audit_epoch(exp_dir, epoch, delta, significance, method=None):
+def audit_epoch(exp_dir, epoch, delta, significance, method=None, target_eps=None):
     in_sum_path = _resolve_score_path(exp_dir, 'sum', 'in', epoch)
     out_sum_path = _resolve_score_path(exp_dir, 'sum', 'out', epoch)
     in_ndis_path = os.path.join(exp_dir, f'in_scores_ndis_{epoch:06d}.csv')
@@ -122,6 +126,13 @@ def audit_epoch(exp_dir, epoch, delta, significance, method=None):
     else:
         eps_upper = float('nan')
 
+    # Score clip for the dp-aware bound: 1.05x the empirical max-abs so no
+    # clipping bias is incurred. tau in this regime scales as sigma*sqrt(2 log n).
+    tau = 1.05 * float(np.max(np.abs(np.concatenate([in_ndis, out_ndis]))))
+    # eps_theory drives the worst-case posterior shift in the dp-aware bound.
+    # Prefer the calibrated target from hparams; fall back to the running eps_upper.
+    eps_th = target_eps if target_eps is not None else eps_upper
+
     auditor = CanaryScoreAuditor(in_sum, out_sum)
     eps_steinke, _ = auditor._epsilon_one_run_all_thresholds(
         significance=significance, delta=delta, one_sided=True, threshold=None, use_fdp=False,
@@ -136,9 +147,11 @@ def audit_epoch(exp_dir, epoch, delta, significance, method=None):
             in_ndis, out_ndis, delta=delta,
             alpha=significance, n_bootstrap=2000,
             pool_variance=True,
+            eps_theory=eps_th, score_clip=tau,
         )
         for m in NDIS_METHODS:
-            ndis_results[f'ndis_{m}'] = float(all_out[m]['eps_lb'])
+            if m in all_out:
+                ndis_results[f'ndis_{m}'] = float(all_out[m]['eps_lb'])
     except (ValueError, RuntimeError) as e:
         print(f"  NDIS failed ({e}), setting all variants to 0")
 
@@ -182,17 +195,18 @@ def run_single(exp_dir, delta, significance, fig_dir):
 
     print(f"Found score files for epochs: {epochs}")
 
+    target_eps = get_target_epsilon(exp_dir)
     series = {k: [] for k in ('epoch', 'upper', 'steinke', 'fdp', *NDIS_KEYS)}
 
     for epoch in epochs:
-        result = audit_epoch(exp_dir, epoch, delta, significance)
+        result = audit_epoch(exp_dir, epoch, delta, significance, target_eps=target_eps)
         if result is None:
             print(f"  Epoch {epoch}: missing score files, skipping")
             continue
         series['epoch'].append(epoch)
         for k in ('upper', 'steinke', 'fdp', *NDIS_KEYS):
             series[k].append(result[k])
-        ndis_str = ', '.join(f"{k.replace('ndis_', '')[:6]}={result[k]:.3f}" for k in NDIS_KEYS)
+        ndis_str = ', '.join(f"{k.replace('ndis_', '')[:14]}={result[k]:.3f}" for k in NDIS_KEYS)
         print(f"  Epoch {epoch:4d}: upper={result['upper']:.3f}, "
               f"steinke={result['steinke']:.3f}, fdp={result['fdp']:.3f}, {ndis_str}")
 
@@ -242,7 +256,7 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
             print(f"Warning: no score files in {exp_dir}, skipping")
             continue
 
-        result = audit_epoch(exp_dir, final_epoch, delta, significance)
+        result = audit_epoch(exp_dir, final_epoch, delta, significance, target_eps=target_eps)
         if result is None:
             print(f"Warning: missing score files for epoch {final_epoch} in {exp_dir}, skipping")
             continue
@@ -251,7 +265,7 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
         for k in ('upper', 'steinke', 'fdp', *NDIS_KEYS):
             series[k].append(result[k])
 
-        ndis_str = ', '.join(f"{k.replace('ndis_', '')[:6]}={result[k]:.3f}" for k in NDIS_KEYS)
+        ndis_str = ', '.join(f"{k.replace('ndis_', '')[:14]}={result[k]:.3f}" for k in NDIS_KEYS)
         print(f"  eps={target_eps}: epoch={final_epoch}, upper={result['upper']:.3f}, "
               f"steinke={result['steinke']:.3f}, fdp={result['fdp']:.3f}, {ndis_str}")
 
@@ -370,10 +384,12 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
             eps_f, _ = auditor._epsilon_one_run_all_thresholds(
                 significance, delta, True, None, use_fdp=True,
             )
+            tau = 1.05 * float(np.max(np.abs(np.concatenate([n_in_scores, n_out_scores]))))
             try:
                 ndis_out = ndis_eps_lb_all(
                     n_in_scores, n_out_scores, delta=delta,
                     alpha=significance, pool_variance=True,
+                    eps_theory=target_eps, score_clip=tau,
                 )
             except (ValueError, RuntimeError):
                 ndis_out = None
@@ -381,7 +397,7 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
             trial_data['steinke'].append(eps_s)
             trial_data['fdp'].append(eps_f)
             for m in NDIS_METHODS:
-                v = float(ndis_out[m]['eps_lb']) if ndis_out is not None else 0.0
+                v = float(ndis_out[m]['eps_lb']) if (ndis_out is not None and m in ndis_out) else 0.0
                 trial_data[f'ndis_{m}'].append(v)
 
         for k in metric_keys:
