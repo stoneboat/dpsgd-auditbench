@@ -840,7 +840,7 @@ def run_gaussianity(exp_dir, fig_dir):
         f" empirical (mu={in_mu:.4f}, sigma={in_sd:.4f})"
     )
 
-    def _hist_with_pdf(ax, scores, mean_pred, sigma, title, label_pred, label_emp):
+    def _hist_with_pdf(ax, scores, mean_pred, sigma, label_pred, label_emp):
         x_max = max(float(np.max(np.abs(scores))), abs(mean_pred) + 4.0 * sigma) * 1.05
         x_lo, x_hi = mean_pred - x_max, mean_pred + x_max
         x_lo = min(x_lo, scores.min() - 0.1 * (scores.max() - scores.min() + 1e-9))
@@ -858,30 +858,33 @@ def run_gaussianity(exp_dir, fig_dir):
         ax.set_xlim(x_lo, x_hi)
         ax.set_xlabel('Score (NDIS scale)')
         ax.set_ylabel('Density')
-        ax.set_title(title)
         ax.legend(loc='upper right', fontsize=14)
 
+    base = os.path.join(fig_dir, f'gaussianity_{mech_label.lower()}_eps{eps_tag}')
     with plt.rc_context(_RC):
-        fig, axes = plt.subplots(1, 2, figsize=(17, 6.5))
+        fig_out, ax_out = plt.subplots(figsize=(11, 6.5))
         _hist_with_pdf(
-            axes[0], out_scores, mean_pred=0.0, sigma=sigma_pred,
-            title=fr'{mech_label} OUT  ($\varepsilon={target_eps:g}$)',
+            ax_out, out_scores, mean_pred=0.0, sigma=sigma_pred,
             label_pred=fr'$\mathcal{{N}}(0, \sigma^2)$,  $\sigma={sigma_pred:.3f}$',
             label_emp=fr'OUT  ($\hat\mu={out_mu:.3f},\, \hat\sigma={out_sd:.3f}$)',
         )
+        fig_out.tight_layout()
+        fig_out.savefig(f'{base}_out.png', dpi=300, bbox_inches='tight')
+        fig_out.savefig(f'{base}_out.pdf',                bbox_inches='tight')
+
+        fig_in, ax_in = plt.subplots(figsize=(11, 6.5))
         _hist_with_pdf(
-            axes[1], in_scores, mean_pred=mean_in_pred, sigma=sigma_pred,
-            title=fr'{mech_label} IN  ($\varepsilon={target_eps:g}$)',
+            ax_in, in_scores, mean_pred=mean_in_pred, sigma=sigma_pred,
             label_pred=(fr'$\mathcal{{N}}(\mu, \sigma^2)$,'
                         fr' $\mu={mean_in_pred:.3f}$ ({in_label}),'
                         fr' $\sigma={sigma_pred:.3f}$'),
             label_emp=fr'IN  ($\hat\mu={in_mu:.3f},\, \hat\sigma={in_sd:.3f}$)',
         )
-        fig.tight_layout()
-        out_png = os.path.join(fig_dir, f'gaussianity_{mech_label.lower()}_eps{eps_tag}.png')
-        fig.savefig(out_png, dpi=300, bbox_inches='tight')
-        fig.savefig(out_png.replace('.png', '.pdf'), bbox_inches='tight')
-        print(f"Saved Gaussianity diagnostic to: {out_png}")
+        fig_in.tight_layout()
+        fig_in.savefig(f'{base}_in.png', dpi=300, bbox_inches='tight')
+        fig_in.savefig(f'{base}_in.pdf',                bbox_inches='tight')
+
+    print(f"Saved Gaussianity diagnostics to: {base}_{{in,out}}.{{png,pdf}}")
 
 
 def main():
