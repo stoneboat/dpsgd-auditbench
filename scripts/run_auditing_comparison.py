@@ -45,7 +45,7 @@ _RC = {
     'xtick.major.width': 0.8,
     'ytick.major.width': 0.8,
     'legend.frameon': True,
-    'legend.fontsize': 20,
+    'legend.fontsize': 16,
     'legend.loc': 'upper left',
     'figure.dpi': 120,
 }
@@ -638,7 +638,7 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
         ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
         ax.tick_params(axis='x', which='minor', labelbottom=False)
 
-        ax.set_xlabel('Number of Canaries ($n$)')
+        ax.set_xlabel('Number of Canaries ($m$)')
         ax.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
         ax.set_ylim(0, 8.5)
         ax.legend()
