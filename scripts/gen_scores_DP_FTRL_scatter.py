@@ -249,11 +249,19 @@ def main():
     in_ndis = in_optimal / math.sqrt(L)
     out_ndis = out_optimal / math.sqrt(L)
 
+    # Andrew et al. (2024, Alg 3): max-over-leaves cosine of dirac canary
+    # direction with the released noisy_G_t. One scalar per canary.
+    andrew = state.compute_andrew_scores(leaves_done)
+    in_andrew = andrew[inclusion_mask]
+    out_andrew = andrew[~inclusion_mask]
+
     e = leaves_done
     np.savetxt(os.path.join(exp_dir, f"in_scores_optimal_{e:06d}.csv"), in_optimal, delimiter=",")
     np.savetxt(os.path.join(exp_dir, f"out_scores_optimal_{e:06d}.csv"), out_optimal, delimiter=",")
     np.savetxt(os.path.join(exp_dir, f"in_scores_ndis_{e:06d}.csv"), in_ndis, delimiter=",")
     np.savetxt(os.path.join(exp_dir, f"out_scores_ndis_{e:06d}.csv"), out_ndis, delimiter=",")
+    np.savetxt(os.path.join(exp_dir, f"in_scores_andrew_{e:06d}.csv"), in_andrew, delimiter=",")
+    np.savetxt(os.path.join(exp_dir, f"out_scores_andrew_{e:06d}.csv"), out_andrew, delimiter=",")
     np.savetxt(
         os.path.join(exp_dir, f"privacy_params_{e:06d}.csv"),
         [[args.epsilon, args.delta]],
@@ -268,7 +276,7 @@ def main():
         acc = test(model, test_loader, device)
         logger.info(f"Final test acc: {acc:.2f}%")
 
-    logger.info(f"Saved scores: optimal in({n_in}) out({n_out}).")
+    logger.info(f"Saved scores: optimal/ndis/andrew in({n_in}) out({n_out}).")
     logger.info(f"Final log file saved at: {log_file}")
 
 

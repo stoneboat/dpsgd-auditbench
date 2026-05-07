@@ -53,6 +53,7 @@ _STYLE = {
     'upper':   {'color': '#555555', 'marker': '',  'linestyle': (0, (3, 5, 1, 5)),  'linewidth': 1.4, 'markersize': 0,  'zorder': 1, 'label': 'Theoretical (upper bound)'},
     'steinke': {'color': '#ff7f0e', 'marker': 'o', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 2, 'label': 'Steinke et al. 2023'},
     'fdp':     {'color': '#2ca02c', 'marker': 's', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 3, 'label': 'Mahloujifar et al. 2024 (f-DP)'},
+    'andrew':  {'color': '#9467bd', 'marker': '^', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 8,  'zorder': 4, 'label': 'Andrew et al. 2024'},
     # NDIS lower-bound variants
     'ndis_parametric_bonferroni': {'color': '#02A1BA', 'marker': 'D', 'linestyle': '-', 'linewidth': 2.0, 'markersize': 6, 'zorder': 5, 'label': 'This paper'},
     'ndis_bootstrap_ellipsoid':   {'color': '#00497D', 'marker': '*', 'linestyle': '-', 'linewidth': 2.4, 'markersize': 10, 'zorder': 8, 'label': 'This paper'},
@@ -89,6 +90,7 @@ from auditing import CanaryScoreAuditor
 from whitebox_auditing.ndis_1d import (
     ndis_eps_from_delta_1d_brentq,
     estimate_mean_variance, ndis_eps_lb, ndis_eps_lb_all,
+    _ndis_eps_from_moments,
 )
 
 
@@ -103,11 +105,14 @@ def _resolve_score_path(exp_dir, kind, side, epoch):
     return None
 
 
-def audit_epoch(exp_dir, epoch, delta, significance, method=None, target_eps=None):
+def audit_epoch(exp_dir, epoch, delta, significance, method=None, target_eps=None,
+                with_andrew=False):
     in_sum_path = _resolve_score_path(exp_dir, 'sum', 'in', epoch)
     out_sum_path = _resolve_score_path(exp_dir, 'sum', 'out', epoch)
     in_ndis_path = os.path.join(exp_dir, f'in_scores_ndis_{epoch:06d}.csv')
     out_ndis_path = os.path.join(exp_dir, f'out_scores_ndis_{epoch:06d}.csv')
+    in_andrew_path = os.path.join(exp_dir, f'in_scores_andrew_{epoch:06d}.csv')
+    out_andrew_path = os.path.join(exp_dir, f'out_scores_andrew_{epoch:06d}.csv')
     privacy_path = os.path.join(exp_dir, f'privacy_params_{epoch:06d}.csv')
 
     paths = [in_sum_path, out_sum_path, in_ndis_path, out_ndis_path]
@@ -158,12 +163,34 @@ def audit_epoch(exp_dir, epoch, delta, significance, method=None, target_eps=Non
     except (ValueError, RuntimeError) as e:
         print(f"  NDIS failed ({e}), setting all variants to 0")
 
-    return {
+    out = {
         'upper': eps_upper,
         'steinke': eps_steinke,
         'fdp': eps_fdp,
         **ndis_results,
     }
+
+    # Andrew et al. 2024 (ICLR'24, Alg 3): only meaningful for DP-FTRL since
+    # the score is the max-over-iterates cosine of a dirac canary against
+    # the noisy cumulative `noisy_G_t` released by the tree mechanism.
+    # Gated on --with-andrew so DP-SGD runs don't pull in placeholder zeros.
+    if with_andrew:
+        eps_andrew = 0.0
+        if os.path.isfile(in_andrew_path) and os.path.isfile(out_andrew_path):
+            in_andrew = np.loadtxt(in_andrew_path, delimiter=',')
+            out_andrew = np.loadtxt(out_andrew_path, delimiter=',')
+            if in_andrew.size >= 2 and out_andrew.size >= 2:
+                eps_andrew = float(_ndis_eps_from_moments(
+                    in_mean=float(np.mean(in_andrew)),
+                    in_std=float(np.std(in_andrew, ddof=1)),
+                    out_mean=float(np.mean(out_andrew)),
+                    out_std=float(np.std(out_andrew, ddof=1)),
+                    delta=delta,
+                    pool_variance=False,
+                ))
+        out['andrew'] = eps_andrew
+
+    return out
 
 
 def get_final_epoch(exp_dir):
@@ -192,7 +219,7 @@ def get_target_T(exp_dir):
     return None
 
 
-def run_single(exp_dir, delta, significance, fig_dir):
+def run_single(exp_dir, delta, significance, fig_dir, with_andrew=False):
     """Original per-epoch line plot for a single experiment."""
     epochs = sorted(set(
         int(f.split('_')[-1].replace('.csv', ''))
@@ -207,21 +234,27 @@ def run_single(exp_dir, delta, significance, fig_dir):
     print(f"Found score files for epochs: {epochs}")
 
     target_eps = get_target_epsilon(exp_dir)
-    series = {k: [] for k in ('epoch', 'upper', 'steinke', 'fdp', *NDIS_KEYS)}
+    metric_keys = ('upper', 'steinke', 'fdp', *(('andrew',) if with_andrew else ()), *NDIS_KEYS)
+    series = {k: [] for k in ('epoch', *metric_keys)}
 
     for epoch in epochs:
-        result = audit_epoch(exp_dir, epoch, delta, significance, target_eps=target_eps)
+        result = audit_epoch(
+            exp_dir, epoch, delta, significance, target_eps=target_eps,
+            with_andrew=with_andrew,
+        )
         if result is None:
             print(f"  Epoch {epoch}: missing score files, skipping")
             continue
         series['epoch'].append(epoch)
-        for k in ('upper', 'steinke', 'fdp', *NDIS_KEYS):
+        for k in metric_keys:
             series[k].append(result[k])
         ndis_str = ', '.join(f"{k.replace('ndis_', '')[:14]}={result[k]:.3f}" for k in NDIS_KEYS)
+        andrew_str = f"andrew={result['andrew']:.3f}, " if with_andrew else ''
         print(f"  Epoch {epoch:4d}: upper={result['upper']:.3f}, "
-              f"steinke={result['steinke']:.3f}, fdp={result['fdp']:.3f}, {ndis_str}")
+              f"steinke={result['steinke']:.3f}, fdp={result['fdp']:.3f}, "
+              f"{andrew_str}{ndis_str}")
 
-    cols = ('epoch', 'upper', 'steinke', 'fdp', *NDIS_KEYS)
+    cols = ('epoch', *metric_keys)
     results = np.column_stack([series[c] for c in cols])
     results_path = os.path.join(exp_dir, 'auditing_results.csv')
     np.savetxt(results_path, results, delimiter=',',
@@ -234,6 +267,8 @@ def run_single(exp_dir, delta, significance, fig_dir):
         _plot_method(ax, series['epoch'], series['upper'],   'upper')
         _plot_method(ax, series['epoch'], series['steinke'], 'steinke')
         _plot_method(ax, series['epoch'], series['fdp'],     'fdp')
+        if with_andrew:
+            _plot_method(ax, series['epoch'], series['andrew'], 'andrew')
         _plot_method(ax, series['epoch'], series['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid')
 
         ax.set_xlabel('Epoch')
@@ -248,9 +283,10 @@ def run_single(exp_dir, delta, significance, fig_dir):
         print(f"Figure saved to: {fig_path} (and .pdf)")
 
 
-def run_multi(exp_dirs, delta, significance, fig_dir):
+def run_multi(exp_dirs, delta, significance, fig_dir, with_andrew=False):
     """Compare final-epoch empirical eps across multiple target epsilons."""
-    series = {k: [] for k in ('target', 'upper', 'steinke', 'fdp', *NDIS_KEYS)}
+    metric_keys = ('upper', 'steinke', 'fdp', *(('andrew',) if with_andrew else ()), *NDIS_KEYS)
+    series = {k: [] for k in ('target', *metric_keys)}
     ortho_results = []
     for exp_dir in exp_dirs:
         if not os.path.isdir(exp_dir):
@@ -267,13 +303,16 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
             print(f"Warning: no score files in {exp_dir}, skipping")
             continue
 
-        result = audit_epoch(exp_dir, final_epoch, delta, significance, target_eps=target_eps)
+        result = audit_epoch(
+            exp_dir, final_epoch, delta, significance, target_eps=target_eps,
+            with_andrew=with_andrew,
+        )
         if result is None:
             print(f"Warning: missing score files for epoch {final_epoch} in {exp_dir}, skipping")
             continue
 
         series['target'].append(target_eps)
-        for k in ('upper', 'steinke', 'fdp', *NDIS_KEYS):
+        for k in metric_keys:
             series[k].append(result[k])
 
         dirs_path = os.path.join(exp_dir, 'canary_directions.csv')
@@ -292,8 +331,10 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
             ortho_results.append(None)
 
         ndis_str = ', '.join(f"{k.replace('ndis_', '')[:14]}={result[k]:.3f}" for k in NDIS_KEYS)
+        andrew_str = f"andrew={result['andrew']:.3f}, " if with_andrew else ''
         print(f"  eps={target_eps}: epoch={final_epoch}, upper={result['upper']:.3f}, "
-              f"steinke={result['steinke']:.3f}, fdp={result['fdp']:.3f}, {ndis_str}")
+              f"steinke={result['steinke']:.3f}, fdp={result['fdp']:.3f}, "
+              f"{andrew_str}{ndis_str}")
 
     if not series['target']:
         print("Error: no valid experiments found")
@@ -303,7 +344,7 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
     for k in series:
         series[k] = [series[k][i] for i in order]
 
-    cols = ('target', 'upper', 'steinke', 'fdp', *NDIS_KEYS)
+    cols = ('target', *metric_keys)
     results = np.column_stack([series[c] for c in cols])
     results_path = os.path.join(fig_dir, 'auditing_comparison_final.csv')
     np.savetxt(results_path, results, delimiter=',',
@@ -332,6 +373,8 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
         _plot_method(ax, series['target'], series['upper'],   'upper')
         _plot_method(ax, series['target'], series['steinke'], 'steinke')
         _plot_method(ax, series['target'], series['fdp'],     'fdp')
+        if with_andrew:
+            _plot_method(ax, series['target'], series['andrew'], 'andrew')
         _plot_method(ax, series['target'], series['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid')
 
         ax.set_xlabel(r'Theoretical $\varepsilon$')
@@ -370,7 +413,7 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
         print(f"Ablation figure saved to: {ablation_fig_path} (and .pdf)")
 
 
-def run_ablation_T(exp_dirs, delta, significance, fig_dir):
+def run_ablation_T(exp_dirs, delta, significance, fig_dir, with_andrew=False):
     """Empirical eps vs number of training steps T at fixed target epsilon.
 
     Each exp_dir is one training run with a different target_steps. The plot
@@ -378,7 +421,8 @@ def run_ablation_T(exp_dirs, delta, significance, fig_dir):
     sweeps T instead of theoretical eps. The horizontal reference line is
     the calibrated target eps shared across all runs.
     """
-    series = {k: [] for k in ('T', 'upper', 'steinke', 'fdp', *NDIS_KEYS)}
+    metric_keys = ('upper', 'steinke', 'fdp', *(('andrew',) if with_andrew else ()), *NDIS_KEYS)
+    series = {k: [] for k in ('T', *metric_keys)}
     target_eps_seen = []
     for exp_dir in exp_dirs:
         if not os.path.isdir(exp_dir):
@@ -393,20 +437,24 @@ def run_ablation_T(exp_dirs, delta, significance, fig_dir):
         if final_epoch is None:
             print(f"Warning: no score files in {exp_dir}, skipping")
             continue
-        result = audit_epoch(exp_dir, final_epoch, delta, significance, target_eps=target_eps)
+        result = audit_epoch(
+            exp_dir, final_epoch, delta, significance, target_eps=target_eps,
+            with_andrew=with_andrew,
+        )
         if result is None:
             print(f"Warning: missing score files for epoch {final_epoch} in {exp_dir}, skipping")
             continue
 
         target_eps_seen.append(float(target_eps))
         series['T'].append(int(T))
-        for k in ('upper', 'steinke', 'fdp', *NDIS_KEYS):
+        for k in metric_keys:
             series[k].append(result[k])
 
         ndis_str = ', '.join(f"{k.replace('ndis_', '')[:14]}={result[k]:.3f}" for k in NDIS_KEYS)
+        andrew_str = f"andrew={result['andrew']:.3f}, " if with_andrew else ''
         print(f"  T={T}: eps_target={target_eps}, epoch={final_epoch}, "
               f"upper={result['upper']:.3f}, steinke={result['steinke']:.3f}, "
-              f"fdp={result['fdp']:.3f}, {ndis_str}")
+              f"fdp={result['fdp']:.3f}, {andrew_str}{ndis_str}")
 
     if not series['T']:
         print("Error: no valid experiments found")
@@ -422,7 +470,7 @@ def run_ablation_T(exp_dirs, delta, significance, fig_dir):
     for k in series:
         series[k] = [series[k][i] for i in order]
 
-    cols = ('T', 'upper', 'steinke', 'fdp', *NDIS_KEYS)
+    cols = ('T', *metric_keys)
     results = np.column_stack([series[c] for c in cols])
     eps_tag = f"{target_eps_label:g}".replace('.', 'p')
     results_path = os.path.join(fig_dir, f'auditing_ablation_T_eps{eps_tag}.csv')
@@ -438,6 +486,8 @@ def run_ablation_T(exp_dirs, delta, significance, fig_dir):
                    label=fr'Theoretical $\varepsilon = {target_eps_label:g}$', zorder=1)
         _plot_method(ax, series['T'], series['steinke'], 'steinke')
         _plot_method(ax, series['T'], series['fdp'],     'fdp')
+        if with_andrew:
+            _plot_method(ax, series['T'], series['andrew'], 'andrew')
         _plot_method(ax, series['T'], series['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid')
 
         ax.set_xscale('log')
@@ -630,6 +680,9 @@ def main():
     parser.add_argument('--complexity', action='store_true', help='Run sample complexity analysis')
     parser.add_argument('--ablation-T', action='store_true',
                         help='With --exp-dirs: sweep training-step count T at fixed target eps.')
+    parser.add_argument('--with-andrew', action='store_true',
+                        help='Include Andrew et al. 2024 (max-over-iterates cosine). '
+                             'DP-FTRL only — DP-SGD runs do not save in_scores_andrew_*.csv.')
     parser.add_argument('--delta', type=float, default=1e-5)
     parser.add_argument('--significance', type=float, default=0.05)
     parser.add_argument('--fig-dir', type=str, default=None)
@@ -640,13 +693,16 @@ def main():
     os.makedirs(args.fig_dir, exist_ok=True)
 
     if args.ablation_T and args.exp_dirs:
-        run_ablation_T(args.exp_dirs, args.delta, args.significance, args.fig_dir)
+        run_ablation_T(args.exp_dirs, args.delta, args.significance, args.fig_dir,
+                       with_andrew=args.with_andrew)
     elif args.complexity and args.exp_dir:
         run_complexity(args.exp_dir, args.delta, args.significance, args.fig_dir)
     elif args.exp_dirs:
-        run_multi(args.exp_dirs, args.delta, args.significance, args.fig_dir)
+        run_multi(args.exp_dirs, args.delta, args.significance, args.fig_dir,
+                  with_andrew=args.with_andrew)
     elif args.exp_dir:
-        run_single(args.exp_dir, args.delta, args.significance, args.fig_dir)
+        run_single(args.exp_dir, args.delta, args.significance, args.fig_dir,
+                   with_andrew=args.with_andrew)
     else:
         parser.error(
             "Provide --exp-dir or --exp-dirs. Add --complexity for sample size analysis "

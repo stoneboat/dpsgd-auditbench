@@ -175,6 +175,9 @@ class DPFTRLState:
 
         self.leaf_proj  = np.zeros((self.T, self.m), dtype=np.float32)
         self.node_noise_proj: Dict[Tuple[int, int], np.ndarray] = {}
+        # Per-leaf L2 norm of noisy_G_t across the full param tensor. Used as
+        # the cosine denominator for the Andrew et al. (2024, Alg 3) audit.
+        self.g_norms = np.zeros(self.T, dtype=np.float64)
 
     # ----------------------------------------------------------------------
     def _project_to_canaries(self, tensors: List[torch.Tensor]) -> np.ndarray:
@@ -212,6 +215,9 @@ class DPFTRLState:
             self.node_noise_proj[node] = self._project_to_canaries(noise)
 
         noisy_G = [c + n for c, n in zip(self.clean_G, self.canonical_noise)]
+        with torch.no_grad():
+            sq = sum(g.pow(2).sum() for g in noisy_G)
+            self.g_norms[t] = float(sq.sqrt().item())
         return noisy_G
 
     # ----------------------------------------------------------------------
@@ -246,6 +252,55 @@ class DPFTRLState:
                 clean_part = cum[b + 1, i] - cum[a, i]
                 noise_part = float(node_noise[i])
                 scores[i] += clean_part + noise_part
+        return scores
+
+    # ----------------------------------------------------------------------
+    def compute_andrew_scores(self, leaves_done: int) -> np.ndarray:
+        """Andrew et al. 2024 (ICLR'24, Alg 3) per-canary score.
+
+        For each canary i with dirac direction e_{c_i} and `noisy_G_t` =
+        clean_G_t + canonical_noise_t (the released cumulative gradient at
+        leaf t), define the cosine projection
+            g_{t, i}  =  noisy_G_t[c_i] / ||noisy_G_t||_2
+                      =  (clean_G_t[c_i] + canonical_noise_t[c_i]) / g_norms[t]
+        and take the max over leaves
+            score_i   =  max_{t < leaves_done} g_{t, i}.
+        Andrew et al. fit one Gaussian to {score_i : i in IN} and another to
+        {score_i : i in OUT}, then invert via Balle-Wang to get eps.
+
+        clean_G_t[c_i] is the cumulative leaf-projection (already recorded in
+        self.leaf_proj). canonical_noise_t[c_i] is the sum over canonical
+        nodes covering [0, t] of node_noise_proj[node][i]; we maintain it
+        incrementally with the same add/remove logic used in step().
+        """
+        if leaves_done <= 0:
+            return np.zeros(self.m, dtype=np.float64)
+
+        cum = np.zeros((leaves_done + 1, self.m), dtype=np.float64)
+        cum[1:] = np.cumsum(self.leaf_proj[:leaves_done].astype(np.float64), axis=0)
+
+        canonical_noise = np.zeros(self.m, dtype=np.float64)
+        active: set = set()
+        scores = np.full(self.m, -np.inf, dtype=np.float64)
+        zero_proj = np.zeros(self.m, dtype=np.float64)
+
+        for t in range(leaves_done):
+            target = _bit_decomposition_set(t + 1)
+            for node in active - target:
+                canonical_noise -= self.node_noise_proj.get(node, zero_proj)
+            for node in target - active:
+                canonical_noise += self.node_noise_proj.get(node, zero_proj)
+            active = target
+
+            denom = float(self.g_norms[t])
+            if denom <= 0.0:
+                continue
+            g_t = (cum[t + 1] + canonical_noise) / denom
+            np.maximum(scores, g_t, out=scores)
+
+        # Replace any remaining -inf (e.g., g_norms[t] all zero) with 0 so
+        # downstream stats don't NaN out.
+        scores[~np.isfinite(scores)] = 0.0
         return scores
 
 
