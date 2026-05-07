@@ -628,8 +628,15 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
         _plot_method(ax, total_budgets, results['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid')
 
         ax.set_xscale('log')
-        ax.set_xticks(total_budgets)
+        # Sparse, log-friendly major ticks so 1000/1500/2000/3500/5000 don't
+        # crash into each other; the data markers still sit at every
+        # `total_budgets` entry because `_plot_method` uses them as x.
+        major_ticks = [t for t in (50, 100, 200, 500, 1000, 2000, 5000)
+                       if min(total_budgets) <= t <= max(total_budgets)]
+        ax.set_xticks(major_ticks)
+        ax.set_xticks(total_budgets, minor=True)
         ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
+        ax.tick_params(axis='x', which='minor', labelbottom=False)
 
         ax.set_xlabel('Number of Canaries ($n$)')
         ax.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
@@ -659,8 +666,12 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
         _plot_method(ax_abl, total_budgets, results['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid', label_override='This paper (Bootstrap Ellipsoid)')
 
         ax_abl.set_xscale('log')
-        ax_abl.set_xticks(total_budgets)
+        major_ticks = [t for t in (50, 100, 200, 500, 1000, 2000, 5000)
+                       if min(total_budgets) <= t <= max(total_budgets)]
+        ax_abl.set_xticks(major_ticks)
+        ax_abl.set_xticks(total_budgets, minor=True)
         ax_abl.get_xaxis().set_major_formatter(plt.ScalarFormatter())
+        ax_abl.tick_params(axis='x', which='minor', labelbottom=False)
 
         ax_abl.set_xlabel('Number of Canaries ($n$)', fontweight='bold')
         ax_abl.set_ylabel(r'Empirical $\varepsilon$ (lower bound)', fontweight='bold')
