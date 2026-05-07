@@ -21,6 +21,7 @@ Usage:
 import sys
 import os
 import json
+import math
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
@@ -63,12 +64,9 @@ _STYLE = {
 NDIS_METHODS = (
     'parametric_bonferroni',
     'bootstrap_ellipsoid',
-    'dp_aware_bonferroni',
 )
 NDIS_KEYS = tuple(f'ndis_{m}' for m in NDIS_METHODS)
-# Methods that should appear in plots. dp_aware_bonferroni is a diagnostic
-# (drops the iid-canary assumption) and is print-only, not plotted.
-NDIS_PLOT_METHODS = ('parametric_bonferroni', 'bootstrap_ellipsoid')
+NDIS_PLOT_METHODS = NDIS_METHODS
 
 
 def _plot_method(ax, x, y, key, label_override=None):
@@ -135,9 +133,6 @@ def audit_epoch(exp_dir, epoch, delta, significance, method=None, target_eps=Non
     else:
         eps_upper = float('nan')
 
-    tau = 1.05 * float(np.max(np.abs(np.concatenate([in_ndis, out_ndis]))))
-    eps_th = target_eps if target_eps is not None else eps_upper
-
     auditor = CanaryScoreAuditor(in_sum, out_sum)
     eps_steinke, _ = auditor._epsilon_one_run_all_thresholds(
         significance=significance, delta=delta, one_sided=True, threshold=None, use_fdp=False,
@@ -152,7 +147,6 @@ def audit_epoch(exp_dir, epoch, delta, significance, method=None, target_eps=Non
             in_ndis, out_ndis, delta=delta,
             alpha=significance, n_bootstrap=2000,
             pool_variance=True,
-            eps_theory=eps_th, score_clip=tau,
         )
         for m in NDIS_METHODS:
             if m in all_out:
@@ -660,6 +654,236 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
         print(f"Ablation Sample Complexity Figure saved to: {ablation_fig_path} (and .pdf)")
 
 
+def run_independence(exp_dir, fig_dir, *, m_show=200, with_andrew=False):
+    """Visual canary-independence diagnostic from a single exp_dir.
+
+    Two panels (shared 'Blues' palette):
+      (i)  Gram matrix |<e_{c_i}, e_{c_j}>| for the first m_show canaries.
+           For dirac canaries with distinct coords this is the identity --
+           visual confirmation of mutual orthogonality, the necessary
+           condition for the iid per-canary-score model used by NDIS.
+      (ii) Hexbin density of (canary index, standardised score) for in-
+           and out-canaries side by side. If scores are exchangeable across
+           canary index, the density is uniform along the x-axis with a
+           Gaussian profile in z.
+    """
+    if not os.path.isdir(exp_dir):
+        sys.exit(f"exp_dir not found: {exp_dir}")
+
+    final_epoch = get_final_epoch(exp_dir)
+    if final_epoch is None:
+        sys.exit(f"No score files in {exp_dir}")
+
+    coords_path = None
+    for cand in ('canary_coords.csv', 'canary_directions.csv'):
+        p = os.path.join(exp_dir, cand)
+        if os.path.isfile(p):
+            coords_path = p
+            break
+    if coords_path is None:
+        sys.exit(f"No canary_coords.csv / canary_directions.csv in {exp_dir}")
+    coords = np.loadtxt(coords_path, delimiter=',', skiprows=1).astype(int)
+    if coords.ndim == 1:
+        coords = coords[:, None]
+
+    in_path = _resolve_score_path(exp_dir, 'sum', 'in', final_epoch)
+    out_path = _resolve_score_path(exp_dir, 'sum', 'out', final_epoch)
+    if in_path is None or out_path is None:
+        sys.exit(f"No score files for epoch {final_epoch} in {exp_dir}")
+    in_scores = np.loadtxt(in_path, delimiter=',')
+    out_scores = np.loadtxt(out_path, delimiter=',')
+
+    inc_mask_path = os.path.join(exp_dir, 'inclusion_mask.csv')
+    inclusion_mask = np.loadtxt(inc_mask_path, delimiter=',').astype(bool) \
+        if os.path.isfile(inc_mask_path) else None
+
+    m_total = int(coords.shape[0])
+    m_show = int(min(m_show, m_total))
+    sub = coords[:m_show]
+    if sub.shape[1] >= 2:
+        same_p = sub[:, 0:1] == sub[:, 0:1].T
+        same_f = sub[:, 1:2] == sub[:, 1:2].T
+        gram = (same_p & same_f).astype(float)
+    else:
+        gram = (sub[:, 0:1] == sub[:, 0:1].T).astype(float)
+
+    diag_mask = np.eye(m_show, dtype=bool)
+    off = gram[~diag_mask]
+    print(
+        f"Gram (m_show={m_show}): diag={float(gram[diag_mask].mean()):.3f}, "
+        f"max|off-diag|={float(np.max(np.abs(off))):.3e}, "
+        f"mean|off-diag|={float(np.mean(np.abs(off))):.3e}"
+    )
+
+    in_z = (in_scores - in_scores.mean()) / max(in_scores.std(ddof=1), 1e-12)
+    out_z = (out_scores - out_scores.mean()) / max(out_scores.std(ddof=1), 1e-12)
+    if inclusion_mask is not None and inclusion_mask.shape[0] == m_total:
+        in_idx = np.flatnonzero(inclusion_mask)
+        out_idx = np.flatnonzero(~inclusion_mask)
+    else:
+        # Fall back to score-aligned indices.
+        in_idx = np.arange(len(in_scores))
+        out_idx = np.arange(len(out_scores))
+
+    target_eps = get_target_epsilon(exp_dir)
+    eps_tag = f"{target_eps:g}".replace('.', 'p') if target_eps is not None else 'unknown'
+
+    with plt.rc_context(_RC):
+        fig, axes = plt.subplots(1, 2, figsize=(16.5, 6.8),
+                                 gridspec_kw={'width_ratios': [1.0, 1.35]})
+
+        # ---- Panel 1: Gram matrix heatmap -----------------------------------
+        im = axes[0].imshow(
+            gram, cmap='Blues', vmin=0.0, vmax=1.0, aspect='equal',
+            interpolation='nearest',
+        )
+        axes[0].set_xlabel(r'Canary index $j$')
+        axes[0].set_ylabel(r'Canary index $i$')
+        axes[0].set_title(fr'Direction Gram matrix ($m{{=}}{m_show}$)')
+        cb = fig.colorbar(im, ax=axes[0], shrink=0.85, pad=0.02)
+        cb.set_label(r'$|\langle e_{c_i}, e_{c_j}\rangle|$')
+
+        # ---- Panel 2: Hexbin density of (canary index, standardised z) ------
+        # Concatenate in/out scores; tag with their canary index in [0, m).
+        all_idx = np.concatenate([in_idx[:len(in_z)], out_idx[:len(out_z)]])
+        all_z   = np.concatenate([in_z,             out_z])
+        hb = axes[1].hexbin(
+            all_idx, all_z,
+            gridsize=(60, 36), cmap='Blues', mincnt=1, linewidths=0,
+        )
+        axes[1].set_xlabel('Canary index')
+        axes[1].set_ylabel(r'Standardised score $z$')
+        axes[1].set_title('Score density across canaries (in + out)')
+        axes[1].set_xlim(0, max(in_idx.max(), out_idx.max()) + 1)
+        axes[1].set_ylim(-4.5, 4.5)
+        cb2 = fig.colorbar(hb, ax=axes[1], shrink=0.85, pad=0.02)
+        cb2.set_label('count per hex')
+
+        fig.tight_layout()
+        out_png = os.path.join(fig_dir, f'canary_independence_eps{eps_tag}.png')
+        fig.savefig(out_png, dpi=300, bbox_inches='tight')
+        fig.savefig(out_png.replace('.png', '.pdf'), bbox_inches='tight')
+        print(f"Saved canary independence diagnostic to: {out_png}")
+
+
+def run_gaussianity(exp_dir, fig_dir):
+    """Histogram of canary scores against the asymptotic Gaussian.
+
+    Two side-by-side panels share an analytic mean / variance pinned by the
+    mechanism's noise calibration (NDIS scale, score = sum / sqrt(T) or
+    optimal / sqrt(L)):
+
+      DP-FTRL:
+          OUT ~ N(0,            sigma_node^2)
+          IN  ~ N(sqrt(L) * C,  sigma_node^2)         with L = log2(T) + 1
+      DP-SGD (Model 1, Bernoulli per-step injection at rate q = B/N):
+          OUT ~ N(0,                  (sigma_dpsgd * C)^2)
+          IN  ~ N(q * sqrt(T) * C,    (sigma_dpsgd * C)^2)
+
+    The IN-mean is exactly the "qC-style" Gaussian: q * sqrt(T) * C in
+    NDIS scale (or q*T*C in raw-sum scale). Comparing the empirical
+    histogram to that curve is the visual Gaussianity check.
+    """
+    if not os.path.isdir(exp_dir):
+        sys.exit(f"exp_dir not found: {exp_dir}")
+    final_epoch = get_final_epoch(exp_dir)
+    if final_epoch is None:
+        sys.exit(f"No score files in {exp_dir}")
+
+    in_path  = os.path.join(exp_dir, f'in_scores_ndis_{final_epoch:06d}.csv')
+    out_path = os.path.join(exp_dir, f'out_scores_ndis_{final_epoch:06d}.csv')
+    if not (os.path.isfile(in_path) and os.path.isfile(out_path)):
+        sys.exit(f"Missing in_scores_ndis / out_scores_ndis at epoch {final_epoch}")
+    in_scores  = np.loadtxt(in_path,  delimiter=',')
+    out_scores = np.loadtxt(out_path, delimiter=',')
+
+    hp_path = os.path.join(exp_dir, 'hparams.json')
+    if not os.path.isfile(hp_path):
+        sys.exit(f"Missing {hp_path}")
+    with open(hp_path) as f:
+        hp = json.load(f)
+
+    if 'sigma_node' in hp:
+        # DP-FTRL: deterministic single-leaf injection -> sqrt(L) * C mean.
+        from whitebox_auditing.tree_mechanism import num_levels
+        sigma_pred = float(hp['sigma_node'])
+        T = int(hp['target_steps'])
+        C = float(hp.get('max_grad_norm', 1.0))
+        L = num_levels(T) + 1
+        mean_in_pred = math.sqrt(L) * C
+        mech_label = 'DP-FTRL'
+        in_label = fr'$\sqrt{{L}}\cdot C = \sqrt{{{L}}}\cdot {C:g}$'
+    elif 'noise_multiplier' in hp:
+        # DP-SGD Model 1: per-step Bernoulli(q) injection -> q * sqrt(T) * C mean.
+        nm = float(hp['noise_multiplier'])
+        C = float(hp.get('max_grad_norm', 1.0))
+        sigma_pred = nm * C
+        T = int(hp['target_steps'])
+        B = int(hp.get('logical_batch_size', 4096))
+        N = int(hp.get('train_set_size', 50000))   # CIFAR-10 default
+        q = B / N
+        mean_in_pred = q * math.sqrt(T) * C
+        mech_label = 'DP-SGD'
+        in_label = fr'$qC\sqrt{{T}} = {q:.3g}\cdot {C:g}\sqrt{{{T}}}$'
+    else:
+        sys.exit("hparams.json has neither sigma_node nor noise_multiplier")
+
+    target_eps = hp.get('epsilon', None)
+    eps_tag = f"{float(target_eps):g}".replace('.', 'p') if target_eps is not None else 'unknown'
+
+    out_mu, out_sd = float(out_scores.mean()), float(out_scores.std(ddof=1))
+    in_mu,  in_sd  = float(in_scores.mean()),  float(in_scores.std(ddof=1))
+    print(
+        f"{mech_label} Gaussianity:\n"
+        f"  OUT predicted N(0, sigma={sigma_pred:.4f}); empirical (mu={out_mu:.4f}, sigma={out_sd:.4f})\n"
+        f"  IN  predicted N(mu={mean_in_pred:.4f}, sigma={sigma_pred:.4f});"
+        f" empirical (mu={in_mu:.4f}, sigma={in_sd:.4f})"
+    )
+
+    def _hist_with_pdf(ax, scores, mean_pred, sigma, title, label_pred, label_emp):
+        x_max = max(float(np.max(np.abs(scores))), abs(mean_pred) + 4.0 * sigma) * 1.05
+        x_lo, x_hi = mean_pred - x_max, mean_pred + x_max
+        x_lo = min(x_lo, scores.min() - 0.1 * (scores.max() - scores.min() + 1e-9))
+        x_hi = max(x_hi, scores.max() + 0.1 * (scores.max() - scores.min() + 1e-9))
+        bins = np.linspace(x_lo, x_hi, 70)
+        ax.hist(
+            scores, bins=bins, density=True,
+            color='#7DBEDC', edgecolor='#1F4E79', linewidth=0.6, alpha=0.75,
+            label=label_emp,
+        )
+        zz = np.linspace(x_lo, x_hi, 400)
+        pdf = np.exp(-0.5 * ((zz - mean_pred) / sigma) ** 2) / (sigma * math.sqrt(2 * math.pi))
+        ax.plot(zz, pdf, color='#cc4422', linewidth=2.4, linestyle='--', label=label_pred)
+        ax.axvline(mean_pred, color='#cc4422', linewidth=1.2, linestyle=':', alpha=0.7)
+        ax.set_xlim(x_lo, x_hi)
+        ax.set_xlabel('Score (NDIS scale)')
+        ax.set_ylabel('Density')
+        ax.set_title(title)
+        ax.legend(loc='upper right', fontsize=14)
+
+    with plt.rc_context(_RC):
+        fig, axes = plt.subplots(1, 2, figsize=(17, 6.5))
+        _hist_with_pdf(
+            axes[0], out_scores, mean_pred=0.0, sigma=sigma_pred,
+            title=fr'{mech_label} OUT  ($\varepsilon={target_eps:g}$)',
+            label_pred=fr'$\mathcal{{N}}(0, \sigma^2)$,  $\sigma={sigma_pred:.3f}$',
+            label_emp=fr'OUT  ($\hat\mu={out_mu:.3f},\, \hat\sigma={out_sd:.3f}$)',
+        )
+        _hist_with_pdf(
+            axes[1], in_scores, mean_pred=mean_in_pred, sigma=sigma_pred,
+            title=fr'{mech_label} IN  ($\varepsilon={target_eps:g}$)',
+            label_pred=(fr'$\mathcal{{N}}(\mu, \sigma^2)$,'
+                        fr' $\mu={mean_in_pred:.3f}$ ({in_label}),'
+                        fr' $\sigma={sigma_pred:.3f}$'),
+            label_emp=fr'IN  ($\hat\mu={in_mu:.3f},\, \hat\sigma={in_sd:.3f}$)',
+        )
+        fig.tight_layout()
+        out_png = os.path.join(fig_dir, f'gaussianity_{mech_label.lower()}_eps{eps_tag}.png')
+        fig.savefig(out_png, dpi=300, bbox_inches='tight')
+        fig.savefig(out_png.replace('.png', '.pdf'), bbox_inches='tight')
+        print(f"Saved Gaussianity diagnostic to: {out_png}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Run auditing methods comparison')
     parser.add_argument('--exp-dir', type=str, help='Single experiment directory')
@@ -670,6 +894,14 @@ def main():
     parser.add_argument('--with-andrew', action='store_true',
                         help='Include Andrew et al. 2024 (max-over-iterates cosine). '
                              'DP-FTRL only — DP-SGD runs do not save in_scores_andrew_*.csv.')
+    parser.add_argument('--independence', action='store_true',
+                        help='With --exp-dir: render the canary-direction Gram matrix + '
+                             'per-canary score density (independence diagnostic).')
+    parser.add_argument('--gaussianity', action='store_true',
+                        help='With --exp-dir: side-by-side IN / OUT score histograms '
+                             'against the asymptotic Gaussians predicted by the noise '
+                             'calibration. IN mean is sqrt(L)*C (DP-FTRL) or q*sqrt(T)*C '
+                             '(DP-SGD).')
     parser.add_argument('--delta', type=float, default=1e-5)
     parser.add_argument('--significance', type=float, default=0.05)
     parser.add_argument('--fig-dir', type=str, default=None)
@@ -679,7 +911,11 @@ def main():
         args.fig_dir = os.path.join(project_dir, 'fig')
     os.makedirs(args.fig_dir, exist_ok=True)
 
-    if args.ablation_T and args.exp_dirs:
+    if args.independence and args.exp_dir:
+        run_independence(args.exp_dir, args.fig_dir, with_andrew=args.with_andrew)
+    elif args.gaussianity and args.exp_dir:
+        run_gaussianity(args.exp_dir, args.fig_dir)
+    elif args.ablation_T and args.exp_dirs:
         run_ablation_T(args.exp_dirs, args.delta, args.significance, args.fig_dir,
                        with_andrew=args.with_andrew)
     elif args.complexity and args.exp_dir:
@@ -692,8 +928,9 @@ def main():
                    with_andrew=args.with_andrew)
     else:
         parser.error(
-            "Provide --exp-dir or --exp-dirs. Add --complexity for sample size analysis "
-            "or --ablation-T to sweep T at fixed eps."
+            "Provide --exp-dir or --exp-dirs. Add --complexity for sample size analysis, "
+            "--ablation-T to sweep T at fixed eps, --independence for the canary "
+            "orthogonality heatmap, or --gaussianity for the score-Gaussian fit."
         )
 
 
