@@ -1,33 +1,10 @@
 """Centralized DP-FTRL training with tree-aggregated Gaussian noise.
-
-Each step processes one mini-batch and produces a "leaf" gradient
-g_t = (sum of clipped per-sample gradients) + (sum of canary signals due at t).
-Leaves enter a streaming binary tree (Honaker construction); we maintain
-the noisy cumulative gradient
-
-    G_t_noisy  =  clean_G_t  +  (sum of fresh noises at canonical nodes for [0..t])
-
-and the FTRL update at step t is
-
-    theta_t  =  theta_init  -  lr * G_t_noisy.
+Each step processes one mini-batch and produces a "leaf" gradient g_t = (sum of clipped per-sample gradients) + (sum of canary signals due at t).
+Leaves enter a streaming binary tree (Honaker construction): G_t_noisy  =  clean_G_t  +  (sum of fresh noises at canonical nodes for [0..t])
 
 Audit setup:
-  * Each canary i has a fixed dirac direction (`canary_dirac_indices[i]` =
-    a (param_idx, flat_idx) pair) and a fixed leaf t_star_i in [0, T).
-  * If `inclusion_mask[i]` is True, the canary's signal `+canary_scale` is
-    added to the leaf gradient at step t_star_i.
-  * The SNR-optimal score per canary is
-
-        score_i  =  sum over a in ancestors(t_star_i) of
-                       (clean_partial_sum_at_a + noise_at_a)[canary_coord_i]
-
-    To compute it cheaply, we record:
-      - per leaf t: the *per-canary* projection of leaf_grad at canary i's
-        coord (a [T, m] float array, ~50MB at T=2500, m=5000),
-      - per newly-created tree node (level, idx): the per-canary projection
-        of the fresh noise tensor at canary i's coord (~log T floats per
-        canary, ~hundreds of KB).
-    At the end, we sum ancestor partial sums + ancestor noises per canary.
+  * Each canary i has a fixed dirac direction (`canary_dirac_indices[i]` = a (param_idx, flat_idx) pair) and a fixed leaf t_star_i in [0, T).
+  * The score per canary is: score_i  =  sum over a in ancestors(t_star_i) of (clean_partial_sum_at_a + noise_at_a)[canary_coord_i]
 """
 
 from __future__ import annotations
@@ -45,17 +22,8 @@ from tqdm import tqdm
 from train import _augment_per_image  # reuse per-image augmentation
 
 _logger = logging.getLogger(__name__)
-# Throttle pre-clip grad-norm telemetry. Logged from _clip_and_sum_grad_samples,
-# which is called once per physical batch. With ~32 physical batches per leaf,
-# N=50 ~= once or twice per leaf. Set to 0 to disable.
 _GRAD_NORM_LOG_EVERY = 50
 _grad_norm_call_count = [0]
-
-
-# ---------------------------------------------------------------------------
-# Canonical decomposition (matches whitebox_auditing.tree_mechanism, repeated
-# here as a set for fast diff operations).
-# ---------------------------------------------------------------------------
 
 
 def _bit_decomposition_set(n: int) -> set:
@@ -71,21 +39,10 @@ def _bit_decomposition_set(n: int) -> set:
             offset += 1 << level
     return out
 
-
 # ---------------------------------------------------------------------------
 # Per-sample clipping helper (replaces Opacus's optimizer-level clipping).
 # ---------------------------------------------------------------------------
-
-
-def _clip_and_sum_grad_samples(
-    params: List[torch.nn.Parameter], max_grad_norm: float
-) -> List[torch.Tensor]:
-    """Per-sample L2 clip then sum across the batch.
-
-    Each parameter has `p.grad_sample` of shape [B, ...] (set by Opacus's
-    GradSampleModule). Returns one tensor per parameter with `p.shape`,
-    holding sum_{b}(min(1, C/||g_b||) * g_b).
-    """
+def _clip_and_sum_grad_samples(params: List[torch.nn.Parameter], max_grad_norm: float) -> List[torch.Tensor]:
     per_sample_sq = None
     for p in params:
         gs = p.grad_sample
@@ -175,8 +132,6 @@ class DPFTRLState:
 
         self.leaf_proj  = np.zeros((self.T, self.m), dtype=np.float32)
         self.node_noise_proj: Dict[Tuple[int, int], np.ndarray] = {}
-        # Per-leaf L2 norm of noisy_G_t across the full param tensor. Used as
-        # the cosine denominator for the Andrew et al. (2024, Alg 3) audit.
         self.g_norms = np.zeros(self.T, dtype=np.float64)
 
     # ----------------------------------------------------------------------
@@ -223,16 +178,12 @@ class DPFTRLState:
     # ----------------------------------------------------------------------
     def compute_optimal_scores(self, leaves_done: int) -> np.ndarray:
         """SNR-optimal audit score per canary, post-training.
-
-        score_i = sum over a in ancestors(t_star_i) of
-                  (clean_partial_sum_at_a[c_i] + noise_at_a[c_i])
+        score_i = sum over a in ancestors(t_star_i) of (clean_partial_sum_at_a[c_i] + noise_at_a[c_i])
         """
-        # Cumulative per-canary leaf projections for O(1) range sums.
         cum = np.zeros((leaves_done + 1, self.m), dtype=np.float64)
         cum[1:] = np.cumsum(self.leaf_proj[:leaves_done].astype(np.float64), axis=0)
 
-        # The tree is over T_pow2 = next_pow2(T) leaves; a single canary's
-        # ancestor list spans levels 0..ceil(log2 T_pow2).
+        # The tree is over T_pow2 = next_pow2(T) leaves; a single canary's ancestor list spans levels 0..ceil(log2 T_pow2).
         T_pow2 = 1 if self.T <= 1 else 1 << (self.T - 1).bit_length()
         max_level = int(round(math.log2(T_pow2)))
 
@@ -254,24 +205,12 @@ class DPFTRLState:
                 scores[i] += clean_part + noise_part
         return scores
 
-    # ----------------------------------------------------------------------
     def compute_andrew_scores(self, leaves_done: int) -> np.ndarray:
         """Andrew et al. 2024 (ICLR'24, Alg 3) per-canary score.
-
-        For each canary i with dirac direction e_{c_i} and `noisy_G_t` =
-        clean_G_t + canonical_noise_t (the released cumulative gradient at
-        leaf t), define the cosine projection
+        For each canary i with dirac direction e_{c_i} and `noisy_G_t` = clean_G_t + canonical_noise_t (the released cumulative gradient at leaf t)
             g_{t, i}  =  noisy_G_t[c_i] / ||noisy_G_t||_2
                       =  (clean_G_t[c_i] + canonical_noise_t[c_i]) / g_norms[t]
-        and take the max over leaves
-            score_i   =  max_{t < leaves_done} g_{t, i}.
-        Andrew et al. fit one Gaussian to {score_i : i in IN} and another to
-        {score_i : i in OUT}, then invert via Balle-Wang to get eps.
-
-        clean_G_t[c_i] is the cumulative leaf-projection (already recorded in
-        self.leaf_proj). canonical_noise_t[c_i] is the sum over canonical
-        nodes covering [0, t] of node_noise_proj[node][i]; we maintain it
-        incrementally with the same add/remove logic used in step().
+        and take the max over leaves -> score_i   =  max_{t < leaves_done} g_{t, i}.
         """
         if leaves_done <= 0:
             return np.zeros(self.m, dtype=np.float64)
@@ -304,10 +243,7 @@ class DPFTRLState:
         return scores
 
 
-# ---------------------------------------------------------------------------
 # Main training loop
-# ---------------------------------------------------------------------------
-
 def train_dpftrl_whitebox(
     model: nn.Module,
     train_loader,

@@ -135,11 +135,7 @@ def audit_epoch(exp_dir, epoch, delta, significance, method=None, target_eps=Non
     else:
         eps_upper = float('nan')
 
-    # Score clip for the dp-aware bound: 1.05x the empirical max-abs so no
-    # clipping bias is incurred. tau in this regime scales as sigma*sqrt(2 log n).
     tau = 1.05 * float(np.max(np.abs(np.concatenate([in_ndis, out_ndis]))))
-    # eps_theory drives the worst-case posterior shift in the dp-aware bound.
-    # Prefer the calibrated target from hparams; fall back to the running eps_upper.
     eps_th = target_eps if target_eps is not None else eps_upper
 
     auditor = CanaryScoreAuditor(in_sum, out_sum)
@@ -171,10 +167,6 @@ def audit_epoch(exp_dir, epoch, delta, significance, method=None, target_eps=Non
         **ndis_results,
     }
 
-    # Andrew et al. 2024 (ICLR'24, Alg 3): only meaningful for DP-FTRL since
-    # the score is the max-over-iterates cosine of a dirac canary against
-    # the noisy cumulative `noisy_G_t` released by the tree mechanism.
-    # Gated on --with-andrew so DP-SGD runs don't pull in placeholder zeros.
     if with_andrew:
         eps_andrew = 0.0
         if os.path.isfile(in_andrew_path) and os.path.isfile(out_andrew_path):
@@ -266,10 +258,14 @@ def run_single(exp_dir, delta, significance, fig_dir, with_andrew=False):
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(10, 6))
         _plot_method(ax, series['epoch'], series['upper'],   'upper')
-        _plot_method(ax, series['epoch'], series['steinke'], 'steinke')
-        _plot_method(ax, series['epoch'], series['fdp'],     'fdp')
         if with_andrew:
+            # DP-FTRL panel: ours vs Andrew only. Steinke / Mahloujifar are
+            # designed for DP-SGD-style score distributions and aren't the
+            # right baseline once we move to the tree-mechanism setting.
             _plot_method(ax, series['epoch'], series['andrew'], 'andrew')
+        else:
+            _plot_method(ax, series['epoch'], series['steinke'], 'steinke')
+            _plot_method(ax, series['epoch'], series['fdp'],     'fdp')
         _plot_method(ax, series['epoch'], series['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid')
 
         ax.set_xlabel('Epoch')
@@ -366,16 +362,14 @@ def run_multi(exp_dirs, delta, significance, fig_dir, with_andrew=False):
         print("="*60)
         print("Note: Dirac canaries are perfectly orthogonal if collisions = 0.")
 
-    # ==========================================
-    # 1. Main Plot: Comparison with all methods (Ellipsoid only for NDIS)
-    # ==========================================
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(11, 6.5))
         _plot_method(ax, series['target'], series['upper'],   'upper')
-        _plot_method(ax, series['target'], series['steinke'], 'steinke')
-        _plot_method(ax, series['target'], series['fdp'],     'fdp')
         if with_andrew:
             _plot_method(ax, series['target'], series['andrew'], 'andrew')
+        else:
+            _plot_method(ax, series['target'], series['steinke'], 'steinke')
+            _plot_method(ax, series['target'], series['fdp'],     'fdp')
         _plot_method(ax, series['target'], series['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid')
 
         ax.set_xlabel(r'Theoretical $\varepsilon$')
@@ -390,9 +384,6 @@ def run_multi(exp_dirs, delta, significance, fig_dir, with_andrew=False):
         fig.savefig(fig_path.replace('.png', '.pdf'), bbox_inches='tight')
         print(f"Main figure saved to: {fig_path} (and .pdf)")
 
-    # ==========================================
-    # 2. Ablation Plot: CR Geometry Comparison
-    # ==========================================
     with plt.rc_context(_RC):
         fig_abl, ax_abl = plt.subplots(figsize=(11, 6.5))
         _plot_method(ax_abl, series['target'], series['upper'], 'upper')
@@ -416,11 +407,6 @@ def run_multi(exp_dirs, delta, significance, fig_dir, with_andrew=False):
 
 def run_ablation_T(exp_dirs, delta, significance, fig_dir, with_andrew=False):
     """Empirical eps vs number of training steps T at fixed target epsilon.
-
-    Each exp_dir is one training run with a different target_steps. The plot
-    mirrors run_multi (steinke / fdp / NDIS bootstrap-ellipsoid lines) but
-    sweeps T instead of theoretical eps. The horizontal reference line is
-    the calibrated target eps shared across all runs.
     """
     metric_keys = ('upper', 'steinke', 'fdp', *(('andrew',) if with_andrew else ()), *NDIS_KEYS)
     series = {k: [] for k in ('T', *metric_keys)}
@@ -478,17 +464,15 @@ def run_ablation_T(exp_dirs, delta, significance, fig_dir, with_andrew=False):
     np.savetxt(results_path, results, delimiter=',', header=','.join(cols), comments='')
     print(f"\nResults saved to: {results_path}")
 
-    # ==========================================
-    # Main plot: competitors vs NDIS bootstrap-ellipsoid (this paper)
-    # ==========================================
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(11, 6.5))
         ax.axhline(y=target_eps_label, color='#555555', ls=(0, (3, 5, 1, 5)), lw=1.4,
                    label=fr'Theoretical $\varepsilon = {target_eps_label:g}$', zorder=1)
-        _plot_method(ax, series['T'], series['steinke'], 'steinke')
-        _plot_method(ax, series['T'], series['fdp'],     'fdp')
         if with_andrew:
             _plot_method(ax, series['T'], series['andrew'], 'andrew')
+        else:
+            _plot_method(ax, series['T'], series['steinke'], 'steinke')
+            _plot_method(ax, series['T'], series['fdp'],     'fdp')
         _plot_method(ax, series['T'], series['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid')
 
         ax.set_xscale('log')
@@ -505,9 +489,6 @@ def run_ablation_T(exp_dirs, delta, significance, fig_dir, with_andrew=False):
         fig.savefig(fig_path.replace('.png', '.pdf'), bbox_inches='tight')
         print(f"Main figure saved to: {fig_path} (and .pdf)")
 
-    # ==========================================
-    # CR-geometry ablation: parametric vs ellipsoid
-    # ==========================================
     with plt.rc_context(_RC):
         fig_abl, ax_abl = plt.subplots(figsize=(11, 6.5))
         ax_abl.axhline(y=target_eps_label, color='#555555', ls=(0, (3, 5, 1, 5)), lw=1.4,
@@ -612,9 +593,6 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
                header=','.join(cols), comments='')
     print(f"\nResults saved to: {results_path}")
 
-    # ==========================================
-    # 1. Main Plot: Competitors vs NDIS Ellipsoid
-    # ==========================================
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(9, 5.5))
         ax.grid(True, which="major", ls="-", alpha=0.2)
@@ -649,9 +627,6 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
         plt.savefig(fig_path.replace('.png', '.pdf'), bbox_inches='tight')
         print(f"Main Sample Complexity Figure saved to: {fig_path} (and .pdf)")
 
-    # ==========================================
-    # 2. Ablation Plot: CR Geometry Comparison
-    # ==========================================
     with plt.rc_context(_RC):
         fig_abl, ax_abl = plt.subplots(figsize=(9, 5.5))
         ax_abl.grid(True, which="major", ls="-", alpha=0.2)

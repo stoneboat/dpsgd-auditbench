@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""Generate in/out audit scores for DP-FTRL on ScatterLinear (Path B).
-
-Trains a Tramer-Boneh-style ScatterLinear (kymatio scattering features + a
-linear classifier) under DP-FTRL with tree-aggregated Gaussian noise, and
-emits per-canary white-box audit scores. Designed for single-pass training
-(T = N / B leaves) so each canary fires at exactly one leaf, matching the
-white-box auditing protocol implemented in `src/train_dpftrl.py` without any
-modification to that file.
-
-This script is independent of `gen_scores_DP_FTRL_whitebox.py` (the WRN /
-Path C job); both can be submitted in parallel.
-"""
-
 import sys
 import os
 import math
@@ -30,11 +17,7 @@ from utils import setup_logging
 from dataset import get_data_loaders
 from scatter_network import ScatterLinear
 from train_dpftrl import train_dpftrl_whitebox, test
-from whitebox_auditing.tree_mechanism import (
-    tree_sigma_for_eps,
-    tree_eps_for_sigma,
-    num_levels,
-)
+from whitebox_auditing.tree_mechanism import (tree_sigma_for_eps, tree_eps_for_sigma, num_levels)
 
 
 # ==========================================
