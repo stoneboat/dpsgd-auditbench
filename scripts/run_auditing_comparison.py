@@ -728,42 +728,41 @@ def run_independence(exp_dir, fig_dir, *, m_show=200, with_andrew=False):
     target_eps = get_target_epsilon(exp_dir)
     eps_tag = f"{target_eps:g}".replace('.', 'p') if target_eps is not None else 'unknown'
 
+    base = os.path.join(fig_dir, f'canary_independence_eps{eps_tag}')
     with plt.rc_context(_RC):
-        fig, axes = plt.subplots(1, 2, figsize=(16.5, 6.8),
-                                 gridspec_kw={'width_ratios': [1.0, 1.35]})
-
-        # ---- Panel 1: Gram matrix heatmap -----------------------------------
-        im = axes[0].imshow(
+        # ---- Plot 1: Gram matrix heatmap ----------------------------------
+        fig_g, ax_g = plt.subplots(figsize=(8.5, 7.5))
+        im = ax_g.imshow(
             gram, cmap='Blues', vmin=0.0, vmax=1.0, aspect='equal',
             interpolation='nearest',
         )
-        axes[0].set_xlabel(r'Canary index $j$')
-        axes[0].set_ylabel(r'Canary index $i$')
-        axes[0].set_title(fr'Direction Gram matrix ($m{{=}}{m_show}$)')
-        cb = fig.colorbar(im, ax=axes[0], shrink=0.85, pad=0.02)
+        ax_g.set_xlabel(r'Canary index $j$')
+        ax_g.set_ylabel(r'Canary index $i$')
+        cb = fig_g.colorbar(im, ax=ax_g, shrink=0.85, pad=0.02)
         cb.set_label(r'$|\langle e_{c_i}, e_{c_j}\rangle|$')
+        fig_g.tight_layout()
+        fig_g.savefig(f'{base}_gram.png', dpi=300, bbox_inches='tight')
+        fig_g.savefig(f'{base}_gram.pdf',                bbox_inches='tight')
 
-        # ---- Panel 2: Hexbin density of (canary index, standardised z) ------
-        # Concatenate in/out scores; tag with their canary index in [0, m).
+        # ---- Plot 2: Hexbin density of (canary index, standardised z) -----
         all_idx = np.concatenate([in_idx[:len(in_z)], out_idx[:len(out_z)]])
         all_z   = np.concatenate([in_z,             out_z])
-        hb = axes[1].hexbin(
+        fig_d, ax_d = plt.subplots(figsize=(11, 6.5))
+        hb = ax_d.hexbin(
             all_idx, all_z,
             gridsize=(60, 36), cmap='Blues', mincnt=1, linewidths=0,
         )
-        axes[1].set_xlabel('Canary index')
-        axes[1].set_ylabel(r'Standardised score $z$')
-        axes[1].set_title('Score density across canaries (in + out)')
-        axes[1].set_xlim(0, max(in_idx.max(), out_idx.max()) + 1)
-        axes[1].set_ylim(-4.5, 4.5)
-        cb2 = fig.colorbar(hb, ax=axes[1], shrink=0.85, pad=0.02)
+        ax_d.set_xlabel('Canary index')
+        ax_d.set_ylabel(r'Standardised score $z$')
+        ax_d.set_xlim(0, max(in_idx.max(), out_idx.max()) + 1)
+        ax_d.set_ylim(-4.5, 4.5)
+        cb2 = fig_d.colorbar(hb, ax=ax_d, shrink=0.85, pad=0.02)
         cb2.set_label('count per hex')
+        fig_d.tight_layout()
+        fig_d.savefig(f'{base}_density.png', dpi=300, bbox_inches='tight')
+        fig_d.savefig(f'{base}_density.pdf',                bbox_inches='tight')
 
-        fig.tight_layout()
-        out_png = os.path.join(fig_dir, f'canary_independence_eps{eps_tag}.png')
-        fig.savefig(out_png, dpi=300, bbox_inches='tight')
-        fig.savefig(out_png.replace('.png', '.pdf'), bbox_inches='tight')
-        print(f"Saved canary independence diagnostic to: {out_png}")
+    print(f"Saved canary independence diagnostics to: {base}_{{gram,density}}.{{png,pdf}}")
 
 
 def run_gaussianity(exp_dir, fig_dir):
