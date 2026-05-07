@@ -28,9 +28,11 @@ from canary_score_diagnostics import within_run_orthogonality_check
 
 _RC = {
     'font.family': 'DejaVu Sans',
-    'font.size': 18,
-    'axes.titlesize': 14,
-    'axes.labelsize': 18,
+    'font.size': 22,
+    'axes.titlesize': 22,
+    'axes.labelsize': 24,
+    'xtick.labelsize': 20,
+    'ytick.labelsize': 20,
     'axes.spines.top': False,
     'axes.spines.right': False,
     'axes.linewidth': 0.8,
@@ -43,7 +45,7 @@ _RC = {
     'xtick.major.width': 0.8,
     'ytick.major.width': 0.8,
     'legend.frameon': False,
-    'legend.fontsize': 14,
+    'legend.fontsize': 20,
     'figure.dpi': 120,
 }
 
@@ -182,6 +184,14 @@ def get_target_epsilon(exp_dir):
     return None
 
 
+def get_target_T(exp_dir):
+    hparams_path = os.path.join(exp_dir, 'hparams.json')
+    if os.path.isfile(hparams_path):
+        with open(hparams_path) as f:
+            return json.load(f).get('target_steps')
+    return None
+
+
 def run_single(exp_dir, delta, significance, fig_dir):
     """Original per-epoch line plot for a single experiment."""
     epochs = sorted(set(
@@ -229,7 +239,7 @@ def run_single(exp_dir, delta, significance, fig_dir):
         ax.set_xlabel('Epoch')
         ax.set_ylabel(r'$\varepsilon$')
         ax.set_ylim(bottom=0)
-        ax.legend(loc='upper left', fontsize=14)
+        ax.legend(loc='upper left')
         fig.tight_layout()
 
         fig_path = os.path.join(fig_dir, 'privacy_bounds_comparison.png')
@@ -328,7 +338,7 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
         ax.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
         ax.set_xticks(series['target'])
         ax.set_ylim(bottom=0)
-        ax.legend(loc='upper left', handlelength=2.5, fontsize=14)
+        ax.legend(loc='upper left', handlelength=2.5)
         fig.tight_layout()
 
         fig_path = os.path.join(fig_dir, 'privacy_bounds_comparison_multi_eps.png')
@@ -351,10 +361,120 @@ def run_multi(exp_dirs, delta, significance, fig_dir):
         ax_abl.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
         ax_abl.set_xticks(series['target'])
         ax_abl.set_ylim(bottom=0)
-        ax_abl.legend(loc='upper left', handlelength=2.5, fontsize=14)
+        ax_abl.legend(loc='upper left', handlelength=2.5)
         fig_abl.tight_layout()
 
         ablation_fig_path = os.path.join(fig_dir, 'ablation_cr_geometry_multi_eps.png')
+        fig_abl.savefig(ablation_fig_path, dpi=300, bbox_inches='tight')
+        fig_abl.savefig(ablation_fig_path.replace('.png', '.pdf'), bbox_inches='tight')
+        print(f"Ablation figure saved to: {ablation_fig_path} (and .pdf)")
+
+
+def run_ablation_T(exp_dirs, delta, significance, fig_dir):
+    """Empirical eps vs number of training steps T at fixed target epsilon.
+
+    Each exp_dir is one training run with a different target_steps. The plot
+    mirrors run_multi (steinke / fdp / NDIS bootstrap-ellipsoid lines) but
+    sweeps T instead of theoretical eps. The horizontal reference line is
+    the calibrated target eps shared across all runs.
+    """
+    series = {k: [] for k in ('T', 'upper', 'steinke', 'fdp', *NDIS_KEYS)}
+    target_eps_seen = []
+    for exp_dir in exp_dirs:
+        if not os.path.isdir(exp_dir):
+            print(f"Warning: {exp_dir} not found, skipping")
+            continue
+        target_eps = get_target_epsilon(exp_dir)
+        T = get_target_T(exp_dir)
+        if target_eps is None or T is None:
+            print(f"Warning: hparams.json missing epsilon or target_steps in {exp_dir}, skipping")
+            continue
+        final_epoch = get_final_epoch(exp_dir)
+        if final_epoch is None:
+            print(f"Warning: no score files in {exp_dir}, skipping")
+            continue
+        result = audit_epoch(exp_dir, final_epoch, delta, significance, target_eps=target_eps)
+        if result is None:
+            print(f"Warning: missing score files for epoch {final_epoch} in {exp_dir}, skipping")
+            continue
+
+        target_eps_seen.append(float(target_eps))
+        series['T'].append(int(T))
+        for k in ('upper', 'steinke', 'fdp', *NDIS_KEYS):
+            series[k].append(result[k])
+
+        ndis_str = ', '.join(f"{k.replace('ndis_', '')[:14]}={result[k]:.3f}" for k in NDIS_KEYS)
+        print(f"  T={T}: eps_target={target_eps}, epoch={final_epoch}, "
+              f"upper={result['upper']:.3f}, steinke={result['steinke']:.3f}, "
+              f"fdp={result['fdp']:.3f}, {ndis_str}")
+
+    if not series['T']:
+        print("Error: no valid experiments found")
+        sys.exit(1)
+
+    eps_set = sorted({round(e, 4) for e in target_eps_seen})
+    if len(eps_set) > 1:
+        print(f"Warning: target eps differs across exp_dirs ({eps_set}); using first run's eps "
+              "for the reference line.")
+    target_eps_label = target_eps_seen[0]
+
+    order = np.argsort(series['T'])
+    for k in series:
+        series[k] = [series[k][i] for i in order]
+
+    cols = ('T', 'upper', 'steinke', 'fdp', *NDIS_KEYS)
+    results = np.column_stack([series[c] for c in cols])
+    eps_tag = f"{target_eps_label:g}".replace('.', 'p')
+    results_path = os.path.join(fig_dir, f'auditing_ablation_T_eps{eps_tag}.csv')
+    np.savetxt(results_path, results, delimiter=',', header=','.join(cols), comments='')
+    print(f"\nResults saved to: {results_path}")
+
+    # ==========================================
+    # Main plot: competitors vs NDIS bootstrap-ellipsoid (this paper)
+    # ==========================================
+    with plt.rc_context(_RC):
+        fig, ax = plt.subplots(figsize=(11, 6.5))
+        ax.axhline(y=target_eps_label, color='#555555', ls=(0, (3, 5, 1, 5)), lw=1.4,
+                   label=fr'Theoretical $\varepsilon = {target_eps_label:g}$', zorder=1)
+        _plot_method(ax, series['T'], series['steinke'], 'steinke')
+        _plot_method(ax, series['T'], series['fdp'],     'fdp')
+        _plot_method(ax, series['T'], series['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid')
+
+        ax.set_xscale('log')
+        ax.set_xticks(series['T'])
+        ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
+        ax.set_xlabel(r'Number of training steps $T$')
+        ax.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
+        ax.set_ylim(bottom=0)
+        ax.legend(loc='lower right', handlelength=2.5)
+        fig.tight_layout()
+
+        fig_path = os.path.join(fig_dir, f'ablation_T_eps{eps_tag}.png')
+        fig.savefig(fig_path, dpi=300, bbox_inches='tight')
+        fig.savefig(fig_path.replace('.png', '.pdf'), bbox_inches='tight')
+        print(f"Main figure saved to: {fig_path} (and .pdf)")
+
+    # ==========================================
+    # CR-geometry ablation: parametric vs ellipsoid
+    # ==========================================
+    with plt.rc_context(_RC):
+        fig_abl, ax_abl = plt.subplots(figsize=(11, 6.5))
+        ax_abl.axhline(y=target_eps_label, color='#555555', ls=(0, (3, 5, 1, 5)), lw=1.4,
+                       label=fr'Theoretical $\varepsilon = {target_eps_label:g}$', zorder=1)
+        _plot_method(ax_abl, series['T'], series['ndis_parametric_bonferroni'], 'ndis_parametric_bonferroni')
+        _plot_method(ax_abl, series['T'], series['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid',
+                     label_override='This paper (Bootstrap Ellipsoid)')
+
+        ax_abl.set_xscale('log')
+        ax_abl.set_xticks(series['T'])
+        ax_abl.get_xaxis().set_major_formatter(plt.ScalarFormatter())
+        ax_abl.set_xlabel(r'Number of training steps $T$')
+        ax_abl.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
+        ax_abl.set_ylim(bottom=0)
+        ax_abl.legend(loc='lower right', handlelength=2.5)
+        fig_abl.tight_layout()
+
+        ablation_fig_path = os.path.join(fig_dir, f'ablation_cr_geometry_T_eps{eps_tag}.png')
         fig_abl.savefig(ablation_fig_path, dpi=300, bbox_inches='tight')
         fig_abl.savefig(ablation_fig_path.replace('.png', '.pdf'), bbox_inches='tight')
         print(f"Ablation figure saved to: {ablation_fig_path} (and .pdf)")
@@ -463,7 +583,7 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
         ax.set_xlabel('Number of Canaries ($n$)')
         ax.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
         ax.set_ylim(0, 8.5)
-        ax.legend(loc='lower right', fontsize=14, frameon=True)
+        ax.legend(loc='lower right', frameon=True)
         plt.tight_layout()
 
         fig_path = os.path.join(fig_dir, 'sample_complexity_main.png')
@@ -494,7 +614,7 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
         ax_abl.set_xlabel('Number of Canaries ($n$)', fontweight='bold')
         ax_abl.set_ylabel(r'Empirical $\varepsilon$ (lower bound)', fontweight='bold')
         ax_abl.set_ylim(0, 8.5)
-        ax_abl.legend(loc='lower right', fontsize=14, frameon=True)
+        ax_abl.legend(loc='lower right', frameon=True)
         plt.tight_layout()
 
         ablation_fig_path = os.path.join(fig_dir, 'ablation_cr_sample_complexity.png')
@@ -508,6 +628,8 @@ def main():
     parser.add_argument('--exp-dir', type=str, help='Single experiment directory')
     parser.add_argument('--exp-dirs', type=str, nargs='+', help='Multiple experiment directories')
     parser.add_argument('--complexity', action='store_true', help='Run sample complexity analysis')
+    parser.add_argument('--ablation-T', action='store_true',
+                        help='With --exp-dirs: sweep training-step count T at fixed target eps.')
     parser.add_argument('--delta', type=float, default=1e-5)
     parser.add_argument('--significance', type=float, default=0.05)
     parser.add_argument('--fig-dir', type=str, default=None)
@@ -517,14 +639,19 @@ def main():
         args.fig_dir = os.path.join(project_dir, 'fig')
     os.makedirs(args.fig_dir, exist_ok=True)
 
-    if args.complexity and args.exp_dir:
+    if args.ablation_T and args.exp_dirs:
+        run_ablation_T(args.exp_dirs, args.delta, args.significance, args.fig_dir)
+    elif args.complexity and args.exp_dir:
         run_complexity(args.exp_dir, args.delta, args.significance, args.fig_dir)
     elif args.exp_dirs:
         run_multi(args.exp_dirs, args.delta, args.significance, args.fig_dir)
     elif args.exp_dir:
         run_single(args.exp_dir, args.delta, args.significance, args.fig_dir)
     else:
-        parser.error("Provide --exp-dir or --exp-dirs. Add --complexity for sample size analysis.")
+        parser.error(
+            "Provide --exp-dir or --exp-dirs. Add --complexity for sample size analysis "
+            "or --ablation-T to sweep T at fixed eps."
+        )
 
 
 if __name__ == '__main__':
