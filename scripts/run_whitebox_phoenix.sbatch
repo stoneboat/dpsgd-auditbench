@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=dpsgd_auditbench
-#SBATCH --account=gts-vzikas3
+#SBATCH --account=<account>
 #SBATCH --partition=gpu-h200
 #SBATCH --gres=gpu:1
 #SBATCH --mem=100G

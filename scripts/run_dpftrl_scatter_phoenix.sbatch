@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=dpftrl_scatter
-#SBATCH --account=gts-vzikas3
+#SBATCH --account=<account>
 #SBATCH --partition=gpu-a100
 #SBATCH --gres=gpu:1
 #SBATCH --mem=40G
