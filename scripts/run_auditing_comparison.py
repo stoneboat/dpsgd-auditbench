@@ -44,8 +44,9 @@ _RC = {
     'ytick.major.size': 3,
     'xtick.major.width': 0.8,
     'ytick.major.width': 0.8,
-    'legend.frameon': False,
+    'legend.frameon': True,
     'legend.fontsize': 20,
+    'legend.loc': 'upper left',
     'figure.dpi': 120,
 }
 
@@ -496,7 +497,7 @@ def run_ablation_T(exp_dirs, delta, significance, fig_dir, with_andrew=False):
         ax.set_xlabel(r'Number of training steps $T$')
         ax.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
         ax.set_ylim(bottom=0)
-        ax.legend(loc='lower right', handlelength=2.5)
+        ax.legend()
         fig.tight_layout()
 
         fig_path = os.path.join(fig_dir, f'ablation_T_eps{eps_tag}.png')
@@ -521,7 +522,7 @@ def run_ablation_T(exp_dirs, delta, significance, fig_dir, with_andrew=False):
         ax_abl.set_xlabel(r'Number of training steps $T$')
         ax_abl.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
         ax_abl.set_ylim(bottom=0)
-        ax_abl.legend(loc='lower right', handlelength=2.5)
+        ax_abl.legend()
         fig_abl.tight_layout()
 
         ablation_fig_path = os.path.join(fig_dir, f'ablation_cr_geometry_T_eps{eps_tag}.png')
@@ -633,7 +634,7 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
         ax.set_xlabel('Number of Canaries ($n$)')
         ax.set_ylabel(r'Empirical $\varepsilon$ (lower bound)')
         ax.set_ylim(0, 8.5)
-        ax.legend(loc='lower right', frameon=True)
+        ax.legend()
         plt.tight_layout()
 
         fig_path = os.path.join(fig_dir, 'sample_complexity_main.png')
@@ -664,7 +665,7 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
         ax_abl.set_xlabel('Number of Canaries ($n$)', fontweight='bold')
         ax_abl.set_ylabel(r'Empirical $\varepsilon$ (lower bound)', fontweight='bold')
         ax_abl.set_ylim(0, 8.5)
-        ax_abl.legend(loc='lower right', frameon=True)
+        ax_abl.legend()
         plt.tight_layout()
 
         ablation_fig_path = os.path.join(fig_dir, 'ablation_cr_sample_complexity.png')
