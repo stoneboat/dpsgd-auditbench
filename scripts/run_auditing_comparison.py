@@ -636,9 +636,9 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
             ax_abl.axhline(y=target_eps, color='#555555', ls='--', lw=1.2,
                            label='Theoretical Upper Bound')
 
-        _plot_method(ax_abl, total_budgets, results['ndis_parametric_bonferroni'], 'ndis_parametric_bonferroni')
+        _plot_method(ax_abl, total_budgets, results['ndis_parametric_bonferroni'], 'ndis_parametric_bonferroni',label_override='95% Bonferroni confidence')
         # Explicit override for the ablation plot only
-        _plot_method(ax_abl, total_budgets, results['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid', label_override='This paper (Bootstrap Ellipsoid)')
+        _plot_method(ax_abl, total_budgets, results['ndis_bootstrap_ellipsoid'], 'ndis_bootstrap_ellipsoid', label_override='95% Bootstrap Ellipsoid confidence')
 
         ax_abl.set_xscale('log')
         major_ticks = [t for t in (50, 100, 200, 500, 1000, 2000, 5000)
@@ -648,8 +648,8 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
         ax_abl.get_xaxis().set_major_formatter(plt.ScalarFormatter())
         ax_abl.tick_params(axis='x', which='minor', labelbottom=False)
 
-        ax_abl.set_xlabel('Number of Canaries ($n$)', fontweight='bold')
-        ax_abl.set_ylabel(r'Empirical $\varepsilon$ (lower bound)', fontweight='bold')
+        ax_abl.set_xlabel('Number of Canaries ($m$)')
+        ax_abl.set_ylabel(r'Empirical $\varepsilon$')
         ax_abl.set_ylim(0, 8.5)
         ax_abl.legend()
         plt.tight_layout()

@@ -238,16 +238,19 @@ def make_plot(exp_dirs, *, delta, alpha, pool_variance, fig_path):
 
     plt.rcParams.update({
         'font.family': 'DejaVu Sans',
-        'font.size': 14,
-        'axes.titlesize': 15,
-        'axes.labelsize': 14,
+        'font.size': 22,
+        'axes.titlesize': 22,
+        'axes.labelsize': 24,
+        'xtick.labelsize': 20,
+        'ytick.labelsize': 20,
         'axes.spines.top': False,
         'axes.spines.right': False,
         'axes.grid': True,
         'grid.alpha': 0.3,
         'legend.frameon': False,
+        'legend.fontsize': 20,
     })
-    fig, ax = plt.subplots(figsize=(8.5, 5.6))
+    fig, ax = plt.subplots(figsize=(11, 6.5))
     positions = np.arange(len(targets), dtype=float)
 
     # Theoretical (calibrated) eps target.
@@ -278,7 +281,7 @@ def make_plot(exp_dirs, *, delta, alpha, pool_variance, fig_path):
     ax.set_ylabel(r'Empirical $\varepsilon$')
     ax.set_title(r'DP-FTRL audit: provable confidence interval recovers theoretical $\varepsilon$')
     ax.set_ylim(bottom=0)
-    ax.legend(loc='upper left', fontsize=11)
+    ax.legend(loc='upper left')
     fig.tight_layout()
     fig.savefig(fig_path, dpi=300, bbox_inches='tight')
     fig.savefig(fig_path.replace('.png', '.pdf'), bbox_inches='tight')
