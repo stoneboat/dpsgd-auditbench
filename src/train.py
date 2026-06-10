@@ -1,9 +1,63 @@
+import logging
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
+import torchvision.transforms.v2 as transforms_v2
 import numpy as np
 from opacus.utils.batch_memory_manager import BatchMemoryManager
 from tqdm import tqdm
+
+_logger = logging.getLogger(__name__)
+# Throttle pre-clip grad-norm telemetry: log once per N physical-batch calls
+# to _whitebox_dp_step. With ~32 physical batches per logical batch, N=50
+# gives ~1-2 lines per logical step. Set to 0 to disable.
+_GRAD_NORM_LOG_EVERY = 50
+_grad_norm_call_count = [0]
+
+
+def _log_grad_sample_norms(optimizer):
+    """Pre-clip per-sample grad norm distribution. Tells us whether the C=1
+    clipping budget is saturating (signal-rich regime) or being wasted (most
+    samples have norm << C, so the noise floor dominates)."""
+    if optimizer.grad_samples is None or len(optimizer.grad_samples) == 0:
+        return
+    per_param_sq = []
+    B = None
+    for gs in optimizer.grad_samples:
+        if gs is None:
+            continue
+        flat = gs.reshape(gs.shape[0], -1)
+        per_param_sq.append((flat * flat).sum(dim=1))
+        B = gs.shape[0]
+    if not per_param_sq:
+        return
+    norms = torch.stack(per_param_sq, dim=0).sum(dim=0).sqrt().detach().cpu().numpy()
+    C = float(getattr(optimizer, "max_grad_norm", 1.0))
+    _logger.info(
+        "grad_norms B=%d C=%.2f mean=%.4f median=%.4f p90=%.4f p99=%.4f "
+        "frac_>=C=%.3f frac_<0.5C=%.3f",
+        B, C,
+        float(np.mean(norms)),
+        float(np.median(norms)),
+        float(np.percentile(norms, 90)),
+        float(np.percentile(norms, 99)),
+        float(np.mean(norms >= C)),
+        float(np.mean(norms < 0.5 * C)),
+    )
+
+
+_PER_IMAGE_AUG = transforms_v2.Compose([
+    transforms_v2.RandomCrop(32, padding=20, padding_mode='reflect'),
+    transforms_v2.RandomHorizontalFlip(p=0.5),
+    transforms_v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+])
+
+
+def _augment_per_image(images):
+    # torchvision v2 transforms applied to a batched tensor still share one
+    # random state across the batch; vmap over the batch dim to get independent
+    # augmentations per image (Sander et al. / Mahloujifar et al. recipe).
+    return torch.stack([_PER_IMAGE_AUG(img) for img in images])
 
 
 def make_dirac_canary_like(params, param_index=0, flat_index=0, device=None, dtype=None):
@@ -63,6 +117,13 @@ def _whitebox_dp_step(
     if optimizer.grad_samples is None or len(optimizer.grad_samples) == 0:
         return optimizer.step()
 
+    # Pre-clip telemetry (throttled). Must run BEFORE clip_and_accumulate
+    # because the latter consumes/clears grad_samples.
+    if _GRAD_NORM_LOG_EVERY > 0:
+        _grad_norm_call_count[0] += 1
+        if _grad_norm_call_count[0] % _GRAD_NORM_LOG_EVERY == 1:
+            _log_grad_sample_norms(optimizer)
+
     optimizer.clip_and_accumulate()
 
     if hasattr(optimizer, "_check_skip_next_step") and optimizer._check_skip_next_step():
@@ -71,19 +132,27 @@ def _whitebox_dp_step(
 
     optimizer._is_last_step_skipped = False
 
-    base_summed = [p.summed_grad.detach().clone() for p in optimizer.params]
-    include = False
+    include_mask = None
     if canary_dirac is not None and canary_prob is not None and canary_prob > 0.0:
         device = canary_dirac["device"]
+        # Per-step sampling: each canary is sampled with prob canary_prob
         include_mask = torch.rand(
             (canary_dirac["num_canaries"],), device=device
         ) < canary_prob
-        if include_mask.any():
+
+        # Only inject IN canaries: AND per-step sampling with membership mask
+        membership_mask = canary_dirac.get("inclusion_mask")
+        if membership_mask is not None:
+            inject_mask = include_mask & membership_mask
+        else:
+            inject_mask = include_mask
+
+        if inject_mask.any():
             for param_idx, p in enumerate(optimizer.params):
                 if param_idx not in canary_dirac["by_param"]:
                     continue
                 flat_indices, canary_ids = canary_dirac["by_param"][param_idx]
-                sel = include_mask[canary_ids]
+                sel = inject_mask[canary_ids]
                 if sel.any():
                     flat = p.summed_grad.view(-1)
                     flat.index_add_(
@@ -96,10 +165,11 @@ def _whitebox_dp_step(
                             dtype=flat.dtype,
                         ),
                     )
-        include = True
 
     optimizer.add_noise()
 
+    # Record scores at ALL canary coordinates (both in and out).
+    # The inclusion_mask (saved separately) determines which is which at analysis time.
     if scores is not None and canary_dirac is not None:
         step_scores = torch.empty(
             (canary_dirac["num_canaries"],), device=canary_dirac["device"]
@@ -108,11 +178,10 @@ def _whitebox_dp_step(
             if param_idx not in canary_dirac["by_param"]:
                 continue
             flat_indices, canary_ids = canary_dirac["by_param"][param_idx]
-            # delta = (p.grad - base_summed[param_idx]).view(-1)
-            delta = p.grad.view(-1)
-            step_scores[canary_ids] = delta[flat_indices]
+            noised_grad = p.grad.view(-1)
+            step_scores[canary_ids] = noised_grad[flat_indices]
         scores.append(step_scores.detach().cpu().tolist())
-        if include_flags is not None:
+        if include_flags is not None and include_mask is not None:
             include_flags.append(include_mask.detach().cpu().tolist())
 
     optimizer.scale_grad()
@@ -139,10 +208,10 @@ def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_p
     losses = []
     
     # Augmentation transform
-    augment_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-    ])
+    # Sander et al. (2023) / Mahloujifar et al. (2024) augmentation recipe.
+    # torchvision v1 Compose on a batched tensor applies the SAME random params
+    # to every image in the batch; we want per-image randomness, so we apply per
+    # image inside the K loop below via _augment_per_image().
     normalize_transform = transforms.Normalize(
         (0.4914, 0.4822, 0.4465),
         (0.2023, 0.1994, 0.2010),
@@ -173,7 +242,7 @@ def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_p
             aug_images = []
             for _ in range(aug_multiplicity):
                 # Augment requires BCHW
-                aug_images.append(augment_transform(images))
+                aug_images.append(_augment_per_image(images))
             
             # Stack: [K, B, C, H, W] -> [B*K, C, H, W]
             aug_images = torch.stack(aug_images).transpose(0, 1).reshape(-1, 3, 32, 32)
@@ -200,15 +269,12 @@ def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_p
                     
                     # Reshape [B, K, ...]
                     gs_view = gs.view(B_K // aug_multiplicity, aug_multiplicity, *feature_shape)
-                    
-                    # Average over K
-                    gs_avg = gs_view.mean(dim=1)
-                    
-                    # Replace grad_sample
-                    p.grad_sample = gs_avg
-            
+
+                    # Mean over K augs (De 2022 / Sander 2023 / Mahloujifar 2024 recipe).
+                    p.grad_sample = gs_view.mean(dim=1)
+
             # --- OPTIMIZER STEP ---
-            # BatchMemoryManager controls this. 
+            # BatchMemoryManager controls this.
             # If it's a partial batch, Opacus clips and accumulates.
             # If it's the end of logical batch, Opacus noises and updates.
             optimizer.step()
@@ -241,14 +307,22 @@ def train_whitebox(
     logical_batch_size,
     *,
     canary_dirac_indices=None,
+    canary_inclusion_mask=None,
     canary_prob=None,
     canary_scale=None,
     return_scores=False,
     return_include_flags=False,
+    ema_model=None,
+    ema_decay=0.9999,
+    ema_step_offset=0,
+    max_logical_steps=None,
 ):
     """Training function for auditing in whitebox model.
 
     canary_dirac_indices: list of (param_index, flat_index) for dirac canaries.
+    canary_inclusion_mask: boolean array of length num_canaries. True = IN (inject signal),
+        False = OUT (no injection, pure noise). Scores are recorded for ALL canaries.
+        If None, all canaries are injected (legacy behavior).
     canary_prob: probability q of injecting the canary per logical step.
     canary_scale: magnitude (mu) of the canary; defaults to optimizer.max_grad_norm.
     """
@@ -284,10 +358,21 @@ def train_whitebox(
                 torch.tensor(data["ids"], device=device, dtype=torch.long),
             )
 
+        inclusion_mask_t = None
+        if canary_inclusion_mask is not None:
+            inclusion_mask_t = torch.as_tensor(
+                canary_inclusion_mask, device=device, dtype=torch.bool
+            )
+            assert inclusion_mask_t.shape[0] == len(canary_dirac_indices), (
+                f"canary_inclusion_mask length {inclusion_mask_t.shape[0]} != "
+                f"num canaries {len(canary_dirac_indices)}"
+            )
+
         canary_dirac = {
             "by_param": by_param_t,
             "num_canaries": len(canary_dirac_indices),
             "device": device,
+            "inclusion_mask": inclusion_mask_t,
         }
 
     if canary_prob is None:
@@ -298,10 +383,10 @@ def train_whitebox(
         canary_scale = 1.0
     
     # Augmentation transform
-    augment_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-    ])
+    # Sander et al. (2023) / Mahloujifar et al. (2024) augmentation recipe.
+    # torchvision v1 Compose on a batched tensor applies the SAME random params
+    # to every image in the batch; we want per-image randomness, so we apply per
+    # image inside the K loop below via _augment_per_image().
     normalize_transform = transforms.Normalize(
         (0.4914, 0.4822, 0.4465),
         (0.2023, 0.1994, 0.2010),
@@ -332,7 +417,7 @@ def train_whitebox(
             aug_images = []
             for _ in range(aug_multiplicity):
                 # Augment requires BCHW
-                aug_images.append(augment_transform(images))
+                aug_images.append(_augment_per_image(images))
             
             # Stack: [K, B, C, H, W] -> [B*K, C, H, W]
             aug_images = torch.stack(aug_images).transpose(0, 1).reshape(-1, 3, 32, 32)
@@ -359,15 +444,12 @@ def train_whitebox(
                     
                     # Reshape [B, K, ...]
                     gs_view = gs.view(B_K // aug_multiplicity, aug_multiplicity, *feature_shape)
-                    
-                    # Average over K
-                    gs_avg = gs_view.mean(dim=1)
-                    
-                    # Replace grad_sample
-                    p.grad_sample = gs_avg
-            
+
+                    # Mean over K augs (De 2022 / Sander 2023 / Mahloujifar 2024 recipe).
+                    p.grad_sample = gs_view.mean(dim=1)
+
             # --- OPTIMIZER STEP ---
-            # BatchMemoryManager controls this. 
+            # BatchMemoryManager controls this.
             # If it's a partial batch, Opacus clips and accumulates.
             # If it's the end of logical batch, Opacus noises and updates.
             _whitebox_dp_step(
@@ -388,11 +470,25 @@ def train_whitebox(
             if samples_in_current_logical_batch >= logical_batch_size:
                 num_logical_steps += 1
                 samples_in_current_logical_batch = 0  # Reset for next logical batch
-            
+
+                if ema_model is not None:
+                    # TIMM-style warmup so the EMA isn't dominated by the random init
+                    # over short training runs (Sander et al. recipe: 2500 steps).
+                    global_step = ema_step_offset + num_logical_steps
+                    effective_decay = min(ema_decay, (1.0 + global_step) / (10.0 + global_step))
+                    with torch.no_grad():
+                        for p_ema, p in zip(ema_model.parameters(), model.parameters()):
+                            p_ema.data.mul_(effective_decay).add_(p.data, alpha=1.0 - effective_decay)
+                        for b_ema, b in zip(ema_model.buffers(), model.buffers()):
+                            b_ema.data.copy_(b.data)
+
+                if max_logical_steps is not None and num_logical_steps >= max_logical_steps:
+                    break
+
             losses.append(loss.item())
             if i % 10 == 0:
                 pbar.set_postfix(loss=np.mean(losses[-10:]))
-    
+
     if return_scores:
         num_logical_steps = len(scores)
         if return_include_flags:

@@ -7,6 +7,7 @@ privacy_params at each checkpoint interval (same logic as train_auditable_DP_mod
 
 import sys
 import os
+import math
 import json
 import secrets
 import argparse
@@ -26,7 +27,6 @@ from utils import setup_logging, save_checkpoint, find_latest_checkpoint, load_c
 from dataset import get_data_loaders
 from network_arch import WideResNet
 from train import test, train_whitebox
-from classifier.white_box_dp_sgd import sample_gaussian
 
 # ==========================================
 # Default Hyperparameters (white-box, from notebook)
@@ -38,9 +38,10 @@ DEFAULT_MAX_GRAD_NORM = 1.0
 DEFAULT_EPSILON = 8.0
 DEFAULT_DELTA = 1e-5
 DEFAULT_EPOCHS = 200
+DEFAULT_TARGET_STEPS = 2500   # Sander/Mahloujifar setting
+DEFAULT_EMA_DECAY = 0.9999    # Sander/Mahloujifar setting
 DEFAULT_LR = 4.0
 DEFAULT_MOMENTUM = 0.0
-DEFAULT_NOISE_MULTIPLIER = 3.0
 DEFAULT_CKPT_INTERVAL = 20
 DEFAULT_CANARY_COUNT = 10000
 DEFAULT_PKEEP = 0.5
@@ -57,10 +58,14 @@ def main():
     parser.add_argument('--max-grad-norm', type=float, default=DEFAULT_MAX_GRAD_NORM)
     parser.add_argument('--epsilon', type=float, default=DEFAULT_EPSILON)
     parser.add_argument('--delta', type=float, default=DEFAULT_DELTA)
-    parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS,
+                        help='Hard cap on epochs; training also stops when --target-steps is reached.')
+    parser.add_argument('--target-steps', type=int, default=DEFAULT_TARGET_STEPS,
+                        help='Total DP-SGD steps to run (Sander/Mahloujifar use 2500). Privacy budget is calibrated to this exact step count.')
+    parser.add_argument('--ema-decay', type=float, default=DEFAULT_EMA_DECAY,
+                        help='Decay for the exponential moving average of model weights used at evaluation. Set to 0 to disable.')
     parser.add_argument('--lr', type=float, default=DEFAULT_LR)
     parser.add_argument('--momentum', type=float, default=DEFAULT_MOMENTUM)
-    parser.add_argument('--noise-multiplier', type=float, default=DEFAULT_NOISE_MULTIPLIER)
     parser.add_argument('--ckpt-interval', type=int, default=DEFAULT_CKPT_INTERVAL)
     # Experiment
     parser.add_argument('--canary-count', type=int, default=DEFAULT_CANARY_COUNT)
@@ -122,9 +127,10 @@ def main():
         'epsilon': args.epsilon,
         'delta': args.delta,
         'epochs': args.epochs,
+        'target_steps': args.target_steps,
+        'ema_decay': args.ema_decay,
         'lr': args.lr,
         'momentum': args.momentum,
-        'noise_multiplier': args.noise_multiplier,
         'ckpt_interval': args.ckpt_interval,
         'canary_count': args.canary_count,
         'pkeep': args.pkeep,
@@ -148,20 +154,60 @@ def main():
     logger.info("Creating model...")
     model = WideResNet(depth=16, widen_factor=4).to(device)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
+
+    # Calibrate the privacy budget to the *target step count*, not to args.epochs.
+    # Opacus computes sigma from (target_eps, target_delta, sample_rate, epochs);
+    # total budgeted steps = epochs * len(orig_loader). We pick epochs so the
+    # budget covers exactly args.target_steps.
+    steps_per_epoch_pre = max(1, len(train_loader))
+    epochs_for_priv = max(
+        1, math.ceil(args.target_steps / steps_per_epoch_pre)
+    )
+    epochs_cap = min(args.epochs, epochs_for_priv)
+    logger.info(
+        f"steps_per_epoch (pre-Opacus) = {steps_per_epoch_pre}, "
+        f"target_steps = {args.target_steps}, "
+        f"epochs_for_privacy = {epochs_for_priv}, epochs_cap = {epochs_cap}"
+    )
+
     logger.info("Setting up privacy engine...")
     privacy_engine = PrivacyEngine()
-    model, optimizer, train_loader = privacy_engine.make_private(
+    model, optimizer, train_loader = privacy_engine.make_private_with_epsilon(
         module=model,
         optimizer=optimizer,
         data_loader=train_loader,
-        noise_multiplier=args.noise_multiplier,
+        epochs=epochs_for_priv,
+        target_epsilon=args.epsilon,
+        target_delta=args.delta,
         max_grad_norm=args.max_grad_norm,
     )
+    noise_multiplier = optimizer.noise_multiplier
+    logger.info(f"Opacus computed noise_multiplier={noise_multiplier:.4f} for epsilon={args.epsilon}, delta={args.delta}, epochs={epochs_for_priv}")
+
+    # ---- EMA: Sander et al. / Mahloujifar et al. eval on EMA weights, not live weights.
+    if args.ema_decay > 0:
+        ema_model = WideResNet(depth=16, widen_factor=4).to(device).eval()
+        with torch.no_grad():
+            for p_ema, p in zip(ema_model.parameters(), model.parameters()):
+                p_ema.data.copy_(p.data)
+            for b_ema, b in zip(ema_model.buffers(), model.buffers()):
+                b_ema.data.copy_(b.data)
+        for p in ema_model.parameters():
+            p.requires_grad_(False)
+        logger.info(f"EMA enabled with decay {args.ema_decay}")
+    else:
+        ema_model = None
+        logger.info("EMA disabled (--ema-decay 0)")
+    params['noise_multiplier'] = noise_multiplier
+    with open(hparams_path, 'w') as f:
+        json.dump(params, f, indent=2)
 
     # Checkpoint loading
     start_epoch = 1
     total_steps = 0
     sum_scores = None
+    last_completed_epoch = None
+    last_completed_total_steps = 0
 
     checkpoint_result = find_latest_checkpoint(ckpt_dir)
     if checkpoint_result is not None:
@@ -174,53 +220,93 @@ def main():
         steps_per_epoch = len(train_loader)
         sample_rate = 1 / len(train_loader)
         privacy_engine.accountant.history.append(
-            (args.noise_multiplier, sample_rate, loaded_global_step)
+            (noise_multiplier, sample_rate, loaded_global_step)
         )
         logger.info(f"Resumed from Epoch {start_epoch}")
         logger.info(f"Privacy Accountant updated with {loaded_global_step} past steps.")
         total_steps = loaded_global_step if loaded_global_step is not None else 0
 
-        in_scores_path = os.path.join(exp_dir, f'in_scores_{checkpoint_epoch:06d}.csv')
-        out_scores_path = os.path.join(exp_dir, f'out_scores_{checkpoint_epoch:06d}.csv')
-        if os.path.isfile(in_scores_path) and total_steps > 0:
-            in_scores_loaded = np.loadtxt(in_scores_path, delimiter=',')
-            sum_scores = in_scores_loaded * total_steps
+        # Restore EMA state if present
+        if ema_model is not None:
+            ema_path = os.path.join(ckpt_dir, f'ema_state_{checkpoint_epoch:06d}.pt')
+            if os.path.isfile(ema_path):
+                ema_model.load_state_dict(torch.load(ema_path, map_location=device))
+                logger.info(f"Loaded EMA state from {ema_path}")
+            else:
+                logger.info(
+                    f"No EMA state at {ema_path}; re-initializing EMA from current model "
+                    "(estimate will be biased for the first few hundred steps)."
+                )
+
+        # Restore sum_scores from saved per-canary sums + inclusion mask
+        sum_scores_path = os.path.join(exp_dir, f'sum_scores_{checkpoint_epoch:06d}.csv')
+        if os.path.isfile(sum_scores_path) and total_steps > 0:
+            sum_scores = np.loadtxt(sum_scores_path, delimiter=',')
             logger.info(
-                f"Loaded in_scores for epoch {checkpoint_epoch} -> restored sum_scores (total_steps={total_steps})"
+                f"Loaded sum_scores for epoch {checkpoint_epoch} (total_steps={total_steps})"
             )
-        if os.path.isfile(out_scores_path):
-            out_scores_loaded = np.loadtxt(out_scores_path, delimiter=',')
-            logger.info(f"Loaded out_scores for epoch {checkpoint_epoch} (same epoch as checkpoint)")
 
         current_eps = privacy_engine.get_epsilon(args.delta)
         logger.info(f"Current Cumulative Epsilon: {current_eps:.2f}")
     else:
         logger.info("No checkpoint found. Starting from scratch.")
 
-    # Build dirac canaries (same as notebook)
+    # Build dirac canaries: random non-repeating coords across the WHOLE model.
+    # Sequential indexing puts every canary into conv1 + early layer1, which
+    # corrupts the feature-extractor stem (each IN canary drifts that coord by
+    # ~q*C*lr*T/B = +0.2 over training; with all conv1 coords being canaries
+    # this destroys early filters). Mahloujifar et al. explicitly say "we make
+    # sure the indices selected in our experiments do not have any repetitions"
+    # -- they sample uniformly. We do the same here.
     params_list = list(model.parameters())
+    total_coords = sum(p.numel() for p in params_list)
+    if args.canary_count > total_coords:
+        raise ValueError(
+            f"canary_count={args.canary_count} > total model coords {total_coords}"
+        )
+    flat_offsets = np.cumsum([0] + [p.numel() for p in params_list])
+    chosen_flat = rng.choice(total_coords, size=args.canary_count, replace=False)
+    chosen_flat.sort()
     canary_dirac_indices = []
-    remaining = args.canary_count
-    for p_idx, p in enumerate(params_list):
-        take = min(remaining, p.numel())
-        canary_dirac_indices.extend((p_idx, i) for i in range(take))
-        remaining -= take
-        if remaining == 0:
-            break
+    for f in chosen_flat:
+        p_idx = int(np.searchsorted(flat_offsets[1:], f, side="right"))
+        within = int(f - flat_offsets[p_idx])
+        canary_dirac_indices.append((p_idx, within))
+
+    directions_path = os.path.join(exp_dir, 'canary_directions.csv')
+    np.savetxt(directions_path, np.array(canary_dirac_indices), delimiter=',', fmt='%d', header='param_idx,coord_idx')
+    logger.info(f"Canary indices saved to: {directions_path}")
+
+    # Generate or load inclusion mask: True = IN (signal injected), False = OUT (pure noise)
+    mask_path = os.path.join(exp_dir, 'inclusion_mask.csv')
+    if os.path.isfile(mask_path):
+        inclusion_mask = np.loadtxt(mask_path, delimiter=',').astype(bool)
+        logger.info(f"Loaded existing inclusion mask from: {mask_path}")
+    else:
+        inclusion_mask = rng.random(args.canary_count) < args.pkeep
+        np.savetxt(mask_path, inclusion_mask.astype(int), delimiter=',', fmt='%d')
+        logger.info(f"Inclusion mask saved to: {mask_path}")
+    n_in = int(inclusion_mask.sum())
+    n_out = args.canary_count - n_in
+    logger.info(f"Inclusion mask: {n_in} IN canaries, {n_out} OUT canaries (pkeep={args.pkeep})")
 
     logger.info("Starting training...")
     logger.info(f"  Epochs: {args.epochs}, LR: {args.lr}, Momentum: {args.momentum}")
     logger.info(f"  Logical batch size: {args.logical_batch_size}")
     logger.info(f"  Max physical batch size: {args.max_physical_batch_size}")
     logger.info(f"  Aug multiplicity: {args.aug_multiplicity}")
-    logger.info(f"  Noise multiplier: {args.noise_multiplier}")
+    logger.info(f"  Noise multiplier (computed): {noise_multiplier:.4f}")
     logger.info(f"  Canary count: {args.canary_count}, P(keep): {args.pkeep}")
     logger.info(f"  Checkpoint interval: {args.ckpt_interval} epochs")
 
     final_test_acc = None
     canary_prob = 1.0 / len(train_loader)
 
-    for epoch in range(start_epoch, args.epochs + 1):
+    for epoch in range(start_epoch, epochs_cap + 1):
+        steps_remaining = args.target_steps - total_steps
+        if steps_remaining <= 0:
+            logger.info(f"Reached target_steps={args.target_steps} at epoch {epoch-1}; stopping.")
+            break
         train_loss, num_steps, scores = train_whitebox(
             model,
             optimizer,
@@ -231,10 +317,15 @@ def main():
             args.max_physical_batch_size,
             args.logical_batch_size,
             canary_dirac_indices=canary_dirac_indices,
+            canary_inclusion_mask=inclusion_mask,
             canary_prob=canary_prob,
             return_scores=True,
+            ema_model=ema_model,
+            ema_decay=args.ema_decay,
+            ema_step_offset=total_steps,
+            max_logical_steps=steps_remaining,
         )
-        scores = np.asarray(scores)
+        scores = np.asarray(scores)  # (num_steps, num_canaries)
         assert scores.shape[0] == num_steps, (
             f"scores.shape[0] = {scores.shape[0]} != num_steps = {num_steps}"
         )
@@ -244,32 +335,58 @@ def main():
             sum_scores = sum_scores + scores.sum(axis=0)
 
         total_steps += num_steps
-        test_acc = test(model, test_loader, device)
+        # Sander/Mahloujifar evaluate on EMA weights when EMA is enabled, but
+        # also log the live-model accuracy so we can spot EMA-vs-live drift.
+        live_acc = test(model, test_loader, device)
+        if ema_model is not None:
+            ema_acc = test(ema_model, test_loader, device)
+            test_acc = ema_acc
+        else:
+            ema_acc = float('nan')
+            test_acc = live_acc
         epsilon = privacy_engine.get_epsilon(delta=args.delta)
         logger.info(
-            f"Epoch {epoch} - Train Loss: {train_loss:.4f}, Test Accuracy: {test_acc:.2f}%, "
+            f"Epoch {epoch} - Train Loss: {train_loss:.4f}, "
+            f"Live Acc: {live_acc:.2f}%, EMA Acc: {ema_acc:.2f}%, "
             f"Epsilon: {epsilon:.2f}, Delta: {args.delta}, Steps: {num_steps}, Total Steps: {total_steps}"
         )
         final_test_acc = test_acc
+        last_completed_epoch = epoch
+        last_completed_total_steps = total_steps
 
         if epoch % args.ckpt_interval == 0:
             save_checkpoint(
                 model, optimizer, epoch, test_acc, ckpt_dir, logger, global_step=total_steps
             )
-            in_scores = sum_scores / total_steps
-            out_canary_observations = sample_gaussian(
-                total_steps, args.canary_count, args.noise_multiplier, rng
-            )
-            out_scores = out_canary_observations.sum(axis=1) / total_steps
+            if ema_model is not None:
+                ema_path = os.path.join(ckpt_dir, f'ema_state_{epoch:06d}.pt')
+                torch.save(ema_model.state_dict(), ema_path)
+                logger.info(f"Saved EMA state to {ema_path}")
+
+            # Split scores by inclusion mask
+            # For paper methods (one-run, f-DP): raw sum
+            in_sum = sum_scores[inclusion_mask]
+            out_sum = sum_scores[~inclusion_mask]
+
+            # For NDIS: normalized by sqrt(T)
+            in_scores_ndis = sum_scores[inclusion_mask] / np.sqrt(total_steps)
+            out_scores_ndis = sum_scores[~inclusion_mask] / np.sqrt(total_steps)
+
             np.savetxt(
-                os.path.join(exp_dir, f'out_scores_{epoch:06d}.csv'),
-                out_scores,
-                delimiter=',',
+                os.path.join(exp_dir, f'in_scores_sum_{epoch:06d}.csv'),
+                in_sum, delimiter=',',
             )
             np.savetxt(
-                os.path.join(exp_dir, f'in_scores_{epoch:06d}.csv'),
-                in_scores,
-                delimiter=',',
+                os.path.join(exp_dir, f'out_scores_sum_{epoch:06d}.csv'),
+                out_sum, delimiter=',',
+            )
+            np.savetxt(
+                os.path.join(exp_dir, f'in_scores_ndis_{epoch:06d}.csv'),
+                in_scores_ndis, delimiter=',',
+            )
+            np.savetxt(
+                os.path.join(exp_dir, f'out_scores_ndis_{epoch:06d}.csv'),
+                out_scores_ndis, delimiter=',',
             )
             np.savetxt(
                 os.path.join(exp_dir, f'privacy_params_{epoch:06d}.csv'),
@@ -277,6 +394,16 @@ def main():
                 delimiter=',',
                 header='current_eps,delta',
                 comments='',
+            )
+            # Save full sum_scores (all canaries) for checkpoint resume
+            np.savetxt(
+                os.path.join(exp_dir, f'sum_scores_{epoch:06d}.csv'),
+                sum_scores, delimiter=',',
+            )
+            logger.info(
+                f"Saved scores at epoch {epoch}: "
+                f"in_sum({n_in}), out_sum({n_out}), "
+                f"in_ndis({n_in}), out_ndis({n_out})"
             )
 
         for handler in logging.getLogger().handlers:
@@ -286,6 +413,38 @@ def main():
                 handler.stream.flush()
 
     logger.info("Training complete!")
+
+    # Always flush canary scores at end of training. Without this, runs whose
+    # last completed epoch is not divisible by --ckpt-interval (e.g.
+    # target_steps=50, steps_per_epoch=12 -> stops at epoch 5, never aligns
+    # with --ckpt-interval=20) would finish without writing any *_scores_*.csv.
+    if (
+        sum_scores is not None
+        and last_completed_epoch is not None
+        and last_completed_epoch % args.ckpt_interval != 0
+    ):
+        epoch = last_completed_epoch
+        total_steps = last_completed_total_steps
+        epsilon = privacy_engine.get_epsilon(delta=args.delta)
+        in_sum = sum_scores[inclusion_mask]
+        out_sum = sum_scores[~inclusion_mask]
+        in_scores_ndis  = sum_scores[inclusion_mask]  / np.sqrt(total_steps)
+        out_scores_ndis = sum_scores[~inclusion_mask] / np.sqrt(total_steps)
+        np.savetxt(os.path.join(exp_dir, f'in_scores_sum_{epoch:06d}.csv'),  in_sum,  delimiter=',')
+        np.savetxt(os.path.join(exp_dir, f'out_scores_sum_{epoch:06d}.csv'), out_sum, delimiter=',')
+        np.savetxt(os.path.join(exp_dir, f'in_scores_ndis_{epoch:06d}.csv'),  in_scores_ndis,  delimiter=',')
+        np.savetxt(os.path.join(exp_dir, f'out_scores_ndis_{epoch:06d}.csv'), out_scores_ndis, delimiter=',')
+        np.savetxt(
+            os.path.join(exp_dir, f'privacy_params_{epoch:06d}.csv'),
+            [[epsilon, args.delta]],
+            delimiter=',', header='current_eps,delta', comments='',
+        )
+        np.savetxt(os.path.join(exp_dir, f'sum_scores_{epoch:06d}.csv'), sum_scores, delimiter=',')
+        logger.info(
+            f"Saved final scores at epoch {epoch} (total_steps={total_steps}): "
+            f"in_sum({n_in}), out_sum({n_out}), in_ndis({n_in}), out_ndis({n_out})"
+        )
+
     save_checkpoint(
         model, optimizer, args.epochs, final_test_acc, ckpt_dir, logger, global_step=total_steps
     )

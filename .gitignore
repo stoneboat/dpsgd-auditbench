@@ -10,5 +10,5 @@ _pycache_/
 *.pywz
 *.pyzw
 *.pyzwz
-
+.idea
 .codex
