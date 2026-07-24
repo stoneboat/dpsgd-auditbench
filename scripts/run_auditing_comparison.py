@@ -873,7 +873,7 @@ def run_gaussianity(exp_dir, fig_dir):
         ax.plot(zz, pdf, color='#cc4422', linewidth=2.4, linestyle='--', label=label_pred)
         ax.axvline(mean_pred, color='#cc4422', linewidth=1.2, linestyle=':', alpha=0.7)
         ax.set_xlim(x_lo, x_hi)
-        ax.set_xlabel('Score (NDIS scale)')
+        ax.set_xlabel('Normalized Scores')
         ax.set_ylabel('Density')
         ax.legend(loc='upper right', fontsize=14)
 
