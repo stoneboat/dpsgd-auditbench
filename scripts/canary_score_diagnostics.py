@@ -153,6 +153,56 @@ def within_run_orthogonality_check(canary_directions):
     }
 
 
+def dirac_canary_interference(canary_coordinates):
+    """Exact Gram/interference metrics for standard-basis (Dirac) canaries.
+
+    Parameters
+    ----------
+    canary_coordinates : (m,) or (m, k) integer array
+        A coordinate identifier per canary; in this repository the two
+        columns are (param_idx, coord_idx). Repeated rows are coordinate
+        collisions, i.e. identical Dirac directions.
+
+    Returns
+    -------
+    dict with collision counts, maximum mutual coherence
+    max_{i != j} |<u_i, u_j>|, and mean/RMS of the off-diagonal Gram
+    entries, computed without materializing the m-by-m Gram matrix.
+    """
+    coords = np.asarray(canary_coordinates)
+    if coords.ndim == 1:
+        coords = coords[:, None]
+    if coords.ndim != 2:
+        raise ValueError("canary_coordinates must be a 1-D or 2-D array.")
+
+    m = int(coords.shape[0])
+    if m == 0:
+        raise ValueError("Need at least one canary coordinate.")
+
+    _, counts = np.unique(coords, axis=0, return_counts=True)
+    unique_count = int(len(counts))
+    collision_count = int(m - unique_count)
+    colliding_pair_count = int(np.sum(counts * (counts - 1) // 2))
+
+    # For Dirac canaries every off-diagonal Gram entry is 1 (same coordinate)
+    # or 0, so the off-diagonal mass is the fraction of colliding pairs.
+    ordered_offdiag = m * (m - 1)
+    offdiag_mass = (
+        2.0 * colliding_pair_count / ordered_offdiag
+        if ordered_offdiag > 0 else 0.0
+    )
+
+    return {
+        "m": m,
+        "unique_coordinate_count": unique_count,
+        "collision_count": collision_count,
+        "colliding_pair_count": colliding_pair_count,
+        "mutual_coherence": 1.0 if colliding_pair_count else 0.0,
+        "mean_abs_offdiag": offdiag_mass,
+        "rms_offdiag": float(np.sqrt(offdiag_mass)),
+    }
+
+
 # ---------------------------------------------------------------------------
 # (B) Marginal Gaussianity
 # ---------------------------------------------------------------------------

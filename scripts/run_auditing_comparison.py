@@ -25,7 +25,10 @@ import math
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
-from canary_score_diagnostics import within_run_orthogonality_check
+from canary_score_diagnostics import (
+    dirac_canary_interference,
+    within_run_orthogonality_check,
+)
 
 _RC = {
     'font.family': 'DejaVu Sans',
@@ -309,14 +312,14 @@ def run_multi(exp_dirs, delta, significance, fig_dir, with_andrew=False):
         dirs_path = os.path.join(exp_dir, 'canary_directions.csv')
         if os.path.isfile(dirs_path):
             indices = np.loadtxt(dirs_path, delimiter=',', skiprows=1)
-            m = len(indices)
-            num_unique = len(np.unique(indices, axis=0))
-            collisions = m - num_unique
+            geometry = dirac_canary_interference(indices)
             ortho_results.append({
                 'target': target_eps,
-                'm': m,
-                'collisions': collisions,
-                'orthogonal': collisions == 0
+                'm': geometry['m'],
+                'collisions': geometry['collision_count'],
+                'orthogonal': geometry['collision_count'] == 0,
+                'mutual_coherence': geometry['mutual_coherence'],
+                'rms_offdiag': geometry['rms_offdiag'],
             })
         else:
             ortho_results.append(None)
@@ -347,12 +350,20 @@ def run_multi(exp_dirs, delta, significance, fig_dir, with_andrew=False):
         print("\n" + "="*60)
         print("CANARY INDEPENDENCE DIAGNOSTIC (DIRAC ORTHOGONALITY)")
         print("-" * 60)
-        print(f"{'Target Eps':>10} | {'Canaries (m)':>12} | {'Collisions':>10} | {'Status'}")
+        print(
+            f"{'Target Eps':>10} | {'Canaries (m)':>12} | {'Collisions':>10} | "
+            f"{'Coherence':>10} | {'RMS offdiag':>11} | Status"
+        )
         print("-" * 60)
         for res in ortho_results:
             if res:
                 status = "PASS (IID)" if res['orthogonal'] else "FAIL (CORRELATED)"
-                print(f"{res['target']:10.2f} | {res['m']:12d} | {res['collisions']:10d} | {status}")
+                print(
+                    f"{res['target']:10.2f} | {res['m']:12d} | "
+                    f"{res['collisions']:10d} | "
+                    f"{res['mutual_coherence']:10.3e} | "
+                    f"{res['rms_offdiag']:11.3e} | {status}"
+                )
         print("="*60)
         print("Note: Dirac canaries are perfectly orthogonal if collisions = 0.")
 
@@ -707,6 +718,13 @@ def run_independence(exp_dir, fig_dir, *, m_show=200, with_andrew=False):
     else:
         gram = (sub[:, 0:1] == sub[:, 0:1].T).astype(float)
 
+    geometry = dirac_canary_interference(coords)
+    print(
+        f"Dirac geometry (m={m_total}): "
+        f"collisions={geometry['collision_count']}, "
+        f"mutual_coherence={geometry['mutual_coherence']:.3e}, "
+        f"RMS_offdiag={geometry['rms_offdiag']:.3e}"
+    )
     diag_mask = np.eye(m_show, dtype=bool)
     off = gram[~diag_mask]
     print(
