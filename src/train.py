@@ -47,9 +47,8 @@ def _log_grad_sample_norms(optimizer):
 
 
 _PER_IMAGE_AUG = transforms_v2.Compose([
-    transforms_v2.RandomCrop(32, padding=20, padding_mode='reflect'),
-    transforms_v2.RandomHorizontalFlip(p=0.5),
-    transforms_v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+    transforms_v2.RandomCrop(32, padding=4, padding_mode='reflect'),
+    transforms_v2.RandomHorizontalFlip(p=0.5)
 ])
 
 
