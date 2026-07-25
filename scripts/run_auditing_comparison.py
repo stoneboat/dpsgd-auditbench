@@ -96,6 +96,44 @@ from whitebox_auditing.ndis_1d import (
 )
 
 
+def print_run_config(exp_dir):
+    """One-line identification of the run being audited.
+
+    Experiment directories are named by database seed, so the path alone does
+    not say which hyperparameter cell a run belongs to. Print the fields that
+    define the cell (batch size, clipping norm, noise multiplier, steps) so a
+    sequence of --exp-dir invocations is self-labelling.
+    """
+    hparams_path = os.path.join(exp_dir, 'hparams.json')
+    if not os.path.isfile(hparams_path):
+        print(f"Run config: no hparams.json in {exp_dir}")
+        return
+    with open(hparams_path) as f:
+        hp = json.load(f)
+
+    fields = [
+        ('eps', 'epsilon', '{:g}'),
+        ('B', 'logical_batch_size', '{:d}'),
+        ('C', 'max_grad_norm', '{:g}'),
+        ('sigma', 'noise_multiplier', '{:.4f}'),
+        ('T', 'target_steps', '{:d}'),
+        ('K', 'aug_multiplicity', '{:d}'),
+        ('m', 'canary_count', '{:d}'),
+    ]
+    parts = []
+    for label, key, fmt in fields:
+        if hp.get(key) is not None:
+            parts.append(f"{label}={fmt.format(hp[key])}")
+    # Only present when the run was produced with --fault (see src/faults.py).
+    if hp.get('fault') not in (None, 'none'):
+        parts.append(f"fault={hp['fault']}")
+        if hp.get('eps_true') is not None:
+            parts.append(f"eps_true={hp['eps_true']:.2f}")
+
+    print(f"Run config: {', '.join(parts)}")
+    print(f"  dir: {exp_dir}")
+
+
 def _resolve_score_path(exp_dir, kind, side, epoch):
     candidates = [
         os.path.join(exp_dir, f'{side}_scores_{kind}_{epoch:06d}.csv'),
@@ -211,6 +249,7 @@ def get_target_T(exp_dir):
 
 def run_single(exp_dir, delta, significance, fig_dir, with_andrew=False):
     """Original per-epoch line plot for a single experiment."""
+    print_run_config(exp_dir)
     epochs = sorted(set(
         int(f.split('_')[-1].replace('.csv', ''))
         for f in os.listdir(exp_dir)
@@ -297,6 +336,7 @@ def run_multi(exp_dirs, delta, significance, fig_dir, with_andrew=False):
             print(f"Warning: no score files in {exp_dir}, skipping")
             continue
 
+        print_run_config(exp_dir)
         result = audit_epoch(
             exp_dir, final_epoch, delta, significance, target_eps=target_eps,
             with_andrew=with_andrew,
