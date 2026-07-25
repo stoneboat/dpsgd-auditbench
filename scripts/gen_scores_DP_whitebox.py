@@ -27,6 +27,7 @@ from utils import setup_logging, save_checkpoint, find_latest_checkpoint, load_c
 from dataset import get_data_loaders
 from network_arch import WideResNet
 from train import test, train_whitebox
+from faults import FAULTS, DEFAULT_STRENGTH, apply_fault
 
 # ==========================================
 # Default Hyperparameters (white-box, from notebook)
@@ -72,6 +73,11 @@ def main():
     parser.add_argument('--pkeep', type=float, default=DEFAULT_PKEEP)
     parser.add_argument('--database-seed', type=str, default=None,
                         help='128-bit integer as string; if None, generate random')
+    # Fault injection (Gaussian-preserving implementation bugs)
+    parser.add_argument('--fault', type=str, default='none', choices=FAULTS,
+                        help='Plant a realistic DP-SGD implementation bug. See src/faults.py.')
+    parser.add_argument('--fault-strength', type=float, default=None,
+                        help='Fault magnitude; defaults per fault (see faults.DEFAULT_STRENGTH).')
     # Paths
     parser.add_argument('--data-dir', type=str, default='./data')
     parser.add_argument('--log-dir', type=str, default='./logs')
@@ -95,9 +101,10 @@ def main():
             sys.exit(1)
         logger.info(f"Using provided database seed: {DATABSEED}")
 
+    fault_tag = "" if args.fault == 'none' else f"-fault_{args.fault}"
     exp_dir = os.path.join(
         args.data_dir,
-        f"mislabeled-canaries-{DATABSEED}-{args.canary_count}-{args.pkeep}-cifar10",
+        f"mislabeled-canaries-{DATABSEED}-{args.canary_count}-{args.pkeep}-cifar10{fault_tag}",
     )
     os.makedirs(exp_dir, exist_ok=True)
     logger.info(f"Experiment directory: {exp_dir}")
@@ -301,6 +308,27 @@ def main():
 
     final_test_acc = None
     canary_prob = 1.0 / len(train_loader)
+
+    # ---- Plant the implementation fault (no-op when --fault none).
+    # Applied after Opacus has calibrated z, so `eps_claimed` is exactly what a
+    # deployment running this code would advertise.
+    fault_info = apply_fault(
+        args.fault,
+        args.fault_strength,
+        optimizer=optimizer,
+        sample_rate=canary_prob,
+        steps=args.target_steps,
+        target_epsilon=args.epsilon,
+        target_delta=args.delta,
+        canary_prob=canary_prob,
+        logger=logger,
+    )
+    canary_prob = fault_info['canary_prob_used']
+    noise_multiplier = optimizer.noise_multiplier
+    params.update(fault_info)
+    params['noise_multiplier'] = noise_multiplier
+    with open(hparams_path, 'w') as f:
+        json.dump(params, f, indent=2)
 
     for epoch in range(start_epoch, epochs_cap + 1):
         steps_remaining = args.target_steps - total_steps
