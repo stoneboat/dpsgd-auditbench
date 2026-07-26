@@ -207,6 +207,54 @@ def dirac_canary_interference(canary_coordinates):
 # (B) Marginal Gaussianity
 # ---------------------------------------------------------------------------
 
+def _ks_stat_standardized(y):
+    """KS distance between the ECDF of standardized `y` and Phi.
+
+    Vectorized over leading axes: y has shape (..., n) and the return has
+    shape y.shape[:-1].
+    """
+    y = np.sort(y, axis=-1)
+    n = y.shape[-1]
+    F = stats.norm.cdf(y)
+    i = np.arange(1, n + 1, dtype=float)
+    d_plus = (i / n) - F
+    d_minus = F - ((i - 1.0) / n)
+    return np.maximum(d_plus.max(axis=-1), d_minus.max(axis=-1))
+
+
+def lilliefors_ks(scores, n_boot=2000, rng=None):
+    """KS statistic vs a *fitted* normal, with a valid p-value.
+
+    `scipy.stats.kstest(z, "norm")` on z = (x - xbar)/s does NOT give a valid
+    p-value: the standard KS null distribution assumes fully specified
+    parameters, whereas fitting mu and sigma to the same sample shrinks the
+    statistic. Using the scipy p-value there is anti-conservative -- it fails
+    to reject distributions that are genuinely non-normal.
+
+    The statistic is still exactly the quantity Theorem 1 bounds, so we keep
+    it and obtain the null distribution by parametric bootstrap (this is the
+    Lilliefors test): draw N(0,1) samples of the same size, standardize each
+    by its OWN sample moments, and recompute.
+    """
+    scores = np.asarray(scores, dtype=float).ravel()
+    n = len(scores)
+    z = (scores - scores.mean()) / scores.std(ddof=1)
+    d_obs = float(_ks_stat_standardized(z))
+
+    if rng is None:
+        rng = np.random.default_rng(0)
+    # Chunk the bootstrap so an (n_boot, n) float64 block stays modest.
+    chunk = max(1, int(4e6 // max(n, 1)))
+    exceed, total = 0, 0
+    while total < n_boot:
+        b = min(chunk, n_boot - total)
+        y = rng.standard_normal((b, n))
+        y = (y - y.mean(axis=-1, keepdims=True)) / y.std(axis=-1, ddof=1, keepdims=True)
+        exceed += int((_ks_stat_standardized(y) >= d_obs).sum())
+        total += b
+    return d_obs, float(exceed / total)
+
+
 def gaussianity_tests(scores, label=""):
     """
     Test whether a 1-D sample of canary scores is consistent with Gaussian.
@@ -250,7 +298,18 @@ def gaussianity_tests(scores, label=""):
     out["shapiro_W"] = float(sw_stat)
     out["shapiro_p"] = float(sw_p)
 
-    # Anderson-Darling for normality (Lilliefors-style: parameters estimated)
+    # KS: the quantity Theorem 1 / Corollary 1 bound. Bulk-sensitive; the
+    # p-value needs the Lilliefors bootstrap because mu, sigma are fitted.
+    ks_D, ks_p = lilliefors_ks(scores)
+    out["ks_D"] = ks_D
+    out["ks_p"] = ks_p
+    out["ks_reject_5pct"] = bool(ks_p < 0.05)
+
+    # Anderson-Darling for normality (Lilliefors-style: parameters estimated).
+    # scipy returns the raw A^2 alongside critical values already adjusted for
+    # n and for the fact that the parameters were estimated, so comparing the
+    # statistic to critical_values[2] is the correct 5% test. Tail-weighted,
+    # hence the more privacy-relevant of the two.
     ad_result = stats.anderson(scores, dist="norm")
     out["anderson_stat"] = float(ad_result.statistic)
     # critical values are at significance levels [15, 10, 5, 2.5, 1] %
