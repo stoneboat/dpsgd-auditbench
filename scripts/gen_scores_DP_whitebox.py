@@ -79,6 +79,9 @@ def main():
     parser.add_argument('--fault-strength', type=float, default=None,
                         help='Fault magnitude; defaults per fault (see faults.DEFAULT_STRENGTH).')
     # Paths
+    parser.add_argument('--exp-tag', type=str, default='',
+                        help='suffix appended to exp_dir; use it to keep ablation arms that '
+                             'share a database seed from overwriting each other')
     parser.add_argument('--data-dir', type=str, default='./data')
     parser.add_argument('--log-dir', type=str, default='./logs')
     parser.add_argument('--log-file', type=str, default=None)
@@ -101,10 +104,13 @@ def main():
             sys.exit(1)
         logger.info(f"Using provided database seed: {DATABSEED}")
 
-    fault_tag = "" if args.fault == 'none' else f"-fault_{args.fault}"
+    # Suffix that separates ablation arms sharing a database seed. The fault name
+    # is one such arm tag; --exp-tag carries any other (e.g. lr8.0).
+    tags = [t for t in (None if args.fault == 'none' else f"fault_{args.fault}", args.exp_tag) if t]
     exp_dir = os.path.join(
         args.data_dir,
-        f"mislabeled-canaries-{DATABSEED}-{args.canary_count}-{args.pkeep}-cifar10{fault_tag}",
+        f"mislabeled-canaries-{DATABSEED}-{args.canary_count}-{args.pkeep}-cifar10"
+        + "".join(f"-{t}" for t in tags),
     )
     os.makedirs(exp_dir, exist_ok=True)
     logger.info(f"Experiment directory: {exp_dir}")
@@ -142,6 +148,7 @@ def main():
         'canary_count': args.canary_count,
         'pkeep': args.pkeep,
         'database_seed': DATABSEED,
+        'exp_tag': args.exp_tag,
     }
     hparams_path = os.path.join(exp_dir, 'hparams.json')
     with open(hparams_path, 'w') as f:
