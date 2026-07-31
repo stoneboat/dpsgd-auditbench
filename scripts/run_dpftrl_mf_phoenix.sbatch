@@ -9,22 +9,10 @@
 #SBATCH --error=logs/dpftrl_mf_%A_%a.err
 #SBATCH --array=0-3
 
-# MF-DP-FTRL audit on ScatterLinear. Answers reviewer v2K8: per-round observations
-# are dependent (rows of B mix the same nu), so Model 1's independence fails, yet
-# the aggregate score is a linear functional of a Gaussian and the pair is exact.
-#
-# Strategy C is the closed-form matrix square root of the prefix-sum matrix; no
-# optimization to solve, no extra dependency. At T=128 sensitivity is 1.62 vs the
-# tree's 2.83, so MF runs at 1.75x less noise for the same eps.
-#
-# All canaries sit at leaf 0 so ||C[:, t]|| is common and the pooled population is
-# exactly Gaussian; --random-leaves reproduces the tree-style assignment and turns
-# the in-population into a mixture (a class-E heterogeneity ablation).
-#
-# Compare against the tree arm at the same seed via run_dpftrl_scatter_phoenix.sbatch.
+# MF-DP-FTRL audit on ScatterLinear.
 
 module load anaconda3
-conda activate /storage/scratch1/6/aagrawal609/conda_envs/dpsgd_bench
+conda activate /storage/scratch1/6/aagrawal609/conda_envs/audit
 
 EPSILONS=(1 2 4 8)
 EPS=${EPSILONS[$SLURM_ARRAY_TASK_ID]}
