@@ -110,6 +110,7 @@ def _whitebox_dp_step(
     include_flags,
     canary_dirac,
     clip_norms=None,
+    normalize_update=False,
 ):
     if not hasattr(optimizer, "clip_and_accumulate"):
         return optimizer.step()
@@ -192,6 +193,13 @@ def _whitebox_dp_step(
             include_flags.append(include_mask.detach().cpu().tolist())
 
     optimizer.scale_grad()
+
+    # Normalized-scale adaptive clipping (Bu et al. 2023, "Automatic Clipping"):
+    if normalize_update:
+        for p in optimizer.params:
+            if p.grad is not None:
+                p.grad /= step_clip_norm
+
     if optimizer.step_hook:
         optimizer.step_hook(optimizer)
 
@@ -266,7 +274,7 @@ def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_p
             outputs = model(aug_images)
             loss_per_sample = criterion(outputs, aug_labels)
 
-            loss = loss_per_sample.mean() * aug_multiplicity
+            loss = loss_per_sample.mean()
             loss.backward()
             
             # --- GRADIENT REDUCTION (B*K -> B) ---
@@ -341,6 +349,8 @@ def train_whitebox(
         Must be None when adaptive_clipping=True.
     adaptive_clipping: inject at the live C_t and drive update_max_grad_norm().
         Scores come back unnormalized; divide by clip_norms for the C=1 observation.
+        Model updates are divided by C_t (Bu et al. 2023 normalized-scale convention),
+        so lr stays in the C=1 units the fixed arm was tuned in.
     return_clip_norms: also return the per-step C_t trajectory.
     """
     model.train()
@@ -453,7 +463,7 @@ def train_whitebox(
             outputs = model(aug_images)
             loss_per_sample = criterion(outputs, aug_labels)
 
-            loss = loss_per_sample.mean() * aug_multiplicity
+            loss = loss_per_sample.mean()
             loss.backward()
             
             # --- GRADIENT REDUCTION (B*K -> B) ---
@@ -483,6 +493,7 @@ def train_whitebox(
                 include_flags=include_flags,
                 canary_dirac=canary_dirac,
                 clip_norms=clip_norms,
+                normalize_update=adaptive_clipping,
             )
             
             # Track samples processed for logical batch counting
