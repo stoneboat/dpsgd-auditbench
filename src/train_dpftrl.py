@@ -85,14 +85,13 @@ def _clip_and_sum_grad_samples(params: List[torch.nn.Parameter], max_grad_norm: 
 
 
 # ---------------------------------------------------------------------------
-# DP-FTRL state -- streaming Honaker tree + audit recording.
+# Shared canary bookkeeping for both noise mechanisms.
 # ---------------------------------------------------------------------------
-class DPFTRLState:
+class _CanaryTracker:
     def __init__(
         self,
         params: List[torch.nn.Parameter],
         device: torch.device,
-        sigma_node: float,
         target_steps: int,
         canary_dirac_indices: List[Tuple[int, int]],
         canary_leaf_assignment: np.ndarray,
@@ -101,16 +100,9 @@ class DPFTRLState:
     ) -> None:
         self.params = params
         self.device = device
-        self.sigma_node = float(sigma_node)
         self.T = int(target_steps)
-
-        # Honaker streaming state -- full-tensor running sums.
         self.clean_G = [torch.zeros_like(p) for p in params]
-        self.canonical_noise = [torch.zeros_like(p) for p in params]
-        # Stored noise per active canonical node, so we can subtract on roll-up.
-        self.noise_per_active: Dict[Tuple[int, int], List[torch.Tensor]] = {}
 
-        # Canary metadata.
         self.dirac = canary_dirac_indices
         self.m = len(canary_dirac_indices)
         self.leaf_of = np.asarray(canary_leaf_assignment, dtype=np.int64)
@@ -131,10 +123,8 @@ class DPFTRLState:
             self._coords_by_param[p_idx] = (flats, ids)
 
         self.leaf_proj  = np.zeros((self.T, self.m), dtype=np.float32)
-        self.node_noise_proj: Dict[Tuple[int, int], np.ndarray] = {}
         self.g_norms = np.zeros(self.T, dtype=np.float64)
 
-    # ----------------------------------------------------------------------
     def _project_to_canaries(self, tensors: List[torch.Tensor]) -> np.ndarray:
         """Per-canary projection: tensor[(p_i, flat_i)] for each canary i."""
         out = torch.zeros(self.m, device=self.device)
@@ -149,6 +139,35 @@ class DPFTRLState:
             if self.in_mask[i]:
                 p_idx, flat_idx = self.dirac[i]
                 leaf_grad[p_idx].view(-1)[flat_idx] += self.canary_scale
+
+    def _record_norm(self, noisy_G: List[torch.Tensor], t: int) -> None:
+        with torch.no_grad():
+            sq = sum(g.pow(2).sum() for g in noisy_G)
+            self.g_norms[t] = float(sq.sqrt().item())
+
+
+# ---------------------------------------------------------------------------
+# DP-FTRL state -- streaming Honaker tree + audit recording.
+# ---------------------------------------------------------------------------
+class DPFTRLState(_CanaryTracker):
+    def __init__(
+        self,
+        params: List[torch.nn.Parameter],
+        device: torch.device,
+        sigma_node: float,
+        target_steps: int,
+        canary_dirac_indices: List[Tuple[int, int]],
+        canary_leaf_assignment: np.ndarray,
+        canary_inclusion_mask: np.ndarray,
+        canary_scale: float,
+    ) -> None:
+        super().__init__(params, device, target_steps, canary_dirac_indices,
+                         canary_leaf_assignment, canary_inclusion_mask, canary_scale)
+        self.sigma_node = float(sigma_node)
+        self.canonical_noise = [torch.zeros_like(p) for p in params]
+        # Stored noise per active canonical node, so we can subtract on roll-up.
+        self.noise_per_active: Dict[Tuple[int, int], List[torch.Tensor]] = {}
+        self.node_noise_proj: Dict[Tuple[int, int], np.ndarray] = {}
 
     def step(self, leaf_grad: List[torch.Tensor], t: int) -> List[torch.Tensor]:
         self._inject_canaries(leaf_grad, t)
@@ -170,9 +189,7 @@ class DPFTRLState:
             self.node_noise_proj[node] = self._project_to_canaries(noise)
 
         noisy_G = [c + n for c, n in zip(self.clean_G, self.canonical_noise)]
-        with torch.no_grad():
-            sq = sum(g.pow(2).sum() for g in noisy_G)
-            self.g_norms[t] = float(sq.sqrt().item())
+        self._record_norm(noisy_G, t)
         return noisy_G
 
     # ----------------------------------------------------------------------
@@ -243,6 +260,86 @@ class DPFTRLState:
         return scores
 
 
+# ---------------------------------------------------------------------------
+# MF-DP-FTRL state -- correlated noise B @ nu with nu i.i.d. Gaussian.
+# ---------------------------------------------------------------------------
+class MFDPFTRLState(_CanaryTracker):
+    """Matrix-factorization DP-FTRL. Releases clean_G_t + (B @ nu)_t.
+
+    Per-round observations are dependent (rows of B mix the same nu), but the
+    audit score is a linear functional of a Gaussian vector, so the Gaussian pair
+    is exact with no CLT -- unlike the i.i.d. per-round Model 1.
+    """
+
+    def __init__(
+        self,
+        params: List[torch.nn.Parameter],
+        device: torch.device,
+        sigma: float,
+        strategy: np.ndarray,
+        decoder: np.ndarray,
+        target_steps: int,
+        canary_dirac_indices: List[Tuple[int, int]],
+        canary_leaf_assignment: np.ndarray,
+        canary_inclusion_mask: np.ndarray,
+        canary_scale: float,
+    ) -> None:
+        super().__init__(params, device, target_steps, canary_dirac_indices,
+                         canary_leaf_assignment, canary_inclusion_mask, canary_scale)
+        if strategy.shape != (self.T, self.T) or decoder.shape != (self.T, self.T):
+            raise ValueError(f"strategy/decoder must both be ({self.T}, {self.T}).")
+        self.sigma = float(sigma)
+        self.C = np.asarray(strategy, dtype=np.float64)
+        self.B = np.asarray(decoder, dtype=np.float64)
+        self.B_t = torch.tensor(self.B, device=device, dtype=torch.float32)
+        # Full nu history: (B @ nu)_t needs every past draw. T*d floats.
+        self.nu_buf = [torch.zeros((self.T, *p.shape), device=device) for p in params]
+        self.nu_proj = np.zeros((self.T, self.m), dtype=np.float32)
+
+    def step(self, leaf_grad: List[torch.Tensor], t: int) -> List[torch.Tensor]:
+        self._inject_canaries(leaf_grad, t)
+        self.leaf_proj[t, :] = self._project_to_canaries(leaf_grad)
+        for c, g in zip(self.clean_G, leaf_grad):
+            c.add_(g)
+
+        nu = [torch.randn_like(p) * self.sigma for p in self.params]
+        for buf, n in zip(self.nu_buf, nu):
+            buf[t].copy_(n)
+        self.nu_proj[t, :] = self._project_to_canaries(nu)
+
+        row = self.B_t[t, : t + 1]
+        noisy_G = []
+        for c, buf in zip(self.clean_G, self.nu_buf):
+            noisy_G.append(c + torch.tensordot(row, buf[: t + 1], dims=1))
+        self._record_norm(noisy_G, t)
+        return noisy_G
+
+    def compute_optimal_scores(self, leaves_done: int) -> np.ndarray:
+        """GLRT-optimal score: <C[:, t_i], C @ x_i + nu_i> / ||C[:, t_i]||.
+
+        Both worlds have sd sigma; the in-world mean is canary_scale*||C[:, t_i]||.
+        B drops out because B^-1 of the released stream is exactly C @ x + nu.
+        """
+        if leaves_done <= 0 or self.m == 0:
+            return np.zeros(self.m, dtype=np.float64)
+        C = self.C[:leaves_done, :leaves_done]
+        encoded = C @ self.leaf_proj[:leaves_done].astype(np.float64) + self.nu_proj[:leaves_done]
+        cols = self.C[:leaves_done, np.clip(self.leaf_of, 0, leaves_done - 1)]  # (T', m)
+        return (cols * encoded).sum(axis=0) / np.linalg.norm(cols, axis=0)
+
+    def compute_andrew_scores(self, leaves_done: int) -> np.ndarray:
+        """Andrew et al. 2024 (Alg 3): max over rounds of released_t[c_i] / ||noisy_G_t||."""
+        if leaves_done <= 0 or self.m == 0:
+            return np.zeros(self.m, dtype=np.float64)
+        cum = np.cumsum(self.leaf_proj[:leaves_done].astype(np.float64), axis=0)
+        released = cum + self.B[:leaves_done, :leaves_done] @ self.nu_proj[:leaves_done]
+        denom = self.g_norms[:leaves_done][:, None]
+        ok = denom > 0
+        scores = np.where(ok, released / np.where(ok, denom, 1.0), -np.inf).max(axis=0)
+        scores[~np.isfinite(scores)] = 0.0
+        return scores
+
+
 # Main training loop
 def train_dpftrl_whitebox(
     model: nn.Module,
@@ -256,20 +353,18 @@ def train_dpftrl_whitebox(
     target_steps: int,
     lr: float,
     max_grad_norm: float,
-    sigma_node: float,
-    canary_dirac_indices: List[Tuple[int, int]],
-    canary_leaf_assignment: np.ndarray,
-    canary_inclusion_mask: np.ndarray,
-    canary_scale: float,
+    state_builder,
     ema_model: Optional[nn.Module] = None,
     ema_decay: float = 0.9999,
     ema_step_offset: int = 0,
     test_every: int = 20,
     test_fn=None,
     logger=None,
-) -> Tuple[List[float], DPFTRLState, int]:
-    """Run DP-FTRL until either the data loader is exhausted or `target_steps`
-    leaves have been processed. Returns (per-step losses, state, leaves_done).
+) -> Tuple[List[float], _CanaryTracker, int]:
+    """Run DP-FTRL until the loader is exhausted or `target_steps` leaves are done.
+
+    state_builder(params, device) returns the noise mechanism (DPFTRLState or
+    MFDPFTRLState); the loop itself only calls state.step().
     """
     from opacus.grad_sample import GradSampleModule
 
@@ -279,16 +374,7 @@ def train_dpftrl_whitebox(
     # Snapshot initial weights for FTRL update form theta_t = theta_0 - lr * G_t.
     theta_init = [p.detach().clone() for p in params]
 
-    state = DPFTRLState(
-        params=params,
-        device=device,
-        sigma_node=sigma_node,
-        target_steps=target_steps,
-        canary_dirac_indices=canary_dirac_indices,
-        canary_leaf_assignment=canary_leaf_assignment,
-        canary_inclusion_mask=canary_inclusion_mask,
-        canary_scale=canary_scale,
-    )
+    state = state_builder(params, device)
 
     criterion = nn.CrossEntropyLoss(reduction="none")
     normalize = transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))

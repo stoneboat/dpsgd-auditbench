@@ -13,11 +13,15 @@ project_dir = os.path.abspath(os.path.join(script_dir, ".."))
 src_dir = os.path.join(project_dir, "src")
 sys.path.append(src_dir)
 
+
+from functools import partial
+
 from utils import setup_logging
 from dataset import get_data_loaders
 from scatter_network import ScatterLinear
-from train_dpftrl import train_dpftrl_whitebox, test
+from train_dpftrl import train_dpftrl_whitebox, test, DPFTRLState, MFDPFTRLState
 from whitebox_auditing.tree_mechanism import (tree_sigma_for_eps, tree_eps_for_sigma, num_levels)
+from whitebox_auditing import matrix_factorization as mf
 
 
 # ==========================================
@@ -57,6 +61,14 @@ def main():
     parser.add_argument("--pkeep", type=float, default=DEFAULT_PKEEP)
     parser.add_argument("--scattering-J", type=int, default=DEFAULT_J,
                         help="Number of scales for the kymatio scattering transform.")
+    parser.add_argument("--mechanism", choices=["tree", "mf"], default="tree",
+                        help="tree = Honaker binary tree; mf = matrix factorization (banded sqrt).")
+    parser.add_argument("--mf-bands", type=int, default=0,
+                        help="Band the sqrt strategy at this lag; 0 = full square root.")
+    parser.add_argument("--random-leaves", action="store_true",
+                        help="Randomize canary leaves. Under mf the column norm of C varies with "
+                             "the leaf, so this makes the pooled in-population a mixture; the "
+                             "default puts every canary at leaf 0 to keep it exactly Gaussian.")
     parser.add_argument("--database-seed", type=str, default=None)
     parser.add_argument("--data-dir", type=str, default="./data")
     parser.add_argument("--log-dir", type=str, default="./logs")
@@ -75,9 +87,10 @@ def main():
         DATABSEED = int(args.database_seed)
         logger.info(f"Using provided database seed: {DATABSEED}")
 
+    tag = "" if args.mechanism == "tree" else f"-{args.mechanism}"
     exp_dir = os.path.join(
         args.data_dir,
-        f"dpftrl-scatter-canaries-{DATABSEED}-{args.canary_count}-{args.pkeep}-cifar10",
+        f"dpftrl-scatter-canaries-{DATABSEED}-{args.canary_count}-{args.pkeep}-cifar10{tag}",
     )
     os.makedirs(exp_dir, exist_ok=True)
     logger.info(f"Experiment directory: {exp_dir}")
@@ -93,15 +106,26 @@ def main():
     rng = np.random.default_rng(torch_seed)
     logger.info(f"Set random seeds (torch, numpy) to: {torch_seed}")
 
-    sigma_node = tree_sigma_for_eps(args.epsilon, args.target_steps, args.delta)
-    eps_check = tree_eps_for_sigma(sigma_node, args.target_steps, args.delta)
-    logger.info(
-        f"Tree mechanism: T={args.target_steps}, levels={num_levels(args.target_steps)}, "
-        f"sigma_node={sigma_node:.4f}, target eps={args.epsilon}, eps roundtrip={eps_check:.4f}"
-    )
+    strategy = decoder_mat = None
+    if args.mechanism == "mf":
+        strategy = mf.sqrt_strategy(args.target_steps, bands=args.mf_bands)
+        decoder_mat = mf.decoder(strategy)
+        sens = mf.sensitivity(strategy, clip_norm=args.max_grad_norm)
+        sigma = mf.sigma_for_eps(args.epsilon, sens, args.delta)
+        eps_check = mf.eps_for_sigma(sigma, sens, args.delta)
+        tree_sigma = tree_sigma_for_eps(args.epsilon, args.target_steps, args.delta)
+        logger.info(f"MF mechanism: T={args.target_steps}, bands={args.mf_bands or 'full'}, sens={sens:.4f}, sigma={sigma:.4f}, eps roundtrip={eps_check:.4f}")
+        logger.info(f"  tree sensitivity={math.sqrt(num_levels(args.target_steps) + 1):.4f} sigma={tree_sigma:.4f} -> MF needs {tree_sigma / sigma:.2f}x less noise")
+        sigma_node = sigma
+    else:
+        sigma_node = tree_sigma_for_eps(args.epsilon, args.target_steps, args.delta)
+        eps_check = tree_eps_for_sigma(sigma_node, args.target_steps, args.delta)
+        logger.info(f"Tree mechanism: T={args.target_steps}, levels={num_levels(args.target_steps)}, sigma_node={sigma_node:.4f}, target eps={args.epsilon}, eps roundtrip={eps_check:.4f}")
 
     params_summary = {
-        "mechanism": "DP-FTRL (tree-aggregated Gaussian) on ScatterLinear",
+        "mechanism": args.mechanism,
+        "mf_bands": args.mf_bands,
+        "random_leaves": args.random_leaves,
         "model": f"ScatterLinear (kymatio J={args.scattering_J})",
         "logical_batch_size": args.logical_batch_size,
         "max_physical_batch_size": args.max_physical_batch_size,
@@ -112,6 +136,7 @@ def main():
         "target_steps": args.target_steps,
         "tree_levels": num_levels(args.target_steps),
         "sigma_node": sigma_node,
+        "mf_sensitivity": None if args.mechanism == "tree" else mf.sensitivity(strategy, args.max_grad_norm),
         "ema_decay": args.ema_decay,
         "lr": args.lr,
         "canary_count": args.canary_count,
@@ -179,10 +204,16 @@ def main():
     if os.path.isfile(leaves_path):
         canary_leaves = np.loadtxt(leaves_path, delimiter=",").astype(np.int64)
         logger.info(f"Loaded existing leaf assignment from: {leaves_path}")
-    else:
+    elif args.random_leaves or args.mechanism == "tree":
+        # The tree gives every leaf the same ancestor-path length, so random leaves
+        # stay identically distributed. MF has no such symmetry -- see --random-leaves.
         canary_leaves = rng.integers(0, args.target_steps, size=args.canary_count, dtype=np.int64)
         np.savetxt(leaves_path, canary_leaves, delimiter=",", fmt="%d")
         logger.info(f"Canary leaf assignment saved to: {leaves_path}")
+    else:
+        canary_leaves = np.zeros(args.canary_count, dtype=np.int64)
+        np.savetxt(leaves_path, canary_leaves, delimiter=",", fmt="%d")
+        logger.info("All canaries at leaf 0 (equal ||C[:, t]||, so the pooled population is homogeneous)")
 
     n_in = int(inclusion_mask.sum())
     n_out = args.canary_count - n_in
@@ -199,6 +230,14 @@ def main():
     logger.info(f"  sigma_node: {sigma_node:.4f}")
     logger.info(f"  Canary count: {args.canary_count}, P(keep): {args.pkeep}")
 
+    canary_kw = dict(target_steps=args.target_steps, canary_dirac_indices=canary_dirac_indices,
+                     canary_leaf_assignment=canary_leaves, canary_inclusion_mask=inclusion_mask,
+                     canary_scale=canary_scale)
+    if args.mechanism == "mf":
+        state_builder = partial(MFDPFTRLState, sigma=sigma_node, strategy=strategy, decoder=decoder_mat, **canary_kw)
+    else:
+        state_builder = partial(DPFTRLState, sigma_node=sigma_node, **canary_kw)
+
     losses, state, leaves_done = train_dpftrl_whitebox(
         model=model,
         train_loader=train_loader,
@@ -210,11 +249,7 @@ def main():
         target_steps=args.target_steps,
         lr=args.lr,
         max_grad_norm=args.max_grad_norm,
-        sigma_node=sigma_node,
-        canary_dirac_indices=canary_dirac_indices,
-        canary_leaf_assignment=canary_leaves,
-        canary_inclusion_mask=inclusion_mask,
-        canary_scale=canary_scale,
+        state_builder=state_builder,
         ema_model=ema_model,
         ema_decay=args.ema_decay,
         ema_step_offset=0,
@@ -228,9 +263,16 @@ def main():
     in_optimal = optimal[inclusion_mask]
     out_optimal = optimal[~inclusion_mask]
 
-    L = num_levels(args.target_steps) + 1
-    in_ndis = in_optimal / math.sqrt(L)
-    out_ndis = out_optimal / math.sqrt(L)
+    # MF scores are already divided by ||C[:, t]||, so their sd is sigma directly;
+    # the tree score sums L ancestors and needs sqrt(L).
+    ndis_scale = 1.0 if args.mechanism == "mf" else math.sqrt(num_levels(args.target_steps) + 1)
+    in_ndis = in_optimal / ndis_scale
+    out_ndis = out_optimal / ndis_scale
+
+    if args.mechanism == "mf" and args.canary_count:
+        mu0, mu1, sd = mf.audit_gaussian_params(strategy, sigma_node, int(canary_leaves[0]), canary_scale)
+        logger.info(f"MF analytic pair (leaf {canary_leaves[0]}): out~N({mu0:.3f}, {sd:.3f}^2), in~N({mu1:.3f}, {sd:.3f}^2)")
+        logger.info(f"MF empirical: out mean={out_ndis.mean():.3f} sd={out_ndis.std():.3f}, in mean={in_ndis.mean():.3f} sd={in_ndis.std():.3f}")
 
     # Andrew et al. (2024, Alg 3): max-over-leaves cosine of dirac canary
     # direction with the released noisy_G_t. One scalar per canary.
