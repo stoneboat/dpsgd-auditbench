@@ -109,6 +109,7 @@ def _whitebox_dp_step(
     scores,
     include_flags,
     canary_dirac,
+    clip_norms=None,
 ):
     if not hasattr(optimizer, "clip_and_accumulate"):
         return optimizer.step()
@@ -130,6 +131,13 @@ def _whitebox_dp_step(
         return None
 
     optimizer._is_last_step_skipped = False
+
+    # C_t for this step; read before update_max_grad_norm() moves it.
+    step_clip_norm = float(optimizer.max_grad_norm)
+    if canary_scale is None:
+        canary_scale = step_clip_norm  # adaptive: inject at the live bound
+    if clip_norms is not None:
+        clip_norms.append(step_clip_norm)
 
     include_mask = None
     if canary_dirac is not None and canary_prob is not None and canary_prob > 0.0:
@@ -186,6 +194,10 @@ def _whitebox_dp_step(
     optimizer.scale_grad()
     if optimizer.step_hook:
         optimizer.step_hook(optimizer)
+
+    # Only reachable from AdaClip's pre_step(), which this path replaces.
+    if hasattr(optimizer, "update_max_grad_norm"):
+        optimizer.update_max_grad_norm()
 
     return optimizer.original_optimizer.step()
 
@@ -311,6 +323,8 @@ def train_whitebox(
     canary_scale=None,
     return_scores=False,
     return_include_flags=False,
+    return_clip_norms=False,
+    adaptive_clipping=False,
     ema_model=None,
     ema_decay=0.9999,
     ema_step_offset=0,
@@ -324,6 +338,10 @@ def train_whitebox(
         If None, all canaries are injected (legacy behavior).
     canary_prob: probability q of injecting the canary per logical step.
     canary_scale: magnitude (mu) of the canary; defaults to optimizer.max_grad_norm.
+        Must be None when adaptive_clipping=True.
+    adaptive_clipping: inject at the live C_t and drive update_max_grad_norm().
+        Scores come back unnormalized; divide by clip_norms for the C=1 observation.
+    return_clip_norms: also return the per-step C_t trajectory.
     """
     model.train()
     criterion = nn.CrossEntropyLoss(reduction='none') 
@@ -331,6 +349,7 @@ def train_whitebox(
 
     scores = [] if return_scores else None
     include_flags = [] if return_include_flags else None
+    clip_norms = [] if return_clip_norms else None
     canary_dirac = None
     if canary_dirac_indices is not None:
         by_param = {}
@@ -376,10 +395,15 @@ def train_whitebox(
 
     if canary_prob is None:
         canary_prob = 1.0 / max(1, len(train_loader))
-    if canary_scale is None and hasattr(optimizer, "max_grad_norm"):
-        canary_scale = float(optimizer.max_grad_norm)
-    if canary_scale is None:
-        canary_scale = 1.0
+    if adaptive_clipping:
+        # left unresolved so each step injects at its own C_t
+        if canary_scale is not None:
+            raise ValueError("canary_scale must be None when adaptive_clipping=True")
+    else:
+        if canary_scale is None and hasattr(optimizer, "max_grad_norm"):
+            canary_scale = float(optimizer.max_grad_norm)
+        if canary_scale is None:
+            canary_scale = 1.0
     
     # Augmentation transform
     # Sander et al. (2023) / Mahloujifar et al. (2024) augmentation recipe.
@@ -458,6 +482,7 @@ def train_whitebox(
                 scores=scores,
                 include_flags=include_flags,
                 canary_dirac=canary_dirac,
+                clip_norms=clip_norms,
             )
             
             # Track samples processed for logical batch counting
@@ -490,9 +515,12 @@ def train_whitebox(
 
     if return_scores:
         num_logical_steps = len(scores)
+        out = [np.mean(losses), num_logical_steps, scores]
         if return_include_flags:
-            return np.mean(losses), num_logical_steps, scores, include_flags
-        return np.mean(losses), num_logical_steps, scores
+            out.append(include_flags)
+        if return_clip_norms:
+            out.append(clip_norms)
+        return tuple(out)
     return np.mean(losses), num_logical_steps
 
 

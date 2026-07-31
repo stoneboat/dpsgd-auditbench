@@ -28,6 +28,11 @@ from dataset import get_data_loaders
 from network_arch import WideResNet
 from train import test, train_whitebox
 from faults import FAULTS, DEFAULT_STRENGTH, apply_fault
+from adaptive_clipping import (
+    AdaptiveClipConfig,
+    install_adaptive_clipping_fix,
+    effective_noise_multipliers,
+)
 
 # ==========================================
 # Default Hyperparameters (white-box, from notebook)
@@ -73,6 +78,21 @@ def main():
     parser.add_argument('--pkeep', type=float, default=DEFAULT_PKEEP)
     parser.add_argument('--database-seed', type=str, default=None,
                         help='128-bit integer as string; if None, generate random')
+    # Quantile-based adaptive clipping (Andrew et al. 2021). See src/adaptive_clipping.py.
+    parser.add_argument('--adaptive-clipping', action='store_true',
+                        help='Adapt C_t to a target quantile of the per-sample grad norms. '
+                             'Canaries inject at the live C_t; scores saved normalized by C_t.')
+    parser.add_argument('--target-unclipped-quantile', type=float, default=0.5,
+                        help='gamma: fraction of per-sample grads left unclipped. 0.5 = median.')
+    parser.add_argument('--clipbound-lr', type=float, default=0.2,
+                        help='eta_C for the geometric update of C_t (paper value: 0.2).')
+    parser.add_argument('--min-clipbound', type=float, default=0.1)
+    parser.add_argument('--max-clipbound', type=float, default=50.0,
+                        help='Ceiling on C_t; a binding ceiling turns the run into fixed clipping.')
+    parser.add_argument('--unclipped-num-std', type=float, default=None,
+                        help='sigma_b, the noise on the unclipped count. Defaults to the '
+                             'paper rule expected_batch_size/20, which holds the noise on '
+                             'the unclipped *fraction* at std 0.05.')
     # Fault injection (Gaussian-preserving implementation bugs)
     parser.add_argument('--fault', type=str, default='none', choices=FAULTS,
                         help='Plant a realistic DP-SGD implementation bug. See src/faults.py.')
@@ -106,7 +126,13 @@ def main():
 
     # Suffix that separates ablation arms sharing a database seed. The fault name
     # is one such arm tag; --exp-tag carries any other (e.g. lr8.0).
-    tags = [t for t in (None if args.fault == 'none' else f"fault_{args.fault}", args.exp_tag) if t]
+    tags = [
+        t for t in (
+            None if args.fault == 'none' else f"fault_{args.fault}",
+            "adaptive" if args.adaptive_clipping else None,
+            args.exp_tag,
+        ) if t
+    ]
     exp_dir = os.path.join(
         args.data_dir,
         f"mislabeled-canaries-{DATABSEED}-{args.canary_count}-{args.pkeep}-cifar10"
@@ -149,6 +175,7 @@ def main():
         'pkeep': args.pkeep,
         'database_seed': DATABSEED,
         'exp_tag': args.exp_tag,
+        'adaptive_clipping': args.adaptive_clipping,
     }
     hparams_path = os.path.join(exp_dir, 'hparams.json')
     with open(hparams_path, 'w') as f:
@@ -186,6 +213,17 @@ def main():
 
     logger.info("Setting up privacy engine...")
     privacy_engine = PrivacyEngine()
+
+    engine_kwargs = {}
+    adaptive_cfg = None
+    if args.adaptive_clipping:
+        sigma_b_override = {} if args.unclipped_num_std is None else {"unclipped_num_std": args.unclipped_num_std}
+        adaptive_cfg = AdaptiveClipConfig.for_batch_size(args.logical_batch_size, **sigma_b_override,
+            target_unclipped_quantile=args.target_unclipped_quantile, clipbound_learning_rate=args.clipbound_lr,
+            min_clipbound=args.min_clipbound, max_clipbound=args.max_clipbound)
+        engine_kwargs = dict(clipping="adaptive", **adaptive_cfg.as_engine_kwargs())
+        logger.info(f"Adaptive clipping enabled: {adaptive_cfg}")
+
     model, optimizer, train_loader = privacy_engine.make_private_with_epsilon(
         module=model,
         optimizer=optimizer,
@@ -194,7 +232,24 @@ def main():
         target_epsilon=args.epsilon,
         target_delta=args.delta,
         max_grad_norm=args.max_grad_norm,
+        **engine_kwargs,
     )
+
+    if args.adaptive_clipping:
+        install_adaptive_clipping_fix(optimizer)  # applied post hoc; Opacus picks the class itself
+        logger.info(f"Installed adaptive-clipping fix: optimizer is now {type(optimizer).__name__}")
+
+        # noise_multiplier is already sigma_g (Theorem 1 split); the accountant reads
+        # it without charging for the count release, so get_epsilon() reads low.
+        sigma_grad = optimizer.noise_multiplier
+        sigma_b = adaptive_cfg.unclipped_num_std
+        sigma_eff = (sigma_grad ** (-2) + (2 * sigma_b) ** (-2)) ** (-0.5)
+        params['sigma_grad'] = sigma_grad
+        params['sigma_effective'] = sigma_eff
+        params['adaptive_clip'] = adaptive_cfg.as_engine_kwargs()
+        params['eps_calibration_target'] = args.epsilon
+        logger.info(f"Theorem 1 split: sigma_eff={sigma_eff:.6f}, sigma_grad={sigma_grad:.6f} (accountant reads this), sigma_b={sigma_b:.2f}. Quote --epsilon, not get_epsilon().")
+
     noise_multiplier = optimizer.noise_multiplier
     logger.info(f"Opacus computed noise_multiplier={noise_multiplier:.4f} for epsilon={args.epsilon}, delta={args.delta}, epochs={epochs_for_priv}")
 
@@ -219,7 +274,10 @@ def main():
     # Checkpoint loading
     start_epoch = 1
     total_steps = 0
+    # sum_scores is C_t-normalized, sum_scores_raw is not; identical at fixed C=1.
     sum_scores = None
+    sum_scores_raw = None
+    clip_norm_history = []
     last_completed_epoch = None
     last_completed_total_steps = 0
 
@@ -259,6 +317,14 @@ def main():
             logger.info(
                 f"Loaded sum_scores for epoch {checkpoint_epoch} (total_steps={total_steps})"
             )
+        raw_path = os.path.join(exp_dir, f'sum_scores_raw_{checkpoint_epoch:06d}.csv')
+        if os.path.isfile(raw_path) and total_steps > 0:
+            sum_scores_raw = np.loadtxt(raw_path, delimiter=',')
+            logger.info(f"Loaded sum_scores_raw for epoch {checkpoint_epoch}")
+        clip_path = os.path.join(exp_dir, f'clip_norms_{checkpoint_epoch:06d}.csv')
+        if os.path.isfile(clip_path) and total_steps > 0:
+            clip_norm_history = np.loadtxt(clip_path, delimiter=',').ravel().tolist()
+            logger.info(f"Loaded {len(clip_norm_history)} past clip norms")
 
         current_eps = privacy_engine.get_epsilon(args.delta)
         logger.info(f"Current Cumulative Epsilon: {current_eps:.2f}")
@@ -342,7 +408,7 @@ def main():
         if steps_remaining <= 0:
             logger.info(f"Reached target_steps={args.target_steps} at epoch {epoch-1}; stopping.")
             break
-        train_loss, num_steps, scores = train_whitebox(
+        train_loss, num_steps, scores, clip_norms = train_whitebox(
             model,
             optimizer,
             train_loader,
@@ -355,6 +421,8 @@ def main():
             canary_inclusion_mask=inclusion_mask,
             canary_prob=canary_prob,
             return_scores=True,
+            return_clip_norms=True,
+            adaptive_clipping=args.adaptive_clipping,
             ema_model=ema_model,
             ema_decay=args.ema_decay,
             ema_step_offset=total_steps,
@@ -364,10 +432,22 @@ def main():
         assert scores.shape[0] == num_steps, (
             f"scores.shape[0] = {scores.shape[0]} != num_steps = {num_steps}"
         )
-        if sum_scores is None:
-            sum_scores = scores.sum(axis=0)
-        else:
-            sum_scores = sum_scores + scores.sum(axis=0)
+        clip_norms = np.asarray(clip_norms, dtype=float)  # (num_steps,)
+        assert clip_norms.shape[0] == num_steps, f"clip_norms {clip_norms.shape[0]} != num_steps {num_steps}"
+        if not np.all(clip_norms > 0):
+            raise ValueError("Non-positive clip norm recorded; cannot normalize scores.")
+        clip_norm_history.extend(clip_norms.tolist())
+
+        # Each step divided by its own C_t: signal C_t and noise sigma_g*C_t both cancel.
+        norm_step_sum = (scores / clip_norms[:, None]).sum(axis=0)
+        raw_step_sum = scores.sum(axis=0)
+        sum_scores = norm_step_sum if sum_scores is None else sum_scores + norm_step_sum
+        sum_scores_raw = raw_step_sum if sum_scores_raw is None else sum_scores_raw + raw_step_sum
+
+        if args.adaptive_clipping:
+            logger.info(f"C_t epoch {epoch}: first={clip_norms[0]:.4f} last={clip_norms[-1]:.4f} min={clip_norms.min():.4f} max={clip_norms.max():.4f} mean={clip_norms.mean():.4f}")
+            if np.any(clip_norms <= args.min_clipbound) or np.any(clip_norms >= args.max_clipbound):
+                logger.warning("C_t hit a clamp; this arm is fixed clipping at the clamp, not adaptive. Widen --min/--max-clipbound.")
 
         total_steps += num_steps
         # Sander/Mahloujifar evaluate on EMA weights when EMA is enabled, but
@@ -435,6 +515,11 @@ def main():
                 os.path.join(exp_dir, f'sum_scores_{epoch:06d}.csv'),
                 sum_scores, delimiter=',',
             )
+            # Unnormalized arm + the C_t trajectory
+            np.savetxt(os.path.join(exp_dir, f'sum_scores_raw_{epoch:06d}.csv'), sum_scores_raw, delimiter=',')
+            np.savetxt(os.path.join(exp_dir, f'clip_norms_{epoch:06d}.csv'), np.asarray(clip_norm_history), delimiter=',')
+            np.savetxt(os.path.join(exp_dir, f'in_scores_ndis_raw_{epoch:06d}.csv'), sum_scores_raw[inclusion_mask] / np.sqrt(total_steps), delimiter=',')
+            np.savetxt(os.path.join(exp_dir, f'out_scores_ndis_raw_{epoch:06d}.csv'), sum_scores_raw[~inclusion_mask] / np.sqrt(total_steps), delimiter=',')
             logger.info(
                 f"Saved scores at epoch {epoch}: "
                 f"in_sum({n_in}), out_sum({n_out}), "
@@ -475,6 +560,10 @@ def main():
             delimiter=',', header='current_eps,delta', comments='',
         )
         np.savetxt(os.path.join(exp_dir, f'sum_scores_{epoch:06d}.csv'), sum_scores, delimiter=',')
+        np.savetxt(os.path.join(exp_dir, f'sum_scores_raw_{epoch:06d}.csv'), sum_scores_raw, delimiter=',')
+        np.savetxt(os.path.join(exp_dir, f'clip_norms_{epoch:06d}.csv'), np.asarray(clip_norm_history), delimiter=',')
+        np.savetxt(os.path.join(exp_dir, f'in_scores_ndis_raw_{epoch:06d}.csv'), sum_scores_raw[inclusion_mask] / np.sqrt(total_steps), delimiter=',')
+        np.savetxt(os.path.join(exp_dir, f'out_scores_ndis_raw_{epoch:06d}.csv'), sum_scores_raw[~inclusion_mask] / np.sqrt(total_steps), delimiter=',')
         logger.info(
             f"Saved final scores at epoch {epoch} (total_steps={total_steps}): "
             f"in_sum({n_in}), out_sum({n_out}), in_ndis({n_in}), out_ndis({n_out})"
