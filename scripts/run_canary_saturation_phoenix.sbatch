@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=canary_sat
 #SBATCH --account=gts-vzikas3
-#SBATCH --partition=gpu-a100
+#SBATCH --partition=gpu-h200
 #SBATCH --gres=gpu:1
 #SBATCH --mem=100G
 #SBATCH --time=24:00:00

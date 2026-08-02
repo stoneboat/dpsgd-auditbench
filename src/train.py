@@ -111,6 +111,7 @@ def _whitebox_dp_step(
     canary_dirac,
     clip_norms=None,
     normalize_update=False,
+    probe=None,
 ):
     if not hasattr(optimizer, "clip_and_accumulate"):
         return optimizer.step()
@@ -124,6 +125,10 @@ def _whitebox_dp_step(
         _grad_norm_call_count[0] += 1
         if _grad_norm_call_count[0] % _GRAD_NORM_LOG_EVERY == 1:
             _log_grad_sample_norms(optimizer)
+
+    # Diagnostic hook: grad_samples are alive and unclipped only here.
+    if probe is not None:
+        probe.observe(optimizer)
 
     optimizer.clip_and_accumulate()
 
@@ -206,6 +211,9 @@ def _whitebox_dp_step(
     # Only reachable from AdaClip's pre_step(), which this path replaces.
     if hasattr(optimizer, "update_max_grad_norm"):
         optimizer.update_max_grad_norm()
+
+    if probe is not None:
+        probe.end_step(optimizer)
 
     return optimizer.original_optimizer.step()
 
@@ -337,6 +345,7 @@ def train_whitebox(
     ema_decay=0.9999,
     ema_step_offset=0,
     max_logical_steps=None,
+    probe=None,
 ):
     """Training function for auditing in whitebox model.
 
@@ -352,6 +361,11 @@ def train_whitebox(
         Model updates are divided by C_t (Bu et al. 2023 normalized-scale convention),
         so lr stays in the C=1 units the fixed arm was tuned in.
     return_clip_norms: also return the per-step C_t trajectory.
+    probe: optional diagnostic object with begin_step(model) / observe(optimizer) /
+        end_step(optimizer). begin_step runs at the top of each logical step (before
+        the batch forward), observe on every physical batch while grad_samples are
+        still unclipped, end_step once the logical step actually fires. No-op when None;
+        it must not mutate optimizer state.
     """
     model.train()
     criterion = nn.CrossEntropyLoss(reduction='none') 
@@ -437,7 +451,12 @@ def train_whitebox(
         
         num_logical_steps = 0  # Count logical batches, not physical batches
         samples_in_current_logical_batch = 0  # Track samples processed in current logical batch
+        new_logical_step = True  # this physical batch opens a new logical step
         for i, (images, labels) in enumerate(pbar):
+            # Diagnostic hook: theta_{t-1} is current and grads are clean here.
+            if probe is not None and new_logical_step:
+                probe.begin_step(model)
+
             # images shape: [B, 3, 32, 32] (Physical Batch)
             
             # --- AUGMENTATION MULTIPLICITY LOGIC ---
@@ -494,8 +513,11 @@ def train_whitebox(
                 canary_dirac=canary_dirac,
                 clip_norms=clip_norms,
                 normalize_update=adaptive_clipping,
+                probe=probe,
             )
-            
+            # A skipped step means the logical batch is still filling up.
+            new_logical_step = not getattr(optimizer, "_is_last_step_skipped", False)
+
             # Track samples processed for logical batch counting
             # images.shape[0] is the physical batch size (before augmentation)
             physical_batch_size = images.shape[0]
