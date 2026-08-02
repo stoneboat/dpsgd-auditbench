@@ -18,7 +18,7 @@ module load anaconda3
 conda activate /storage/scratch1/6/aagrawal609/conda_envs/audit
 
 EPS=8
-STEPS=500
+STEPS=2500
 
 COMMON="--epsilon ${EPS} --delta 1e-5 --target-steps ${STEPS} \
     --logical-batch-size 4096 --max-physical-batch-size 128 \
