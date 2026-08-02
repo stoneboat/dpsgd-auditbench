@@ -88,6 +88,7 @@ def main():
         logger.info(f"Using provided database seed: {DATABSEED}")
 
     tag = "" if args.mechanism == "tree" else f"-{args.mechanism}"
+    tag += f"-eps{args.epsilon:g}"
     exp_dir = os.path.join(
         args.data_dir,
         f"dpftrl-scatter-canaries-{DATABSEED}-{args.canary_count}-{args.pkeep}-cifar10{tag}",
