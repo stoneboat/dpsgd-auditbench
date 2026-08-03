@@ -187,7 +187,7 @@ def audit_epoch(exp_dir, epoch, delta, significance, method=None, target_eps=Non
         all_out = ndis_eps_lb_all(
             in_ndis, out_ndis, delta=delta,
             alpha=significance, n_bootstrap=2000,
-            pool_variance=True,
+            pool_variance=False,
         )
         for m in NDIS_METHODS:
             if m in all_out:
