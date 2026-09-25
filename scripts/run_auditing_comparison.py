@@ -611,12 +611,10 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
             eps_f, _ = auditor._epsilon_one_run_all_thresholds(
                 significance, delta, True, None, use_fdp=True,
             )
-            tau = 1.05 * float(np.max(np.abs(np.concatenate([n_in_scores, n_out_scores]))))
             try:
                 ndis_out = ndis_eps_lb_all(
                     n_in_scores, n_out_scores, delta=delta,
                     alpha=significance, pool_variance=True,
-                    eps_theory=target_eps, score_clip=tau,
                 )
             except (ValueError, RuntimeError):
                 ndis_out = None

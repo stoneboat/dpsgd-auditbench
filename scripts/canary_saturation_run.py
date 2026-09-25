@@ -238,9 +238,12 @@ def main():
                     f"frac >= C = {np.mean(ratios >= 1.0):.4f}; argmin at step {rows[int(ratios.argmin())]['step']}")
         logger.info(f"A2 {'HOLDS' if ratios.min() >= 1.0 else 'FAILS'} on this run.")
     logger.info(f"A1 per-record alignment: mean_z h = {mean_h.mean():+.6f} (|clip_C(g_z)| <= C = {C})")
-    logger.info(f"A1 drift:    q*sum_h    = {drift:+.6f}  vs canary q*C      = {q * C:.6f}")
-    logger.info(f"A1 variance: q(1-q)*sum_h2 = {var_term:.6f}  vs canary q(1-q)C^2 = {q * (1 - q) * C * C:.6f}  vs tau^2 = {tau ** 2:.6f}")
-    logger.info(f"A1 {'HOLDS (both terms < 5% of their canary/noise references)' if drift < 0.05 * q * C and var_term < 0.05 * tau ** 2 else 'FAILS: background projections are not negligible'}")
+    # The drift is identical in both worlds (Prop 3: m_t = q[sum_z h + b a_t]), so it
+    # shifts mu_0 and mu_1 together and cancels in mu_1 - mu_0. Reported for completeness;
+    # the verdict keys on the variance term, which inflates v_0 and v_1 and costs power.
+    logger.info(f"A1 drift:    q*sum_h    = {drift:+.6f}  vs canary q*C = {q * C:.6f}  (common to both worlds, absorbed by the fitted means)")
+    logger.info(f"A1 variance: q(1-q)*sum_h2 = {var_term:.6f} = {var_term / tau ** 2:.4f} * tau^2  (tau^2 = {tau ** 2:.6f}, canary q(1-q)C^2 = {q * (1 - q) * C * C:.6f})")
+    logger.info(f"A1 {'HOLDS: background variance < 5% of tau^2' if var_term < 0.05 * tau ** 2 else f'FAILS: background variance is {var_term / tau ** 2:.1f}x tau^2, which buries the canary signal'}")
 
     with open(args.out, 'w') as f:
         f.write(','.join(rows[0].keys()) + '\n')
