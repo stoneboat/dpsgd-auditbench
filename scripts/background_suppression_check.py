@@ -87,8 +87,19 @@ def simulate_scores(n, inject, T, tau, q, C, rng, *, per_step=False,
     return s / math.sqrt(T)
 
 
-def audit_all(in_ndis, out_ndis, in_sum, out_sum, delta, alpha, n_bootstrap, rng):
-    """Every audit statistic on one score pair."""
+CHEAP_KEYS = ('mu_in', 'mu_out', 'sd_in', 'sd_out', 'mu_gdp', 'eps_point')
+SLOW_KEYS = ('eps_ndis_bonf', 'eps_ndis_boot', 'eps_steinke', 'eps_fdp')
+KEYS = CHEAP_KEYS + SLOW_KEYS
+
+
+def audit_all(in_ndis, out_ndis, in_sum, out_sum, delta, alpha, n_bootstrap, rng, slow=True):
+    """Audit statistics on one score pair.
+
+    slow=False returns only the closed-form ones. The confidence bounds are far
+    more expensive -- the bootstrap ellipsoid refits a CR, and Steinke / f-DP
+    sweep every threshold with a nested epsilon search at each -- so they run on
+    their own smaller replicate budget.
+    """
     out = {}
     out['mu_in'] = float(in_ndis.mean())
     out['mu_out'] = float(out_ndis.mean())
@@ -97,6 +108,10 @@ def audit_all(in_ndis, out_ndis, in_sum, out_sum, delta, alpha, n_bootstrap, rng
     pooled_sd = math.sqrt(0.5 * (out['sd_in'] ** 2 + out['sd_out'] ** 2))
     out['mu_gdp'] = (out['mu_in'] - out['mu_out']) / pooled_sd if pooled_sd > 0 else float('nan')
     out['eps_point'] = _ndis_eps_from_moments(out['mu_in'], out['sd_in'], out['mu_out'], out['sd_out'], delta)
+    if not slow:
+        for k in SLOW_KEYS:
+            out[k] = float('nan')
+        return out
     try:
         lb = ndis_eps_lb_all(in_ndis, out_ndis, delta=delta, alpha=alpha, n_bootstrap=n_bootstrap, pool_variance=False, rng=rng)
         out['eps_ndis_bonf'] = float(lb['parametric_bonferroni']['eps_lb'])
@@ -112,7 +127,6 @@ def audit_all(in_ndis, out_ndis, in_sum, out_sum, delta, alpha, n_bootstrap, rng
     return out
 
 
-KEYS = ('mu_in', 'mu_out', 'sd_in', 'sd_out', 'mu_gdp', 'eps_point', 'eps_ndis_bonf', 'eps_ndis_boot', 'eps_steinke', 'eps_fdp')
 
 
 def check_one(exp_dir, args, rng):
@@ -164,7 +178,7 @@ def check_one(exp_dir, args, rng):
 
     n_in, n_out = len(in_ndis), len(out_ndis)
     sqrtT = math.sqrt(T)
-    real = audit_all(in_ndis, out_ndis, in_sum, out_sum, args.delta, args.alpha, args.n_bootstrap, rng)
+    real = audit_all(in_ndis, out_ndis, in_sum, out_sum, args.delta, args.alpha, args.n_bootstrap, rng, slow=not args.skip_slow)
 
     sim = lambda n, inject: simulate_scores(n, inject, T, tau, q, C, rng,
                                             per_step=args.per_step,
@@ -172,12 +186,19 @@ def check_one(exp_dir, args, rng):
                                             mu_inject=mu_in_pred)
 
     sims = {k: [] for k in KEYS}
-    for _ in range(args.reps):
+    for _ in range(args.reps):                       # closed-form statistics, cheap
         si, so = sim(n_in, True), sim(n_out, False)
-        r = audit_all(si, so, si * sqrtT, so * sqrtT, args.delta, args.alpha, args.n_bootstrap, rng)
-        for k in KEYS:
+        r = audit_all(si, so, None, None, args.delta, args.alpha, args.n_bootstrap, rng, slow=False)
+        for k in CHEAP_KEYS:
+            sims[k].append(r[k])
+    n_slow = 0 if args.skip_slow else args.reps_slow
+    for _ in range(n_slow):                          # confidence bounds, expensive
+        si, so = sim(n_in, True), sim(n_out, False)
+        r = audit_all(si, so, si * sqrtT, so * sqrtT, args.delta, args.alpha, args.n_bootstrap, rng, slow=True)
+        for k in SLOW_KEYS:
             sims[k].append(r[k])
     sims = {k: np.array(v, dtype=float) for k, v in sims.items()}
+    reps_of = {**{k: args.reps for k in CHEAP_KEYS}, **{k: n_slow for k in SLOW_KEYS}}
 
     # Two-sample KS + Anderson-Darling: real scores vs one background-free draw, per world.
     sim_in_1, sim_out_1 = sim(n_in, True), sim(n_out, False)
@@ -193,14 +214,18 @@ def check_one(exp_dir, args, rng):
     print(f"  generative model (no background): per step N(0, {tau:.4f}^2) {inj};  score = sum_t/sqrt(T)")
     print(f"  -> predicted OUT N(0, {tau:.4f}^2)   IN N({mu_in_pred:.4f}, {sd_in_pred:.4f}^2)")
     print("-" * 96)
-    print(f"  {'statistic':<16}{'real':>12}{'simulated mean':>16}{'sim sd':>10}{'z':>8}{'pct':>7}   verdict")
+    print(f"  {'statistic':<16}{'real':>12}{'sim mean':>12}{'sim sd':>10}{'z':>8}{'pct':>7}{'reps':>6}   verdict")
     for k in KEYS:
-        s = sims[k]
-        mu_s, sd_s = float(s.mean()), float(s.std(ddof=1)) if len(s) > 1 else 0.0
+        v = sims[k]
+        if len(v) == 0 or not np.isfinite(real[k]):
+            print(f"  {k:<16}{real[k]:>12.4f}{'-':>12}{'-':>10}{'-':>8}{'-':>7}{reps_of[k]:>6}   skipped")
+            continue
+        mu_s = float(v.mean())
+        sd_s = float(v.std(ddof=1)) if len(v) > 1 else 0.0
         z = (real[k] - mu_s) / sd_s if sd_s > 0 else float('nan')
-        pct = 100.0 * float(np.mean(s <= real[k]))
+        pct = 100.0 * float(np.mean(v <= real[k]))
         flag = 'ok' if (not np.isfinite(z) or abs(z) < 3) else 'OUTSIDE'
-        print(f"  {k:<16}{real[k]:>12.4f}{mu_s:>16.4f}{sd_s:>10.4f}{z:>8.2f}{pct:>6.0f}%   {flag}")
+        print(f"  {k:<16}{real[k]:>12.4f}{mu_s:>12.4f}{sd_s:>10.4f}{z:>8.2f}{pct:>6.0f}%{reps_of[k]:>6}   {flag}")
     print("-" * 96)
     print(f"  within-world sd vs tau: OUT {real['sd_out']:.4f} / {tau:.4f} = {real['sd_out'] / tau:.4f}   "
           f"IN {real['sd_in']:.4f} / {sd_in_pred:.4f} = {real['sd_in'] / sd_in_pred:.4f}")
@@ -218,9 +243,11 @@ def check_one(exp_dir, args, rng):
                ad_real_out=ad_real_out, ad_real_in=ad_real_in,
                ad_sim_out=ad_sim_out, ad_sim_in=ad_sim_in)
     for k in KEYS:
+        v = sims[k]
         row[f'real_{k}'] = real[k]
-        row[f'sim_{k}'] = float(sims[k].mean())
-        row[f'sim_{k}_sd'] = float(sims[k].std(ddof=1)) if args.reps > 1 else 0.0
+        row[f'sim_{k}'] = float(v.mean()) if len(v) else float('nan')
+        row[f'sim_{k}_sd'] = float(v.std(ddof=1)) if len(v) > 1 else 0.0
+        row[f'reps_{k}'] = reps_of[k]
     return row
 
 
@@ -229,7 +256,13 @@ def main():
     ap.add_argument('--exp-dirs', nargs='+', required=True)
     ap.add_argument('--delta', type=float, default=1e-5)
     ap.add_argument('--alpha', type=float, default=0.05)
-    ap.add_argument('--reps', type=int, default=100, help='Simulated replicates per run.')
+    ap.add_argument('--reps', type=int, default=500,
+                    help='Replicates for the closed-form statistics (moments, mu_GDP, eps_point). Cheap.')
+    ap.add_argument('--reps-slow', type=int, default=5,
+                    help='Replicates for the confidence bounds (NDIS CRs, Steinke, f-DP). Each costs '
+                         'seconds to minutes at m=5000, so keep this small.')
+    ap.add_argument('--skip-slow', action='store_true',
+                    help='Closed-form statistics only. mu_GDP and eps_point already settle the question.')
     ap.add_argument('--n-bootstrap', type=int, default=500, help='Bootstrap draws inside the ellipsoid CR.')
     ap.add_argument('--train-set-size', type=int, default=50000, help='N for q = B/N when hparams lacks it.')
     ap.add_argument('--per-step', action='store_true',
