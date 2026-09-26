@@ -12,6 +12,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import norm
 
+from run_auditing_comparison import _RC  # same fonts/sizes/grid as the audit plots
+
 COLORS = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100']  # categorical slots 1-4
 
 
@@ -25,27 +27,26 @@ def load(row):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--csv', default='bg_suppression.csv', help='output of background_suppression_check.py --out')
-    ap.add_argument('--out', default='fig/bg_suppression')
+    ap.add_argument('--out', default='fig/bg_suppression.png')
     args = ap.parse_args()
 
     runs = sorted(load(r) for r in csv.DictReader(open(args.csv)))
-    fig, ax = plt.subplots(figsize=(3.0, 3.0))
-    for (eps, z), c in zip(runs, COLORS):
-        theo = norm.ppf((np.arange(1, len(z) + 1) - 0.5) / len(z))  # N(0,1) plotting positions
-        ax.plot(theo, np.sort(z), lw=1.5, color=c, label=f'$\\varepsilon={eps:g}$')
-    ax.plot([-4, 4], [-4, 4], color='black', lw=1, ls='--', label='$y=x$')
-    ax.set_xlim(-4, 4)
-    ax.set_ylim(-4, 4)
-    ax.set_aspect('equal')
-    ax.set_xlabel('$\\mathcal{N}(0,1)$ quantile')
-    ax.set_ylabel('OUT score / $\\tau$ quantile')
-    ax.spines[['top', 'right']].set_visible(False)
-    ax.legend(frameon=False, fontsize=7)
-    fig.tight_layout()
-    os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
-    for ext in ('pdf', 'png'):
-        fig.savefig(f'{args.out}.{ext}', dpi=300)
-    print(f'wrote {args.out}.pdf/.png')
+    with plt.rc_context(_RC):
+        fig, ax = plt.subplots(figsize=(11, 6.5))
+        ax.plot([-4, 4], [-4, 4], color='#555555', ls=(0, (3, 5, 1, 5)), lw=1.4, label='$y=x$', zorder=1)
+        for (eps, z), c in zip(runs, COLORS):
+            theo = norm.ppf((np.arange(1, len(z) + 1) - 0.5) / len(z))  # N(0,1) plotting positions
+            ax.plot(theo, np.sort(z), lw=2.4, color=c, label=f'$\\varepsilon={eps:g}$', zorder=2)
+        ax.set_xlim(-4, 4)
+        ax.set_ylim(-4, 4)
+        ax.set_xlabel(r'$\mathcal{N}(0,1)$ quantile')
+        ax.set_ylabel(r'OUT score / $\tau$ quantile')
+        ax.legend(loc='upper left', handlelength=2.5)
+        fig.tight_layout()
+        os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
+        fig.savefig(args.out, dpi=300, bbox_inches='tight')
+        fig.savefig(args.out.replace('.png', '.pdf'), bbox_inches='tight')
+    print(f'wrote {args.out} (+ .pdf)')
 
 
 if __name__ == '__main__':
