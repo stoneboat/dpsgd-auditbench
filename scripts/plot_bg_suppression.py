@@ -33,14 +33,14 @@ def main():
     runs = sorted(load(r) for r in csv.DictReader(open(args.csv)))
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(11, 6.5))
-        ax.plot([-4, 4], [-4, 4], color='#555555', ls=(0, (3, 5, 1, 5)), lw=1.4, label='$y=x$', zorder=1)
+        ax.plot([-4, 4], [-4, 4], color='#555555', ls=(0, (3, 5, 1, 5)), lw=1.4, label='perfect agreement', zorder=1)
         for (eps, z), c in zip(runs, COLORS):
             theo = norm.ppf((np.arange(1, len(z) + 1) - 0.5) / len(z))  # N(0,1) plotting positions
             ax.plot(theo, np.sort(z), lw=2.4, color=c, label=f'$\\varepsilon={eps:g}$', zorder=2)
         ax.set_xlim(-4, 4)
         ax.set_ylim(-4, 4)
-        ax.set_xlabel(r'$\mathcal{N}(0,1)$ quantile')
-        ax.set_ylabel(r'OUT score / $\tau$ quantile')
+        ax.set_xlabel(r'Background-free quantile, $\mathcal{N}(0,1)$')
+        ax.set_ylabel('OUT score / DP noise std')
         ax.legend(loc='upper left', handlelength=2.5)
         fig.tight_layout()
         os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
