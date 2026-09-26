@@ -66,9 +66,12 @@ def main():
     parser.add_argument("--mf-bands", type=int, default=0,
                         help="Band the sqrt strategy at this lag; 0 = full square root.")
     parser.add_argument("--random-leaves", action="store_true",
-                        help="Randomize canary leaves. Under mf the column norm of C varies with "
-                             "the leaf, so this makes the pooled in-population a mixture; the "
-                             "default puts every canary at leaf 0 to keep it exactly Gaussian.")
+                        help="Randomize canary leaves. Both mechanisms give leaf 0 the strongest, "
+                             "cleanest signal, so randomizing makes the pooled in-population a "
+                             "mixture: under mf the column norm of C varies with the leaf, and "
+                             "under tree the streaming construction materializes only T nodes, so "
+                             "the number of released ancestors covering a leaf runs from 1 to L. "
+                             "The default puts every canary at leaf 0 to keep it exactly Gaussian.")
     parser.add_argument("--database-seed", type=str, default=None)
     parser.add_argument("--data-dir", type=str, default="./data")
     parser.add_argument("--log-dir", type=str, default="./logs")
@@ -205,16 +208,19 @@ def main():
     if os.path.isfile(leaves_path):
         canary_leaves = np.loadtxt(leaves_path, delimiter=",").astype(np.int64)
         logger.info(f"Loaded existing leaf assignment from: {leaves_path}")
-    elif args.random_leaves or args.mechanism == "tree":
-        # The tree gives every leaf the same ancestor-path length, so random leaves
-        # stay identically distributed. MF has no such symmetry -- see --random-leaves.
+    elif args.random_leaves:
+        # Opt-in only. Neither mechanism is leaf-symmetric: mf column norms vary with
+        # the leaf, and the streaming tree adds one node per step, so leaf t is covered
+        # by 1 + (zero bits of t) released nodes rather than all L ancestors. Random
+        # leaves therefore make both the mean and the variance vary across canaries.
         canary_leaves = rng.integers(0, args.target_steps, size=args.canary_count, dtype=np.int64)
         np.savetxt(leaves_path, canary_leaves, delimiter=",", fmt="%d")
         logger.info(f"Canary leaf assignment saved to: {leaves_path}")
     else:
         canary_leaves = np.zeros(args.canary_count, dtype=np.int64)
         np.savetxt(leaves_path, canary_leaves, delimiter=",", fmt="%d")
-        logger.info("All canaries at leaf 0 (equal ||C[:, t]||, so the pooled population is homogeneous)")
+        logger.info("All canaries at leaf 0: tree gets all L ancestors, mf gets the largest "
+                    "||C[:, t]||, so the pooled population is homogeneous and at the worst case")
 
     n_in = int(inclusion_mask.sum())
     n_out = args.canary_count - n_in

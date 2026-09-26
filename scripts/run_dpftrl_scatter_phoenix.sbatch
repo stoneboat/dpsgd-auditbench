@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=dpftrl_scatter
-#SBATCH --account=<account>
+#SBATCH --account=gts-vzikas3
 #SBATCH --partition=gpu-a100
 #SBATCH --gres=gpu:1
 #SBATCH --mem=40G
@@ -11,7 +11,7 @@
 
 # === Module and env setup ===
 module load anaconda3
-conda activate /storage/scratch1/6/aagrawal609/conda_envs/dpsgd_bench
+conda activate /storage/scratch1/6/aagrawal609/conda_envs/audit
 
 # One-time dependency install (kymatio for the scattering transform):
 #   pip install kymatio
