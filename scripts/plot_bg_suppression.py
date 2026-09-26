@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real OUT canary scores / tau for each run vs the background-free prediction N(0, 1).
+"""Q-Q plot: real OUT canary scores / tau for each run vs the background-free prediction N(0, 1).
 
 Usage:
   python scripts/plot_bg_suppression.py --csv bg_suppression.csv
@@ -29,14 +29,16 @@ def main():
     args = ap.parse_args()
 
     runs = sorted(load(r) for r in csv.DictReader(open(args.csv)))
-    bins = np.linspace(-4, 4, 41)
-    fig, ax = plt.subplots(figsize=(3.4, 2.4))
+    fig, ax = plt.subplots(figsize=(3.0, 3.0))
     for (eps, z), c in zip(runs, COLORS):
-        ax.hist(z, bins=bins, density=True, histtype='step', lw=1.5, color=c, label=f'$\\varepsilon={eps:g}$')
-    x = np.linspace(-4, 4, 400)
-    ax.plot(x, norm.pdf(x), color='black', lw=1.5, ls='--', label='$\\mathcal{N}(0,1)$')
-    ax.set_xlabel('OUT score / $\\tau$')
-    ax.set_ylabel('density')
+        theo = norm.ppf((np.arange(1, len(z) + 1) - 0.5) / len(z))  # N(0,1) plotting positions
+        ax.plot(theo, np.sort(z), lw=1.5, color=c, label=f'$\\varepsilon={eps:g}$')
+    ax.plot([-4, 4], [-4, 4], color='black', lw=1, ls='--', label='$y=x$')
+    ax.set_xlim(-4, 4)
+    ax.set_ylim(-4, 4)
+    ax.set_aspect('equal')
+    ax.set_xlabel('$\\mathcal{N}(0,1)$ quantile')
+    ax.set_ylabel('OUT score / $\\tau$ quantile')
     ax.spines[['top', 'right']].set_visible(False)
     ax.legend(frameon=False, fontsize=7)
     fig.tight_layout()
