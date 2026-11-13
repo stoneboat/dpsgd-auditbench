@@ -942,6 +942,110 @@ def run_gaussianity(exp_dir, fig_dir):
     print(f"Saved Gaussianity diagnostics to: {base}_{{in,out}}.{{png,pdf}}")
 
 
+def _gaussian_lr_regions(first, second, eps):
+    """Intervals where the first Gaussian density exceeds exp(eps) times the second."""
+    mu1, sd1 = first
+    mu2, sd2 = second
+    a = 0.5 * (sd2**-2 - sd1**-2)
+    b = mu1 / sd1**2 - mu2 / sd2**2
+    c = 0.5 * ((mu2 / sd2)**2 - (mu1 / sd1)**2) + math.log(sd2 / sd1) - eps
+    if abs(a) < 1e-12:
+        if abs(b) < 1e-12:
+            return [(-np.inf, np.inf)] if c > 0 else []
+        cutoff = -c / b
+        return [(cutoff, np.inf)] if b > 0 else [(-np.inf, cutoff)]
+    discriminant = b * b - 4 * a * c
+    if discriminant < 0:
+        return [(-np.inf, np.inf)] if a > 0 else []
+    root = -0.5 * (b + math.copysign(math.sqrt(discriminant), b))
+    left, right = sorted((root / a, c / root)) if root else (0.0, 0.0)
+    return [(-np.inf, left), (right, np.inf)] if a > 0 else [(left, right)]
+
+
+def run_tail_comparison(exp_dir, delta, significance):
+    """Compare finite-T Model 1 and saved scores on the regions used by NDIS."""
+    from scipy.stats import binom, norm
+
+    epoch = get_final_epoch(exp_dir)
+    with open(os.path.join(exp_dir, 'hparams.json')) as f:
+        hp = json.load(f)
+    if epoch is None or 'noise_multiplier' not in hp or 'sigma_node' in hp:
+        raise ValueError('tail comparison requires saved DP-SGD scores and noise metadata')
+
+    scores = [
+        np.atleast_1d(np.loadtxt(os.path.join(exp_dir, f'{side}_scores_ndis_{epoch:06d}.csv'), delimiter=','))
+        for side in ('in', 'out')
+    ]
+    if any(s.ndim != 1 or s.size < 2 or not np.isfinite(s).all() for s in scores):
+        raise ValueError('each NDIS score file must contain at least two finite scores')
+    in_sum = np.loadtxt(_resolve_score_path(exp_dir, 'sum', 'in', epoch), delimiter=',')
+    # The generator saves both the sum and the same sum divided by sqrt(T).
+    largest = np.argmax(np.abs(scores[0]))
+    if in_sum.shape != scores[0].shape or scores[0][largest] == 0:
+        raise ValueError('cannot recover the checkpoint step count from the saved IN scores')
+    steps = round((in_sum[largest] / scores[0][largest])**2)
+    if steps <= 0 or not np.allclose(in_sum, scores[0] * math.sqrt(steps), rtol=1e-6, atol=1e-10):
+        raise ValueError('the saved IN sum and NDIS scores disagree on the checkpoint step count')
+
+    # Legacy CIFAR-10 runs used 1 / len(train_loader) with drop_last=True.
+    q = hp.get('canary_prob_used')
+    q_source = 'saved canary rate'
+    if q is None:
+        batches = hp.get('train_set_size', 50000) // hp['logical_batch_size']
+        if batches < 1:
+            raise ValueError('cannot infer the canary rate from the batch and dataset sizes')
+        q = 1 / batches
+        q_source = 'legacy loader rate inferred from batch and dataset sizes'
+    sigma = hp.get('noise_multiplier_used', hp['noise_multiplier'])
+    if not 0 <= q <= 1 or sigma <= 0:
+        raise ValueError('invalid Model 1 canary rate or noise multiplier')
+
+    result = ndis_eps_lb_all(
+        *scores, delta=delta, alpha=significance, n_bootstrap=2000,
+        pool_variance=False, rng=np.random.default_rng(2), methods=('bootstrap_ellipsoid',),
+    )['bootstrap_ellipsoid']
+    eps = result['eps_lb']
+    fitted = result['theta_min'].reshape(2, 2)
+    factor = math.exp(eps)
+
+    # Saved NDIS scores sum gradients divided by their per-step clipping bounds.
+    # In those units each sampled canary adds 1 before the final sqrt(T) normalization.
+    hits = np.arange(steps + 1)
+    weights = binom.pmf(hits, steps, q)
+    shifts = hits / math.sqrt(steps)
+    model_mean = q * math.sqrt(steps)
+    model_sd = math.sqrt(sigma**2 + q * (1 - q))
+
+    print(f'Checkpoint {epoch}, T={steps}, q={q:.6g} ({q_source}), sigma={sigma:.6g}')
+    print(f'Gaussian NDIS epsilon={eps:.6f}, delta={delta:g}')
+    print('Regions come from the fitted Gaussians. Model 1 rows use the run settings.')
+    for direction, first, second in [('IN vs OUT', 0, 1), ('OUT vs IN', 1, 0)]:
+        regions = _gaussian_lr_regions(fitted[first], fitted[second], eps)
+
+        def mass(mean, sd):
+            prob = np.zeros_like(mean, dtype=float)
+            for left, right in regions:
+                lo, hi = (left - mean) / sd, (right - mean) / sd
+                prob += np.where(lo > 0, norm.sf(lo) - norm.sf(hi), norm.cdf(hi) - norm.cdf(lo))
+            return prob
+
+        gaussian = (mass(model_mean, model_sd), mass(0.0, sigma))
+        mixture = (np.dot(weights, mass(shifts, sigma)), gaussian[1])
+        counts = [sum(np.count_nonzero((s > left) & (s < right)) for left, right in regions) for s in scores]
+        empirical = [count / s.size for count, s in zip(counts, scores)]
+        print(f'\n{direction}, regions={regions}')
+        fitted_gap = mass(*fitted[first]) - factor * mass(*fitted[second])
+        print(f'Gap under the fitted NDIS Gaussians: {fitted_gap:.7g}')
+        print(f"{'Source':<23} {'IN probability':>15} {'OUT probability':>15} {'Privacy gap':>15}")
+        for label, probs in [('Model 1 Gaussian', gaussian), ('Model 1 exact mixture', mixture), ('Saved scores', empirical)]:
+            gap = probs[first] - factor * probs[second]
+            print(f'{label:<23} {probs[0]:>15.7g} {probs[1]:>15.7g} {gap:>15.7g}')
+        in_error = gaussian[0] - mixture[0]
+        gap_error = in_error if first == 0 else -factor * in_error
+        print(f'Gaussian minus mixture: IN probability {in_error:+.3e}, privacy gap {gap_error:+.3e}')
+        print(f'Saved scores in region: IN {counts[0]}/{scores[0].size}, OUT {counts[1]}/{scores[1].size}')
+
+
 def main():
     parser = argparse.ArgumentParser(description='Run auditing methods comparison')
     parser.add_argument('--exp-dir', type=str, help='Single experiment directory')
@@ -952,6 +1056,9 @@ def main():
     parser.add_argument('--with-andrew', action='store_true',
                         help='Include Andrew et al. 2024 (max-over-iterates cosine). '
                              'DP-FTRL only — DP-SGD runs do not save in_scores_andrew_*.csv.')
+    parser.add_argument('--compare-tails', action='store_true',
+                        help='With --exp-dir: compare Gaussian, exact Model 1, and saved-score '
+                             'probabilities in the final DP-SGD checkpoint’s NDIS regions.')
     parser.add_argument('--independence', action='store_true',
                         help='With --exp-dir: render the canary-direction Gram matrix + '
                              'per-canary score density (independence diagnostic).')
@@ -964,6 +1071,15 @@ def main():
     parser.add_argument('--significance', type=float, default=0.05)
     parser.add_argument('--fig-dir', type=str, default=None)
     args = parser.parse_args()
+
+    if args.compare_tails:
+        if not args.exp_dir:
+            parser.error('--compare-tails requires --exp-dir')
+        try:
+            run_tail_comparison(args.exp_dir, args.delta, args.significance)
+        except (OSError, ValueError, KeyError) as e:
+            parser.error(str(e))
+        return
 
     if args.fig_dir is None:
         args.fig_dir = os.path.join(project_dir, 'fig')
