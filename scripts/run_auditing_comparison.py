@@ -4,7 +4,7 @@ Run all 3 auditing methods on saved whitebox scores and plot comparison.
 
 Methods:
   1. Steinke et al. 2023 (one-run, Theorem 5.2) — uses raw sum scores
-  2. Mahloujifar et al. 2024 (f-DP) — uses raw sum scores
+  2. Mahloujifar et al. 2025 (f-DP) — uses raw sum scores
   3. NDIS (normal distribution indistinguishability spectrum) — uses normalized scores
 
 Usage:
@@ -25,7 +25,10 @@ import math
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
-from canary_score_diagnostics import within_run_orthogonality_check
+from canary_score_diagnostics import (
+    dirac_canary_interference,
+    within_run_orthogonality_check,
+)
 
 _RC = {
     'font.family': 'DejaVu Sans',
@@ -54,7 +57,7 @@ _RC = {
 _STYLE = {
     'upper':   {'color': '#555555', 'marker': '',  'linestyle': (0, (3, 5, 1, 5)),  'linewidth': 1.4, 'markersize': 0,  'zorder': 1, 'label': 'Theoretical Upper Bound)'},
     'steinke': {'color': '#ff7f0e', 'marker': 'o', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 2, 'label': 'Steinke et al. 2023'},
-    'fdp':     {'color': '#2ca02c', 'marker': 's', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 3, 'label': 'Mahloujifar et al. 2024 (f-DP)'},
+    'fdp':     {'color': '#2ca02c', 'marker': 's', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 7,  'zorder': 3, 'label': 'Mahloujifar et al. 2025 (f-DP)'},
     'andrew':  {'color': '#9467bd', 'marker': '^', 'linestyle': '--',  'linewidth': 2.4, 'markersize': 8,  'zorder': 4, 'label': 'Andrew et al. 2024'},
     # NDIS lower-bound variants
     'ndis_parametric_bonferroni': {'color': '#02A1BA', 'marker': 'D', 'linestyle': '-', 'linewidth': 2.0, 'markersize': 6, 'zorder': 5, 'label': 'This paper'},
@@ -91,6 +94,44 @@ from whitebox_auditing.ndis_1d import (
     estimate_mean_variance, ndis_eps_lb, ndis_eps_lb_all,
     _ndis_eps_from_moments,
 )
+
+
+def print_run_config(exp_dir):
+    """One-line identification of the run being audited.
+
+    Experiment directories are named by database seed, so the path alone does
+    not say which hyperparameter cell a run belongs to. Print the fields that
+    define the cell (batch size, clipping norm, noise multiplier, steps) so a
+    sequence of --exp-dir invocations is self-labelling.
+    """
+    hparams_path = os.path.join(exp_dir, 'hparams.json')
+    if not os.path.isfile(hparams_path):
+        print(f"Run config: no hparams.json in {exp_dir}")
+        return
+    with open(hparams_path) as f:
+        hp = json.load(f)
+
+    fields = [
+        ('eps', 'epsilon', '{:g}'),
+        ('B', 'logical_batch_size', '{:d}'),
+        ('C', 'max_grad_norm', '{:g}'),
+        ('sigma', 'noise_multiplier', '{:.4f}'),
+        ('T', 'target_steps', '{:d}'),
+        ('K', 'aug_multiplicity', '{:d}'),
+        ('m', 'canary_count', '{:d}'),
+    ]
+    parts = []
+    for label, key, fmt in fields:
+        if hp.get(key) is not None:
+            parts.append(f"{label}={fmt.format(hp[key])}")
+    # Only present when the run was produced with --fault (see src/faults.py).
+    if hp.get('fault') not in (None, 'none'):
+        parts.append(f"fault={hp['fault']}")
+        if hp.get('eps_true') is not None:
+            parts.append(f"eps_true={hp['eps_true']:.2f}")
+
+    print(f"Run config: {', '.join(parts)}")
+    print(f"  dir: {exp_dir}")
 
 
 def _resolve_score_path(exp_dir, kind, side, epoch):
@@ -146,7 +187,7 @@ def audit_epoch(exp_dir, epoch, delta, significance, method=None, target_eps=Non
         all_out = ndis_eps_lb_all(
             in_ndis, out_ndis, delta=delta,
             alpha=significance, n_bootstrap=2000,
-            pool_variance=True,
+            pool_variance=False,
         )
         for m in NDIS_METHODS:
             if m in all_out:
@@ -208,6 +249,7 @@ def get_target_T(exp_dir):
 
 def run_single(exp_dir, delta, significance, fig_dir, with_andrew=False):
     """Original per-epoch line plot for a single experiment."""
+    print_run_config(exp_dir)
     epochs = sorted(set(
         int(f.split('_')[-1].replace('.csv', ''))
         for f in os.listdir(exp_dir)
@@ -294,6 +336,7 @@ def run_multi(exp_dirs, delta, significance, fig_dir, with_andrew=False):
             print(f"Warning: no score files in {exp_dir}, skipping")
             continue
 
+        print_run_config(exp_dir)
         result = audit_epoch(
             exp_dir, final_epoch, delta, significance, target_eps=target_eps,
             with_andrew=with_andrew,
@@ -309,14 +352,14 @@ def run_multi(exp_dirs, delta, significance, fig_dir, with_andrew=False):
         dirs_path = os.path.join(exp_dir, 'canary_directions.csv')
         if os.path.isfile(dirs_path):
             indices = np.loadtxt(dirs_path, delimiter=',', skiprows=1)
-            m = len(indices)
-            num_unique = len(np.unique(indices, axis=0))
-            collisions = m - num_unique
+            geometry = dirac_canary_interference(indices)
             ortho_results.append({
                 'target': target_eps,
-                'm': m,
-                'collisions': collisions,
-                'orthogonal': collisions == 0
+                'm': geometry['m'],
+                'collisions': geometry['collision_count'],
+                'orthogonal': geometry['collision_count'] == 0,
+                'mutual_coherence': geometry['mutual_coherence'],
+                'rms_offdiag': geometry['rms_offdiag'],
             })
         else:
             ortho_results.append(None)
@@ -347,12 +390,20 @@ def run_multi(exp_dirs, delta, significance, fig_dir, with_andrew=False):
         print("\n" + "="*60)
         print("CANARY INDEPENDENCE DIAGNOSTIC (DIRAC ORTHOGONALITY)")
         print("-" * 60)
-        print(f"{'Target Eps':>10} | {'Canaries (m)':>12} | {'Collisions':>10} | {'Status'}")
+        print(
+            f"{'Target Eps':>10} | {'Canaries (m)':>12} | {'Collisions':>10} | "
+            f"{'Coherence':>10} | {'RMS offdiag':>11} | Status"
+        )
         print("-" * 60)
         for res in ortho_results:
             if res:
                 status = "PASS (IID)" if res['orthogonal'] else "FAIL (CORRELATED)"
-                print(f"{res['target']:10.2f} | {res['m']:12d} | {res['collisions']:10d} | {status}")
+                print(
+                    f"{res['target']:10.2f} | {res['m']:12d} | "
+                    f"{res['collisions']:10d} | "
+                    f"{res['mutual_coherence']:10.3e} | "
+                    f"{res['rms_offdiag']:11.3e} | {status}"
+                )
         print("="*60)
         print("Note: Dirac canaries are perfectly orthogonal if collisions = 0.")
 
@@ -560,12 +611,10 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
             eps_f, _ = auditor._epsilon_one_run_all_thresholds(
                 significance, delta, True, None, use_fdp=True,
             )
-            tau = 1.05 * float(np.max(np.abs(np.concatenate([n_in_scores, n_out_scores]))))
             try:
                 ndis_out = ndis_eps_lb_all(
                     n_in_scores, n_out_scores, delta=delta,
                     alpha=significance, pool_variance=True,
-                    eps_theory=target_eps, score_clip=tau,
                 )
             except (ValueError, RuntimeError):
                 ndis_out = None
@@ -707,6 +756,13 @@ def run_independence(exp_dir, fig_dir, *, m_show=200, with_andrew=False):
     else:
         gram = (sub[:, 0:1] == sub[:, 0:1].T).astype(float)
 
+    geometry = dirac_canary_interference(coords)
+    print(
+        f"Dirac geometry (m={m_total}): "
+        f"collisions={geometry['collision_count']}, "
+        f"mutual_coherence={geometry['mutual_coherence']:.3e}, "
+        f"RMS_offdiag={geometry['rms_offdiag']:.3e}"
+    )
     diag_mask = np.eye(m_show, dtype=bool)
     off = gram[~diag_mask]
     print(
@@ -855,7 +911,7 @@ def run_gaussianity(exp_dir, fig_dir):
         ax.plot(zz, pdf, color='#cc4422', linewidth=2.4, linestyle='--', label=label_pred)
         ax.axvline(mean_pred, color='#cc4422', linewidth=1.2, linestyle=':', alpha=0.7)
         ax.set_xlim(x_lo, x_hi)
-        ax.set_xlabel('Score (NDIS scale)')
+        ax.set_xlabel('Normalized Scores')
         ax.set_ylabel('Density')
         ax.legend(loc='upper right', fontsize=14)
 

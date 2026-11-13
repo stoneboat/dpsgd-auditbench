@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=dpftrl_scatter
-#SBATCH --account=<account>
+#SBATCH --account=gts-vzikas3
 #SBATCH --partition=gpu-a100
 #SBATCH --gres=gpu:1
 #SBATCH --mem=40G
@@ -11,7 +11,7 @@
 
 # === Module and env setup ===
 module load anaconda3
-conda activate /storage/scratch1/6/aagrawal609/conda_envs/dpsgd_bench
+conda activate /storage/scratch1/6/aagrawal609/conda_envs/audit
 
 # One-time dependency install (kymatio for the scattering transform):
 #   pip install kymatio
@@ -19,11 +19,16 @@ conda activate /storage/scratch1/6/aagrawal609/conda_envs/dpsgd_bench
 # === Epsilon values (parity with DP-SGD / DP-FTRL-WRN sweeps) ===
 EPSILONS=(1 2 4 8)
 
+# Same seed as run_dpftrl_mf_phoenix.sbatch, so tree and MF share canary
+# coordinates, inclusion mask, model init and data order.
+DATABASE_SEED=277640617625635548156432291773894477542
+
 if [ $SLURM_ARRAY_TASK_ID -lt 4 ]; then
     # Tasks 0, 1, 2, 3 handle the actual audit sweep
     EPS=${EPSILONS[$SLURM_ARRAY_TASK_ID]}
     echo "Running Audit for Epsilon: $EPS"
     python scripts/gen_scores_DP_FTRL_scatter.py \
+        --database-seed ${DATABASE_SEED} \
         --target-steps 128 \
         --logical-batch-size 380 \
         --max-physical-batch-size 390 \
@@ -39,6 +44,7 @@ else
     # Task 4 handles the baseline only
     echo "Running Baseline (Canary Count 0)"
     python scripts/gen_scores_DP_FTRL_scatter.py \
+    --database-seed ${DATABASE_SEED} \
     --target-steps 128 \
     --logical-batch-size 390 \
     --max-physical-batch-size 390 \

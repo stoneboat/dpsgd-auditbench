@@ -47,9 +47,8 @@ def _log_grad_sample_norms(optimizer):
 
 
 _PER_IMAGE_AUG = transforms_v2.Compose([
-    transforms_v2.RandomCrop(32, padding=20, padding_mode='reflect'),
-    transforms_v2.RandomHorizontalFlip(p=0.5),
-    transforms_v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+    transforms_v2.RandomCrop(32, padding=4, padding_mode='reflect'),
+    transforms_v2.RandomHorizontalFlip(p=0.5)
 ])
 
 
@@ -110,6 +109,9 @@ def _whitebox_dp_step(
     scores,
     include_flags,
     canary_dirac,
+    clip_norms=None,
+    normalize_update=False,
+    probe=None,
 ):
     if not hasattr(optimizer, "clip_and_accumulate"):
         return optimizer.step()
@@ -124,6 +126,10 @@ def _whitebox_dp_step(
         if _grad_norm_call_count[0] % _GRAD_NORM_LOG_EVERY == 1:
             _log_grad_sample_norms(optimizer)
 
+    # Diagnostic hook: grad_samples are alive and unclipped only here.
+    if probe is not None:
+        probe.observe(optimizer)
+
     optimizer.clip_and_accumulate()
 
     if hasattr(optimizer, "_check_skip_next_step") and optimizer._check_skip_next_step():
@@ -131,6 +137,13 @@ def _whitebox_dp_step(
         return None
 
     optimizer._is_last_step_skipped = False
+
+    # C_t for this step; read before update_max_grad_norm() moves it.
+    step_clip_norm = float(optimizer.max_grad_norm)
+    if canary_scale is None:
+        canary_scale = step_clip_norm  # adaptive: inject at the live bound
+    if clip_norms is not None:
+        clip_norms.append(step_clip_norm)
 
     include_mask = None
     if canary_dirac is not None and canary_prob is not None and canary_prob > 0.0:
@@ -185,8 +198,22 @@ def _whitebox_dp_step(
             include_flags.append(include_mask.detach().cpu().tolist())
 
     optimizer.scale_grad()
+
+    # Normalized-scale adaptive clipping (Bu et al. 2023, "Automatic Clipping"):
+    if normalize_update:
+        for p in optimizer.params:
+            if p.grad is not None:
+                p.grad /= step_clip_norm
+
     if optimizer.step_hook:
         optimizer.step_hook(optimizer)
+
+    # Only reachable from AdaClip's pre_step(), which this path replaces.
+    if hasattr(optimizer, "update_max_grad_norm"):
+        optimizer.update_max_grad_norm()
+
+    if probe is not None:
+        probe.end_step(optimizer)
 
     return optimizer.original_optimizer.step()
 
@@ -255,7 +282,7 @@ def train(model, optimizer, train_loader, device, epoch, aug_multiplicity, max_p
             outputs = model(aug_images)
             loss_per_sample = criterion(outputs, aug_labels)
 
-            loss = loss_per_sample.mean() * aug_multiplicity
+            loss = loss_per_sample.mean()
             loss.backward()
             
             # --- GRADIENT REDUCTION (B*K -> B) ---
@@ -312,10 +339,13 @@ def train_whitebox(
     canary_scale=None,
     return_scores=False,
     return_include_flags=False,
+    return_clip_norms=False,
+    adaptive_clipping=False,
     ema_model=None,
     ema_decay=0.9999,
     ema_step_offset=0,
     max_logical_steps=None,
+    probe=None,
 ):
     """Training function for auditing in whitebox model.
 
@@ -325,6 +355,17 @@ def train_whitebox(
         If None, all canaries are injected (legacy behavior).
     canary_prob: probability q of injecting the canary per logical step.
     canary_scale: magnitude (mu) of the canary; defaults to optimizer.max_grad_norm.
+        Must be None when adaptive_clipping=True.
+    adaptive_clipping: inject at the live C_t and drive update_max_grad_norm().
+        Scores come back unnormalized; divide by clip_norms for the C=1 observation.
+        Model updates are divided by C_t (Bu et al. 2023 normalized-scale convention),
+        so lr stays in the C=1 units the fixed arm was tuned in.
+    return_clip_norms: also return the per-step C_t trajectory.
+    probe: optional diagnostic object with begin_step(model) / observe(optimizer) /
+        end_step(optimizer). begin_step runs at the top of each logical step (before
+        the batch forward), observe on every physical batch while grad_samples are
+        still unclipped, end_step once the logical step actually fires. No-op when None;
+        it must not mutate optimizer state.
     """
     model.train()
     criterion = nn.CrossEntropyLoss(reduction='none') 
@@ -332,6 +373,7 @@ def train_whitebox(
 
     scores = [] if return_scores else None
     include_flags = [] if return_include_flags else None
+    clip_norms = [] if return_clip_norms else None
     canary_dirac = None
     if canary_dirac_indices is not None:
         by_param = {}
@@ -377,10 +419,15 @@ def train_whitebox(
 
     if canary_prob is None:
         canary_prob = 1.0 / max(1, len(train_loader))
-    if canary_scale is None and hasattr(optimizer, "max_grad_norm"):
-        canary_scale = float(optimizer.max_grad_norm)
-    if canary_scale is None:
-        canary_scale = 1.0
+    if adaptive_clipping:
+        # left unresolved so each step injects at its own C_t
+        if canary_scale is not None:
+            raise ValueError("canary_scale must be None when adaptive_clipping=True")
+    else:
+        if canary_scale is None and hasattr(optimizer, "max_grad_norm"):
+            canary_scale = float(optimizer.max_grad_norm)
+        if canary_scale is None:
+            canary_scale = 1.0
     
     # Augmentation transform
     # Sander et al. (2023) / Mahloujifar et al. (2024) augmentation recipe.
@@ -404,7 +451,12 @@ def train_whitebox(
         
         num_logical_steps = 0  # Count logical batches, not physical batches
         samples_in_current_logical_batch = 0  # Track samples processed in current logical batch
+        new_logical_step = True  # this physical batch opens a new logical step
         for i, (images, labels) in enumerate(pbar):
+            # Diagnostic hook: theta_{t-1} is current and grads are clean here.
+            if probe is not None and new_logical_step:
+                probe.begin_step(model)
+
             # images shape: [B, 3, 32, 32] (Physical Batch)
             
             # --- AUGMENTATION MULTIPLICITY LOGIC ---
@@ -430,7 +482,7 @@ def train_whitebox(
             outputs = model(aug_images)
             loss_per_sample = criterion(outputs, aug_labels)
 
-            loss = loss_per_sample.mean() * aug_multiplicity
+            loss = loss_per_sample.mean()
             loss.backward()
             
             # --- GRADIENT REDUCTION (B*K -> B) ---
@@ -459,8 +511,13 @@ def train_whitebox(
                 scores=scores,
                 include_flags=include_flags,
                 canary_dirac=canary_dirac,
+                clip_norms=clip_norms,
+                normalize_update=adaptive_clipping,
+                probe=probe,
             )
-            
+            # A skipped step means the logical batch is still filling up.
+            new_logical_step = not getattr(optimizer, "_is_last_step_skipped", False)
+
             # Track samples processed for logical batch counting
             # images.shape[0] is the physical batch size (before augmentation)
             physical_batch_size = images.shape[0]
@@ -491,9 +548,12 @@ def train_whitebox(
 
     if return_scores:
         num_logical_steps = len(scores)
+        out = [np.mean(losses), num_logical_steps, scores]
         if return_include_flags:
-            return np.mean(losses), num_logical_steps, scores, include_flags
-        return np.mean(losses), num_logical_steps, scores
+            out.append(include_flags)
+        if return_clip_norms:
+            out.append(clip_norms)
+        return tuple(out)
     return np.mean(losses), num_logical_steps
 
 

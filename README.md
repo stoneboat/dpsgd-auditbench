@@ -116,7 +116,7 @@ python scripts/gen_scores_DP_FTRL_scatter.py \
     --data-dir ./data --log-dir ./logs
 ```
 
-Produces `exp_dir = ./data/dpftrl-scatter-canaries-<seed>-5000-0.5-cifar10/` with
+Produces `exp_dir = ./data/dpftrl-scatter-canaries-<seed>-5000-0.5-cifar10[-<mechanism>]-eps<eps>/` with
 `in_scores_optimal_*.csv`, `out_scores_optimal_*.csv`, `in_scores_ndis_*.csv`, `out_scores_ndis_*.csv`,
 `in_scores_andrew_*.csv`, `out_scores_andrew_*.csv`, plus `hparams.json` / `inclusion_mask.csv` / `canary_coords.csv` / `canary_leaves.csv`.
 
