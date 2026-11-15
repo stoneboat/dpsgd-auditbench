@@ -18,17 +18,31 @@ Usage:
   python scripts/run_auditing_comparison.py --complexity --exp-dir ./data/mislabeled-canaries-<seed>-5000-0.5-cifar10
 """
 
-import sys
-import os
+import argparse
 import json
 import math
-import argparse
-import numpy as np
+import os
+import re
+import sys
+
 import matplotlib.pyplot as plt
-from canary_score_diagnostics import (
-    dirac_canary_interference,
-    within_run_orthogonality_check,
+import numpy as np
+from scipy.optimize import brentq
+from scipy.stats import chi2
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_dir = os.path.abspath(os.path.join(script_dir, '..'))
+src_dir = os.path.join(project_dir, 'src')
+sys.path.append(src_dir)
+
+from auditing import CanaryScoreAuditor
+from canary_score_diagnostics import dirac_canary_interference
+from whitebox_auditing.ndis_1d import (
+    _log_delta_two_gaussians_one_direction,
+    _ndis_eps_from_moments,
+    ndis_eps_lb_all,
 )
+from whitebox_auditing.tree_mechanism import num_levels
 
 _RC = {
     'font.family': 'DejaVu Sans',
@@ -81,19 +95,6 @@ def _plot_method(ax, x, y, key, label_override=None):
             linewidth=s['linewidth'], markersize=s['markersize'],
             label=label, zorder=s['zorder'],
             markerfacecolor=s['color'], markeredgecolor='white', markeredgewidth=0.6)
-
-
-script_dir = os.path.dirname(os.path.abspath(__file__))
-project_dir = os.path.abspath(os.path.join(script_dir, '..'))
-src_dir = os.path.join(project_dir, 'src')
-sys.path.append(src_dir)
-
-from auditing import CanaryScoreAuditor
-from whitebox_auditing.ndis_1d import (
-    ndis_eps_from_delta_1d_brentq,
-    estimate_mean_variance, ndis_eps_lb, ndis_eps_lb_all,
-    _ndis_eps_from_moments,
-)
 
 
 def print_run_config(exp_dir):
@@ -860,7 +861,6 @@ def run_gaussianity(exp_dir, fig_dir):
 
     if 'sigma_node' in hp:
         # DP-FTRL: deterministic single-leaf injection -> sqrt(L) * C mean.
-        from whitebox_auditing.tree_mechanism import num_levels
         sigma_pred = float(hp['sigma_node'])
         T = int(hp['target_steps'])
         C = float(hp.get('max_grad_norm', 1.0))
@@ -942,108 +942,96 @@ def run_gaussianity(exp_dir, fig_dir):
     print(f"Saved Gaussianity diagnostics to: {base}_{{in,out}}.{{png,pdf}}")
 
 
-def _gaussian_lr_regions(first, second, eps):
-    """Intervals where the first Gaussian density exceeds exp(eps) times the second."""
-    mu1, sd1 = first
-    mu2, sd2 = second
-    a = 0.5 * (sd2**-2 - sd1**-2)
-    b = mu1 / sd1**2 - mu2 / sd2**2
-    c = 0.5 * ((mu2 / sd2)**2 - (mu1 / sd1)**2) + math.log(sd2 / sd1) - eps
-    if abs(a) < 1e-12:
-        if abs(b) < 1e-12:
-            return [(-np.inf, np.inf)] if c > 0 else []
-        cutoff = -c / b
-        return [(cutoff, np.inf)] if b > 0 else [(-np.inf, cutoff)]
-    discriminant = b * b - 4 * a * c
-    if discriminant < 0:
-        return [(-np.inf, np.inf)] if a > 0 else []
-    root = -0.5 * (b + math.copysign(math.sqrt(discriminant), b))
-    left, right = sorted((root / a, c / root)) if root else (0.0, 0.0)
-    return [(-np.inf, left), (right, np.inf)] if a > 0 else [(left, right)]
+def _invert_corrected_ndis(mean_in, std_in, std_out, delta, cdf_error):
+    log_delta = math.log(delta)
+    log_penalty = math.log(2 * cdf_error) if cdf_error > 0 else -math.inf
+    log_forward_target = np.logaddexp(log_delta, log_penalty)
+
+    def margin(eps):
+        forward = _log_delta_two_gaussians_one_direction(mean_in, std_in, 0.0, std_out, eps)
+        reverse = _log_delta_two_gaussians_one_direction(0.0, std_out, mean_in, std_in, eps)
+        log_reverse_target = np.logaddexp(log_delta, eps + log_penalty)
+        return max(forward - log_forward_target, reverse - log_reverse_target)
+
+    if margin(0.0) <= 0:
+        return 0.0
+    upper = 1.0
+    while margin(upper) > 0:
+        upper *= 2
+    return brentq(margin, 0.0, upper)
 
 
-def run_tail_comparison(exp_dir, delta, significance):
-    """Compare finite-T Model 1 and saved scores on the regions used by NDIS."""
-    from scipy.stats import binom, norm
+def run_finite_t_ndis(exp_dir, delta, significance, steps=None):
+    if not 0 < delta < 1 or not 0 < significance < 1:
+        raise ValueError('finite-T NDIS requires delta and significance in (0, 1)')
+    if steps is not None and steps < 1:
+        raise ValueError('--steps must be positive')
 
-    epoch = get_final_epoch(exp_dir)
-    with open(os.path.join(exp_dir, 'hparams.json')) as f:
-        hp = json.load(f)
-    if epoch is None or 'noise_multiplier' not in hp or 'sigma_node' in hp:
-        raise ValueError('tail comparison requires saved DP-SGD scores and noise metadata')
-
-    scores = [
-        np.atleast_1d(np.loadtxt(os.path.join(exp_dir, f'{side}_scores_ndis_{epoch:06d}.csv'), delimiter=','))
+    epochs = [int(match[1]) for name in os.listdir(exp_dir) if (match := re.fullmatch(r'in_scores_ndis_(\d+)\.csv', name))]
+    if not epochs:
+        raise ValueError('no saved IN NDIS scores found')
+    epoch = max(epochs)
+    if os.path.isfile(os.path.join(exp_dir, f'in_scores_andrew_{epoch:06d}.csv')):
+        raise ValueError('finite-T NDIS requires normalized DP-SGD Dirac scores')
+    in_scores, out_scores = [
+        np.loadtxt(os.path.join(exp_dir, f'{side}_scores_ndis_{epoch:06d}.csv'), delimiter=',', ndmin=1)
         for side in ('in', 'out')
     ]
-    if any(s.ndim != 1 or s.size < 2 or not np.isfinite(s).all() for s in scores):
+    if any(scores.ndim != 1 or scores.size < 2 or not np.isfinite(scores).all() for scores in (in_scores, out_scores)):
         raise ValueError('each NDIS score file must contain at least two finite scores')
-    in_sum = np.loadtxt(_resolve_score_path(exp_dir, 'sum', 'in', epoch), delimiter=',')
-    # The generator saves both the sum and the same sum divided by sqrt(T).
-    largest = np.argmax(np.abs(scores[0]))
-    if in_sum.shape != scores[0].shape or scores[0][largest] == 0:
-        raise ValueError('cannot recover the checkpoint step count from the saved IN scores')
-    steps = round((in_sum[largest] / scores[0][largest])**2)
-    if steps <= 0 or not np.allclose(in_sum, scores[0] * math.sqrt(steps), rtol=1e-6, atol=1e-10):
-        raise ValueError('the saved IN sum and NDIS scores disagree on the checkpoint step count')
 
-    # Legacy CIFAR-10 runs used 1 / len(train_loader) with drop_last=True.
-    q = hp.get('canary_prob_used')
-    q_source = 'saved canary rate'
-    if q is None:
-        batches = hp.get('train_set_size', 50000) // hp['logical_batch_size']
-        if batches < 1:
-            raise ValueError('cannot infer the canary rate from the batch and dataset sizes')
-        q = 1 / batches
-        q_source = 'legacy loader rate inferred from batch and dataset sizes'
-    sigma = hp.get('noise_multiplier_used', hp['noise_multiplier'])
-    if not 0 <= q <= 1 or sigma <= 0:
-        raise ValueError('invalid Model 1 canary rate or noise multiplier')
+    sum_path = os.path.join(exp_dir, f'in_scores_sum_{epoch:06d}.csv')
+    if os.path.isfile(sum_path):
+        in_sum = np.loadtxt(sum_path, delimiter=',', ndmin=1)
+        if in_sum.shape != in_scores.shape or not np.isfinite(in_sum).all():
+            raise ValueError('saved IN sum and NDIS scores must have matching shapes and finite values')
+        if steps is None:
+            largest = np.argmax(np.abs(in_scores))
+            if in_scores[largest] == 0:
+                raise ValueError('pass --steps when the IN scores are all zero')
+            steps = round((in_sum[largest] / in_scores[largest])**2)
+        if steps < 1 or not np.allclose(in_sum, in_scores * math.sqrt(steps), rtol=1e-6, atol=1e-10):
+            raise ValueError('the saved IN sum and NDIS scores disagree with the checkpoint step count')
+    elif steps is None:
+        raise ValueError('pass --steps when the saved IN sum scores are unavailable')
 
-    result = ndis_eps_lb_all(
-        *scores, delta=delta, alpha=significance, n_bootstrap=2000,
-        pool_variance=False, rng=np.random.default_rng(2), methods=('bootstrap_ellipsoid',),
-    )['bootstrap_ellipsoid']
-    eps = result['eps_lb']
-    fitted = result['theta_min'].reshape(2, 2)
-    factor = math.exp(eps)
+    sample_in_mean = in_scores.mean()
+    in_residuals = in_scores - sample_in_mean
+    out_squares = np.dot(out_scores, out_scores)
+    joint_squares = out_squares + np.dot(in_residuals, in_residuals)
+    noise_alpha = significance / 4
+    out_variance_upper = out_squares / chi2.ppf(noise_alpha, out_scores.size)
+    joint_variance_upper = joint_squares / chi2.ppf(noise_alpha, out_scores.size + in_scores.size - 1)
+    sigma_upper = math.sqrt(min(out_variance_upper, joint_variance_upper))
+    if not math.isfinite(sigma_upper) or sigma_upper <= 0:
+        raise ValueError('OUT scores must give a finite, positive upper noise bound')
+    radius = math.sqrt(2 * (sigma_upper**2 + 0.25) * math.log(2 / significance) / in_scores.size)
+    q_lower = float(np.clip((sample_in_mean - radius) / math.sqrt(steps), 0, 1))
+    hit_variance = q_lower * (1 - q_lower)
+    skewness_term = hit_variance * abs(1 - 2 * q_lower) / (6 * sigma_upper**3 * math.sqrt(2 * math.pi * steps))
+    remainder = hit_variance / (12 * math.pi * sigma_upper**4 * steps)
+    cdf_error = min(1.0, skewness_term + remainder)
 
-    # Saved NDIS scores sum gradients divided by their per-step clipping bounds.
-    # In those units each sampled canary adds 1 before the final sqrt(T) normalization.
-    hits = np.arange(steps + 1)
-    weights = binom.pmf(hits, steps, q)
-    shifts = hits / math.sqrt(steps)
-    model_mean = q * math.sqrt(steps)
-    model_sd = math.sqrt(sigma**2 + q * (1 - q))
-
-    print(f'Checkpoint {epoch}, T={steps}, q={q:.6g} ({q_source}), sigma={sigma:.6g}')
-    print(f'Gaussian NDIS epsilon={eps:.6f}, delta={delta:g}')
-    print('Regions come from the fitted Gaussians. Model 1 rows use the run settings.')
-    for direction, first, second in [('IN vs OUT', 0, 1), ('OUT vs IN', 1, 0)]:
-        regions = _gaussian_lr_regions(fitted[first], fitted[second], eps)
-
-        def mass(mean, sd):
-            prob = np.zeros_like(mean, dtype=float)
-            for left, right in regions:
-                lo, hi = (left - mean) / sd, (right - mean) / sd
-                prob += np.where(lo > 0, norm.sf(lo) - norm.sf(hi), norm.cdf(hi) - norm.cdf(lo))
-            return prob
-
-        gaussian = (mass(model_mean, model_sd), mass(0.0, sigma))
-        mixture = (np.dot(weights, mass(shifts, sigma)), gaussian[1])
-        counts = [sum(np.count_nonzero((s > left) & (s < right)) for left, right in regions) for s in scores]
-        empirical = [count / s.size for count, s in zip(counts, scores)]
-        print(f'\n{direction}, regions={regions}')
-        fitted_gap = mass(*fitted[first]) - factor * mass(*fitted[second])
-        print(f'Gap under the fitted NDIS Gaussians: {fitted_gap:.7g}')
-        print(f"{'Source':<23} {'IN probability':>15} {'OUT probability':>15} {'Privacy gap':>15}")
-        for label, probs in [('Model 1 Gaussian', gaussian), ('Model 1 exact mixture', mixture), ('Saved scores', empirical)]:
-            gap = probs[first] - factor * probs[second]
-            print(f'{label:<23} {probs[0]:>15.7g} {probs[1]:>15.7g} {gap:>15.7g}')
-        in_error = gaussian[0] - mixture[0]
-        gap_error = in_error if first == 0 else -factor * in_error
-        print(f'Gaussian minus mixture: IN probability {in_error:+.3e}, privacy gap {gap_error:+.3e}')
-        print(f'Saved scores in region: IN {counts[0]}/{scores[0].size}, OUT {counts[1]}/{scores[1].size}')
+    mean_in = q_lower * math.sqrt(steps)
+    std_in = math.sqrt(sigma_upper**2 + hit_variance)
+    uncorrected = _invert_corrected_ndis(mean_in, std_in, sigma_upper, delta, 0.0)
+    corrected = _invert_corrected_ndis(mean_in, std_in, sigma_upper, delta, cdf_error)
+    print(f'Checkpoint {epoch}, T={steps}, delta={delta:g}, confidence={1 - significance:.1%}')
+    print(f'q_lower={q_lower:.6g}, sigma_upper={sigma_upper:.6g}, IN CDF error bound={cdf_error:.6g}')
+    print(f'Model 1 Gaussian stds at the limits  IN={std_in:.6g}, OUT={sigma_upper:.6g}')
+    print(f'NDIS epsilon at confidence limits before correction={uncorrected:.6f}, after correction={corrected:.6f}')
+    reported = corrected
+    try:
+        result = ndis_eps_lb_all(
+            in_scores, out_scores, delta=delta, alpha=significance, rng=np.random.default_rng(2), methods=('bootstrap_ellipsoid',),
+        )['bootstrap_ellipsoid']
+        bootstrap = result['eps_lb']
+        _, fitted_in_std, _, fitted_out_std = result['theta_hat']
+        print(f'Bootstrap NDIS epsilon={bootstrap:.6f}, fitted IN std={fitted_in_std:.6g}, fitted OUT std={fitted_out_std:.6g}')
+        reported = min(bootstrap, corrected)
+    except (ValueError, RuntimeError) as error:
+        print(f'Bootstrap NDIS unavailable: {error}')
+    print(f'Finite-T NDIS epsilon lower bound under Model 1={reported:.6f}')
 
 
 def main():
@@ -1057,8 +1045,8 @@ def main():
                         help='Include Andrew et al. 2024 (max-over-iterates cosine). '
                              'DP-FTRL only — DP-SGD runs do not save in_scores_andrew_*.csv.')
     parser.add_argument('--compare-tails', action='store_true',
-                        help='With --exp-dir: compare Gaussian, exact Model 1, and saved-score '
-                             'probabilities in the final DP-SGD checkpoint’s NDIS regions.')
+                        help='Compare bootstrap and finite-T NDIS on normalized DP-SGD Dirac scores. Requires --exp-dir.')
+    parser.add_argument('--steps', type=int, help='Checkpoint step count for --compare-tails. Defaults to the count inferred from the saved IN sum.')
     parser.add_argument('--independence', action='store_true',
                         help='With --exp-dir: render the canary-direction Gram matrix + '
                              'per-canary score density (independence diagnostic).')
@@ -1076,8 +1064,8 @@ def main():
         if not args.exp_dir:
             parser.error('--compare-tails requires --exp-dir')
         try:
-            run_tail_comparison(args.exp_dir, args.delta, args.significance)
-        except (OSError, ValueError, KeyError) as e:
+            run_finite_t_ndis(args.exp_dir, args.delta, args.significance, args.steps)
+        except (OSError, ValueError) as e:
             parser.error(str(e))
         return
 
