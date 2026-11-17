@@ -28,9 +28,6 @@ import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.optimize import brentq
-from scipy.special import ndtr
-from scipy.stats import binom, chi2
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_dir = os.path.abspath(os.path.join(script_dir, '..'))
@@ -40,9 +37,9 @@ sys.path.append(src_dir)
 from auditing import CanaryScoreAuditor
 from canary_score_diagnostics import dirac_canary_interference
 from whitebox_auditing.ndis_1d import (
-    _log_delta_two_gaussians_one_direction,
     _ndis_eps_from_moments,
     ndis_eps_lb_all,
+    ndis_eps_lb_parametric_bonferroni,
 )
 from whitebox_auditing.tree_mechanism import num_levels
 
@@ -162,7 +159,7 @@ def _audit_thresholds(in_sum, out_sum, delta, significance):
 
 
 def audit_epoch(exp_dir, epoch, delta, significance, method=None, target_eps=None,
-                with_andrew=False, *, correct_bootstrap=False, steps=None, noise_multiplier_floor=None):
+                with_andrew=False, *, steps=None, noise_multiplier_floor=None):
     in_sum_path = _resolve_score_path(exp_dir, 'sum', 'in', epoch)
     out_sum_path = _resolve_score_path(exp_dir, 'sum', 'out', epoch)
     in_ndis_path = os.path.join(exp_dir, f'in_scores_ndis_{epoch:06d}.csv')
@@ -177,7 +174,7 @@ def audit_epoch(exp_dir, epoch, delta, significance, method=None, target_eps=Non
 
     in_sum = np.loadtxt(in_sum_path, delimiter=',')
     out_sum = np.loadtxt(out_sum_path, delimiter=',')
-    if correct_bootstrap:
+    if noise_multiplier_floor is not None:
         _, steps, in_ndis, out_ndis = _load_finite_t_scores(exp_dir, steps, epoch=epoch)
     else:
         in_ndis = np.loadtxt(in_ndis_path, delimiter=',')
@@ -194,7 +191,7 @@ def audit_epoch(exp_dir, epoch, delta, significance, method=None, target_eps=Non
         eps_upper = float('nan')
 
     out = {'upper': eps_upper, **_audit_thresholds(in_sum, out_sum, delta, significance)}
-    if correct_bootstrap:
+    if noise_multiplier_floor is not None:
         correction_r = _gaussian_correction_for_noise_floor(steps, noise_multiplier_floor)
         out['correction'] = _corrected_bootstrap(
             in_ndis, out_ndis, steps, delta, significance, include_bonferroni=True, correction_r=correction_r,
@@ -959,25 +956,6 @@ def run_gaussianity(exp_dir, fig_dir):
     print(f"Saved Gaussianity diagnostics to: {base}_{{in,out}}.{{png,pdf}}")
 
 
-def _invert_corrected_ndis(mean_in, std_in, std_out, delta, cdf_error):
-    log_delta = math.log(delta)
-    log_penalty = math.log(2 * cdf_error) if cdf_error > 0 else -math.inf
-    log_forward_target = np.logaddexp(log_delta, log_penalty)
-
-    def margin(eps):
-        forward = _log_delta_two_gaussians_one_direction(mean_in, std_in, 0.0, std_out, eps)
-        reverse = _log_delta_two_gaussians_one_direction(0.0, std_out, mean_in, std_in, eps)
-        log_reverse_target = np.logaddexp(log_delta, eps + log_penalty)
-        return max(forward - log_forward_target, reverse - log_reverse_target)
-
-    if margin(0.0) <= 0:
-        return 0.0
-    upper = 1.0
-    while margin(upper) > 0:
-        upper *= 2
-    return brentq(margin, 0.0, upper)
-
-
 def _load_finite_t_scores(exp_dir, steps, *, epoch=None):
     if steps is not None and steps < 1:
         raise ValueError('--steps must be positive')
@@ -1015,159 +993,24 @@ def _load_finite_t_scores(exp_dir, steps, *, epoch=None):
     return epoch, steps, in_scores, out_scores
 
 
-def _model1_hit_distribution(steps, q):
-    first = int(binom.ppf(1e-12, steps, q))
-    last = int(binom.isf(1e-12, steps, q))
-    counts = np.arange(first, last + 1)
-    tail_mass = binom.cdf(first - 1, steps, q) + binom.sf(last, steps, q)
-    return counts / math.sqrt(steps), binom.pmf(counts, steps, q), tail_mass
-
-
-def _finite_t_comparison_pairs(in_scores, steps, significance, sigma_lower, sigma_upper):
-    scores = np.sort(in_scores)
-    ranks = np.linspace(0, scores.size - 1, min(41, scores.size), dtype=int)
-    thresholds = np.unique(scores[ranks])
-    radius = math.sqrt((math.log(4) - math.log(significance)) / (2 * scores.size))
-    cdf_lower = np.searchsorted(scores, thresholds, side='right') / scores.size - radius
-    cdf_upper = np.searchsorted(scores, thresholds, side='left') / scores.size + radius
-    z_lower, z_upper = np.sort(thresholds / np.array([sigma_lower, sigma_upper])[:, None], axis=0)
-    q_edges = np.r_[0.0, np.geomspace(1 / (16 * steps), 1.0, 401)]
-    noise_cdf = ndtr(z_lower)
-    ratio_search_upper = max(1.0, z_lower.max() + 8) * math.sqrt(steps)
-    tolerance = 1e-12
-
-    def cdf(z, ratio, hit_distribution):
-        hits, weights, _ = hit_distribution
-        return ndtr(z[:, None] - ratio * hits) @ weights
-
-    lower_hits = _model1_hit_distribution(steps, 0)
-    for q_lower, q_upper in zip(q_edges[:-1], q_edges[1:]):
-        upper_hits = _model1_hit_distribution(steps, q_upper)
-        if np.all(binom.pmf(0, steps, q_upper) * noise_cdf <= cdf_upper + tolerance):
-            ratio_lower, upper = 0.0, ratio_search_upper
-            for _ in range(30):
-                ratio = (ratio_lower + upper) / 2
-                if np.any(cdf(z_lower, ratio, upper_hits) > cdf_upper + tolerance):
-                    ratio_lower = ratio
-                else:
-                    upper = ratio
-            if np.all(cdf(z_upper, ratio_lower, lower_hits) + lower_hits[2] + tolerance >= cdf_lower):
-                yield q_lower, ratio_lower
-        lower_hits = upper_hits
-
-
-def _model1_gaussian_comparison(q, hit_to_noise, steps):
-    hit_variance = q * (1 - q) * hit_to_noise**2
-    skewness_term = hit_variance * abs(1 - 2 * q) * hit_to_noise / (6 * math.sqrt(2 * math.pi * steps))
-    remainder = hit_variance * hit_to_noise**2 / (12 * math.pi * steps)
-    return q * hit_to_noise * math.sqrt(steps), math.sqrt(1 + hit_variance), min(1.0, skewness_term + remainder)
-
-
-def _finite_t_unit_hit_bound(in_scores, out_scores, steps, delta, significance):
-    out_squares = np.dot(out_scores, out_scores)
-    sigma_upper = math.sqrt(out_squares / chi2.ppf(significance / 2, out_scores.size))
-    radius = math.sqrt(2 * (sigma_upper**2 + 0.25) * math.log(2 / significance) / in_scores.size)
-    q_lower = float(np.clip((in_scores.mean() - radius) / math.sqrt(steps), 0, 1))
-    mean_in, std_in, cdf_error = _model1_gaussian_comparison(q_lower, 1 / sigma_upper, steps)
-    return _invert_corrected_ndis(mean_in, std_in, 1.0, delta, cdf_error)
-
-
-def _finite_t_ndis_estimates(in_scores, out_scores, steps, delta, significance):
-    if not 0 < delta < 1 or not 0 < significance < 1:
-        raise ValueError('finite-T NDIS requires delta and significance in (0, 1)')
-    sample_in_mean = in_scores.mean()
-    out_squares = np.dot(out_scores, out_scores)
-    sigma_lower = math.sqrt(out_squares / chi2.isf(significance / 4, out_scores.size))
-    sigma_upper = math.sqrt(out_squares / chi2.ppf(significance / 4, out_scores.size))
-    if not 0 < sigma_lower <= sigma_upper < math.inf:
-        raise ValueError('OUT scores must give a finite, positive noise interval')
-
-    comparisons = []
-    for q, hit_to_noise in _finite_t_comparison_pairs(in_scores, steps, significance, sigma_lower, sigma_upper):
-        mean_in, std_in, cdf_error = _model1_gaussian_comparison(q, hit_to_noise, steps)
-        corrected = _invert_corrected_ndis(mean_in, std_in, 1.0, delta, cdf_error)
-        uncorrected = _invert_corrected_ndis(mean_in, std_in, 1.0, delta, 0.0)
-        comparisons.append((corrected, uncorrected, q, hit_to_noise, cdf_error, mean_in, std_in))
-
-    corrected, _, comparison_q, hit_to_noise, cdf_error, mean_in, std_in = min(
-        comparisons, default=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
-    )
-    return {
-        'T': steps, 'delta': delta, 'alpha': significance, 'confidence': 1 - significance,
-        'n_in': in_scores.size, 'n_out': out_scores.size, 'm': in_scores.size + out_scores.size,
-        'q_lower': min((row[2] for row in comparisons), default=0.0),
-        'sigma_lower': sigma_lower, 'sigma_upper': sigma_upper, 'retained_q_intervals': len(comparisons),
-        'comparison_q': comparison_q, 'comparison_hit_to_noise': hit_to_noise,
-        'in_cdf_error_bound': cdf_error,
-        'model1_mean_in': mean_in * sigma_upper, 'model1_std_in': std_in * sigma_upper, 'model1_std_out': sigma_upper,
-        'fitted_mean_in': sample_in_mean, 'fitted_mean_out': out_scores.mean(),
-        'fitted_std_in': in_scores.std(ddof=1), 'fitted_std_out': out_scores.std(ddof=1),
-        'model1_eps_before_correction': min((row[1] for row in comparisons), default=0.0),
-        'model1_eps_corrected': corrected,
-    }
-
-
-def run_finite_t_ndis(exp_dir, delta, significance, steps=None):
-    epoch, steps, in_scores, out_scores = _load_finite_t_scores(exp_dir, steps)
-    estimates = _finite_t_ndis_estimates(in_scores, out_scores, steps, delta, significance)
-    print(f'Checkpoint {epoch}, T={steps}, delta={delta:g}, confidence={1 - significance:.1%}')
-    print('Unknown C and q: OUT noise interval=[{sigma_lower:.6g}, {sigma_upper:.6g}], retained q intervals={retained_q_intervals}'.format(**estimates))
-    print('Limiting comparison pair: q={comparison_q:.6g}, C/sigma={comparison_hit_to_noise:.6g}, uniform IN CDF bound={in_cdf_error_bound:.6g}'.format(**estimates))
-    print('Comparison Gaussian stds  IN={model1_std_in:.6g}, OUT={model1_std_out:.6g}'.format(**estimates))
-    print('Minimum NDIS epsilon across comparison pairs with Gaussian scores={model1_eps_before_correction:.6f}, '
-          'with uniform correction={model1_eps_corrected:.6f}'.format(**estimates))
-    print('Fitted Gaussian stds  IN={fitted_std_in:.6g}, OUT={fitted_std_out:.6g}'.format(**estimates))
-    bootstrap_eps = None
-    for method, label in (('parametric_bonferroni', 'Gaussian Bonferroni'), ('bootstrap_ellipsoid', 'Bootstrap')):
-        try:
-            result = ndis_eps_lb_all(
-                in_scores, out_scores, delta=delta, alpha=significance, rng=np.random.default_rng(2), methods=(method,),
-            )[method]
-        except (ValueError, RuntimeError) as error:
-            print(f'{label} NDIS unavailable ({error})')
-            continue
-        estimate = result['eps_lb']
-        if method == 'bootstrap_ellipsoid':
-            bootstrap_eps = estimate
-        print(f'{label} NDIS epsilon={estimate:.6f}, with finite-T cap={min(estimates["model1_eps_corrected"], estimate):.6f}')
-
-    baselines = _audit_thresholds(in_scores, out_scores, delta, significance)
-    metadata = _finite_t_run_metadata(exp_dir)
-    true_eps = metadata['eps_true'] if metadata['eps_true'] is not None else metadata['target_epsilon']
-    unit_hit_scores = (
-        (metadata['max_grad_norm'] == 1.0 and not metadata['adaptive_clipping'])
-        or os.path.isfile(os.path.join(exp_dir, f'clip_norms_{epoch:06d}.csv'))
-    )
-    corrected_q = corrected_q_c = None
-    if bootstrap_eps is not None:
-        corrected_q_c = min(bootstrap_eps, estimates['model1_eps_corrected'])
-        if unit_hit_scores:
-            corrected_q = min(bootstrap_eps, _finite_t_unit_hit_bound(in_scores, out_scores, steps, delta, significance))
-
-    headers = ('True epsilon', 'One Run', 'f-DP', 'Ours without correction',
-               'Ours corrected (q, unit hit)', 'Ours corrected (q and C)')
-    values = (true_eps, baselines['steinke'], baselines['fdp'], bootstrap_eps, corrected_q, corrected_q_c)
-    print('\n| ' + ' | '.join(headers) + ' |')
-    print('| ' + ' | '.join('---' for _ in headers) + ' |')
-    print('| ' + ' | '.join(f'{value:.6f}' if value is not None else 'n/a' for value in values) + ' |')
-
-
-def run_gaussian_correction(exp_dir, delta, significance, steps, correction_r):
+def run_gaussian_correction(exp_dir, delta, significance, steps, correction_r, *, noise_multiplier_floor=None):
     if not 0 < delta < 1 or not 0 < significance < 1:
         raise ValueError('Gaussian correction requires delta and significance in (0, 1)')
     epoch, steps, in_scores, out_scores = _load_finite_t_scores(exp_dir, steps)
-    estimates = _corrected_bootstrap(in_scores, out_scores, steps, delta, significance, correction_r=correction_r)
-    print(f'Checkpoint {epoch}, T={steps}, delta={delta:g}, bootstrap confidence level={1 - significance:.1%}')
-    print(f'Supplied IN probability correction r={correction_r:.6g}')
-    print('\n| Bootstrap NDIS direction | Gaussian epsilon | Corrected epsilon |')
+    if noise_multiplier_floor is not None:
+        correction_r = _gaussian_correction_for_noise_floor(steps, noise_multiplier_floor)
+    estimates = _corrected_bootstrap(in_scores, out_scores, steps, delta, significance,
+                                     include_bonferroni=True, correction_r=correction_r)
+    print(f'Checkpoint {epoch}, T={steps}, delta={delta:g}, confidence level={1 - significance:.1%}')
+    print(f'IN probability correction r={correction_r:.6g}')
+    print('\n| NDIS estimate | Gaussian epsilon | Corrected epsilon |')
     print('| --- | --- | --- |')
-    print(f'| IN -> OUT | {estimates["bootstrap_in_to_out_eps"]:.6f} | {estimates["corrected_bootstrap_in_to_out_eps"]:.6f} |')
-    print(f'| Both directions | {estimates["bootstrap_eps"]:.6f} | {estimates["corrected_bootstrap_eps"]:.6f} |')
+    print(f'| Bootstrap IN -> OUT | {estimates["bootstrap_in_to_out_eps"]:.6f} | {estimates["corrected_bootstrap_in_to_out_eps"]:.6f} |')
+    print(f'| Bootstrap both directions | {estimates["bootstrap_eps"]:.6f} | {estimates["corrected_bootstrap_eps"]:.6f} |')
+    print(f'| Bonferroni both directions | {estimates["ndis_parametric_bonferroni"]:.6f} | {estimates["ndis_parametric_bonferroni_corrected"]:.6f} |')
 
 
 def _gaussian_correction_for_noise_floor(steps, noise_multiplier_floor):
-    if noise_multiplier_floor is None:
-        return None
     if not math.isfinite(noise_multiplier_floor) or noise_multiplier_floor <= 0:
         raise ValueError('noise multiplier floor must be finite and positive')
     # Uniform over q in [0, 1], with two endpoints in the Gaussian decision region.
@@ -1176,34 +1019,30 @@ def _gaussian_correction_for_noise_floor(steps, noise_multiplier_floor):
     return math.ceil((skew_term + remainder) * 1e8) / 1e8
 
 
-def _corrected_bootstrap(in_scores, out_scores, steps, delta, significance, *, pool_variance=False,
-                         include_bonferroni=False, correction_r=None):
-    if correction_r is None:
-        estimates = _finite_t_ndis_estimates(in_scores, out_scores, steps, delta, significance)
-    else:
-        estimates = {
-            'T': steps, 'delta': delta, 'alpha': significance, 'confidence': 1 - significance,
-            'n_in': in_scores.size, 'n_out': out_scores.size, 'm': in_scores.size + out_scores.size,
-            'gaussian_correction_r': correction_r,
-        }
+def _corrected_bootstrap(in_scores, out_scores, steps, delta, significance, *,
+                         include_bonferroni=False, correction_r):
+    estimates = {
+        'T': steps, 'delta': delta, 'alpha': significance, 'confidence': 1 - significance,
+        'n_in': in_scores.size, 'n_out': out_scores.size, 'm': in_scores.size + out_scores.size,
+        'gaussian_correction_r': correction_r,
+    }
     ndis = ndis_eps_lb_all(
-        in_scores, out_scores, delta=delta, alpha=significance, pool_variance=pool_variance,
+        in_scores, out_scores, delta=delta, alpha=significance,
         rng=np.random.default_rng(2), methods=NDIS_METHODS if include_bonferroni else ('bootstrap_ellipsoid',),
-        bootstrap_gaussian_correction_r=correction_r,
+        gaussian_correction_r=correction_r,
     )
     bootstrap = ndis['bootstrap_ellipsoid']
     if not math.isfinite(bootstrap['eps_lb']):
         raise ValueError('bootstrap NDIS returned a nonfinite estimate')
     if include_bonferroni:
-        estimates['ndis_parametric_bonferroni'] = ndis['parametric_bonferroni']['eps_lb']
-    estimates['bootstrap_pool_variance'] = pool_variance
+        bonferroni = ndis['parametric_bonferroni']
+        estimates['ndis_parametric_bonferroni'] = bonferroni['eps_lb']
+        estimates['ndis_parametric_bonferroni_corrected'] = bonferroni['eps_lb_corrected']
+    estimates['bootstrap_pool_variance'] = False
     estimates['bootstrap_eps'] = bootstrap['eps_lb']
-    if correction_r is None:
-        estimates['corrected_bootstrap_eps'] = min(estimates['model1_eps_corrected'], bootstrap['eps_lb'])
-    else:
-        estimates['corrected_bootstrap_eps'] = bootstrap['eps_lb_corrected']
-        estimates['bootstrap_in_to_out_eps'] = bootstrap['eps_lb_in_to_out']
-        estimates['corrected_bootstrap_in_to_out_eps'] = bootstrap['eps_lb_in_to_out_corrected']
+    estimates['corrected_bootstrap_eps'] = bootstrap['eps_lb_corrected']
+    estimates['bootstrap_in_to_out_eps'] = bootstrap['eps_lb_in_to_out']
+    estimates['corrected_bootstrap_in_to_out_eps'] = bootstrap['eps_lb_in_to_out_corrected']
     return estimates
 
 
@@ -1239,7 +1078,8 @@ def _plot_corrected_bootstrap(rows, axis, fig_dir):
         raise ValueError(f'The original plot requires {x_field} for every run')
     rows = sorted(rows, key=lambda row: row[x_field])
     x = [row[x_field] for row in rows]
-    series = {key: [row[key] for row in rows] for key in ('steinke', 'fdp', 'ndis_parametric_bonferroni')}
+    series = {key: [row[key] for row in rows] for key in ('steinke', 'fdp')}
+    series['ndis_parametric_bonferroni'] = [row['ndis_parametric_bonferroni_corrected'] for row in rows]
     series['ndis_bootstrap_ellipsoid'] = [row['corrected_bootstrap_eps'] for row in rows]
     target_eps = rows[0]['target_epsilon']
     if axis == 'm':
@@ -1257,7 +1097,7 @@ def _plot_corrected_bootstrap(rows, axis, fig_dir):
         _plot_multi(series, fig_dir)
 
 
-def run_corrected_bootstrap_report(exp_dirs, delta, significance, fig_dir, *, steps=None, axis=None, noise_floors=None):
+def run_corrected_bootstrap_report(exp_dirs, delta, significance, fig_dir, *, noise_floors, steps=None, axis=None):
     failures = []
 
     def evaluate_runs():
@@ -1265,33 +1105,26 @@ def run_corrected_bootstrap_report(exp_dirs, delta, significance, fig_dir, *, st
             try:
                 metadata = _finite_t_run_metadata(exp_dir)
                 target_eps = metadata['target_epsilon']
-                noise_floor = None
-                if noise_floors is not None:
-                    noise_floor = noise_floors.get(exp_dir, noise_floors.get(target_eps))
-                    if noise_floor is None:
-                        raise ValueError('no noise multiplier floor specified for this run')
-                if axis or noise_floor is not None:
-                    epoch = get_final_epoch(exp_dir)
-                    if epoch is None:
-                        raise ValueError('The comparison requires saved canary sums')
-                    if noise_floor is not None and (metadata['adaptive_clipping'] or exp_dir.endswith('-adaptive')):
-                        clip_norms = os.path.join(exp_dir, f'clip_norms_{epoch:06d}.csv')
-                        if not os.path.isfile(clip_norms):
-                            raise ValueError('adaptive clipping requires scores normalized by the per-step clipping bounds')
-                    metrics = audit_epoch(exp_dir, epoch, delta, significance, correct_bootstrap=True,
-                                          steps=steps, noise_multiplier_floor=noise_floor)
-                    if metrics is None:
-                        raise ValueError(f'Missing IN or OUT scores for checkpoint {epoch}')
-                    estimates = metrics.pop('correction')
-                    estimates.update(metrics)
-                else:
-                    epoch, actual_steps, in_scores, out_scores = _load_finite_t_scores(exp_dir, steps)
-                    estimates = _corrected_bootstrap(in_scores, out_scores, actual_steps, delta, significance)
-                if noise_floor is not None:
-                    estimates['noise_multiplier_floor'] = noise_floor
-                    print(f'Target epsilon {target_eps}, checkpoint {epoch}, T={estimates["T"]}, '
-                          f'noise multiplier floor={noise_floor:g}, r={estimates["gaussian_correction_r"]:.6g}, '
-                          f'corrected bootstrap epsilon={estimates["corrected_bootstrap_eps"]:.6f}')
+                noise_floor = noise_floors.get(exp_dir, noise_floors.get(target_eps))
+                if noise_floor is None:
+                    raise ValueError('no noise multiplier floor specified for this run')
+                epoch = get_final_epoch(exp_dir)
+                if epoch is None:
+                    raise ValueError('The comparison requires saved canary sums')
+                if metadata['adaptive_clipping'] or exp_dir.endswith('-adaptive'):
+                    clip_norms = os.path.join(exp_dir, f'clip_norms_{epoch:06d}.csv')
+                    if not os.path.isfile(clip_norms):
+                        raise ValueError('adaptive clipping requires scores normalized by the per-step clipping bounds')
+                metrics = audit_epoch(exp_dir, epoch, delta, significance, steps=steps,
+                                      noise_multiplier_floor=noise_floor)
+                if metrics is None:
+                    raise ValueError(f'Missing IN or OUT scores for checkpoint {epoch}')
+                estimates = metrics.pop('correction')
+                estimates.update(metrics)
+                estimates['noise_multiplier_floor'] = noise_floor
+                print(f'Target epsilon {target_eps}, checkpoint {epoch}, T={estimates["T"]}, '
+                      f'noise multiplier floor={noise_floor:g}, r={estimates["gaussian_correction_r"]:.6g}, '
+                      f'corrected bootstrap epsilon={estimates["corrected_bootstrap_eps"]:.6f}')
             except (OSError, ValueError, RuntimeError) as error:
                 print(f'{exp_dir}: {error}', file=sys.stderr)
                 failures.append(exp_dir)
@@ -1304,6 +1137,11 @@ def run_corrected_bootstrap_report(exp_dirs, delta, significance, fig_dir, *, st
     if rows and axis:
         _plot_corrected_bootstrap(rows, axis, fig_dir)
     return bool(rows) and not failures
+
+
+def _complexity_trial_parts(directory):
+    return sorted(os.path.join(directory, name) for name in os.listdir(directory)
+                  if re.fullmatch(r'sample_complexity_trials_part_\d+\.csv', name))
 
 
 def _read_complexity_trials(paths, trial_indices, settings, metric_names):
@@ -1323,13 +1161,17 @@ def _read_complexity_trials(paths, trial_indices, settings, metric_names):
                 raise ValueError(f'{path}: trial {key} has a different IN/OUT split')
             row.update(settings)
             row.update(m=key[0], trial=key[1], n_in=len(in_indices), n_out=len(out_indices))
-            row.update({name: float(row[name]) for name in metric_names})
+            for name in metric_names:
+                if name == 'ndis_parametric_bonferroni_corrected' and not row.get(name):
+                    row.pop(name, None)
+                else:
+                    row[name] = float(row[name])
             trials[key] = row
     return trials
 
 
-def run_corrected_bootstrap_complexity(exp_dir, delta, significance, fig_dir, n_trials, *, steps=None,
-                                       csv_only=False, noise_multiplier_floor=None, shard=None,
+def run_corrected_bootstrap_complexity(exp_dir, delta, significance, fig_dir, n_trials, *, noise_multiplier_floor,
+                                       steps=None, csv_only=False, shard=None,
                                        resume_csv=None, merge_shards=False):
     if n_trials < 1:
         raise ValueError('--complexity-trials must be positive')
@@ -1339,9 +1181,8 @@ def run_corrected_bootstrap_complexity(exp_dir, delta, significance, fig_dir, n_
     epoch, steps, in_scores, out_scores = _load_finite_t_scores(exp_dir, steps)
     metadata = _finite_t_run_metadata(exp_dir)
     correction_r = _gaussian_correction_for_noise_floor(steps, noise_multiplier_floor)
-    if correction_r is not None:
-        metadata['noise_multiplier_floor'] = noise_multiplier_floor
-        metadata['gaussian_correction_r'] = correction_r
+    metadata['noise_multiplier_floor'] = noise_multiplier_floor
+    metadata['gaussian_correction_r'] = correction_r
     if not csv_only:
         in_sum, out_sum = [
             np.loadtxt(os.path.join(exp_dir, f'{side}_scores_sum_{epoch:06d}.csv'), delimiter=',', ndmin=1)
@@ -1356,7 +1197,7 @@ def run_corrected_bootstrap_complexity(exp_dir, delta, significance, fig_dir, n_
     def evaluate_trial(in_indices, out_indices):
         estimates = _corrected_bootstrap(
             in_scores[in_indices], out_scores[out_indices], steps, delta, significance,
-            pool_variance=correction_r is None, include_bonferroni=not csv_only, correction_r=correction_r,
+            include_bonferroni=not csv_only, correction_r=correction_r,
         )
         if not csv_only:
             estimates.update(_audit_thresholds(in_sum[in_indices], out_sum[out_indices], delta, significance))
@@ -1373,23 +1214,19 @@ def run_corrected_bootstrap_complexity(exp_dir, delta, significance, fig_dir, n_
             trial_indices[budget, trial] = in_indices, out_indices
     trial_indices[full_budget, 1] = np.arange(in_scores.size), np.arange(out_scores.size)
 
-    mean_fields = ('bootstrap_eps', 'corrected_bootstrap_eps')
-    if correction_r is None:
-        mean_fields = ('model1_eps_before_correction', 'model1_eps_corrected', *mean_fields)
-    else:
-        mean_fields += ('bootstrap_in_to_out_eps', 'corrected_bootstrap_in_to_out_eps')
+    mean_fields = ('bootstrap_eps', 'corrected_bootstrap_eps', 'bootstrap_in_to_out_eps', 'corrected_bootstrap_in_to_out_eps')
     if not csv_only:
-        mean_fields += ('steinke', 'fdp', 'ndis_parametric_bonferroni')
+        mean_fields += ('steinke', 'fdp', 'ndis_parametric_bonferroni', 'ndis_parametric_bonferroni_corrected')
 
     settings = {**metadata, 'checkpoint': epoch, 'T': steps, 'delta': delta, 'alpha': significance,
-                'confidence': 1 - significance, 'bootstrap_pool_variance': correction_r is None}
+                'confidence': 1 - significance, 'bootstrap_pool_variance': False}
     trial_path = os.path.join(fig_dir, 'sample_complexity_trials.csv')
     if merge_shards:
-        parts = sorted(os.path.join(fig_dir, name) for name in os.listdir(fig_dir)
-                       if re.fullmatch(r'sample_complexity_trials_part_\d+\.csv', name))
-        saved = _read_complexity_trials(parts, trial_indices, settings, mean_fields)
+        saved = _read_complexity_trials(_complexity_trial_parts(fig_dir), trial_indices, settings, mean_fields)
         if len(saved) != len(trial_indices):
             raise ValueError(f'canary sweep incomplete: found {len(saved)} of {len(trial_indices)} trials')
+        if not csv_only and any('ndis_parametric_bonferroni_corrected' not in row for row in saved.values()):
+            raise ValueError('Some shards lack corrected Bonferroni values. Resume from this directory to fill them in.')
         trials = _write_corrected_bootstrap_csv(trial_path, (saved[key] for key in trial_indices))
     else:
         selected = list(trial_indices)
@@ -1397,19 +1234,37 @@ def run_corrected_bootstrap_complexity(exp_dir, delta, significance, fig_dir, n_
             index, count = shard
             selected = selected[index::count]
             trial_path = os.path.join(fig_dir, f'sample_complexity_trials_part_{index:03d}.csv')
-        saved = _read_complexity_trials([resume_csv], trial_indices, settings, mean_fields) if resume_csv else {}
-        if list(saved) != list(trial_indices)[:len(saved)]:
-            raise ValueError('resume CSV must contain the initial trials of the same canary sweep')
+        saved = {}
+        if resume_csv:
+            if os.path.isdir(resume_csv):
+                paths = _complexity_trial_parts(resume_csv) or [os.path.join(resume_csv, 'sample_complexity_trials.csv')]
+                saved = _read_complexity_trials(paths, trial_indices, settings, mean_fields)
+            else:
+                saved = _read_complexity_trials([resume_csv], trial_indices, settings, mean_fields)
+                if list(saved) != list(trial_indices)[:len(saved)]:
+                    raise ValueError('resume CSV must contain the initial trials of the same canary sweep')
         if shard is not None and os.path.isfile(trial_path):
             previous = _read_complexity_trials([trial_path], trial_indices, settings, mean_fields)
             saved.update(previous)
         reused = sum(key in saved for key in selected)
-        print(f'Canary trials assigned={len(selected)}, reusing={reused}, remaining={len(selected) - reused}')
+        bonferroni_to_fill = 0 if csv_only else sum(
+            'ndis_parametric_bonferroni_corrected' not in saved[key] for key in selected if key in saved
+        )
+        print(f'Canary trials assigned={len(selected)}, reusing={reused}, remaining={len(selected) - reused}, '
+              f'Bonferroni to fill={bonferroni_to_fill}')
 
         def evaluate_subsets():
             for key in selected:
                 if key in saved:
-                    yield saved[key]
+                    row = saved[key]
+                    if not csv_only and 'ndis_parametric_bonferroni_corrected' not in row:
+                        in_indices, out_indices = trial_indices[key]
+                        bonferroni = ndis_eps_lb_parametric_bonferroni(
+                            in_scores[in_indices], out_scores[out_indices], delta, alpha=significance,
+                            gaussian_correction_r=correction_r,
+                        )
+                        row['ndis_parametric_bonferroni_corrected'] = bonferroni['eps_lb']
+                    yield row
                 else:
                     estimates = evaluate_trial(*trial_indices[key])
                     yield {**metadata, 'checkpoint': epoch, 'trial': key[1], **estimates}
@@ -1444,11 +1299,15 @@ def main():
                         help='Include Andrew et al. 2024 (max-over-iterates cosine). '
                              'DP-FTRL only — DP-SGD runs do not save in_scores_andrew_*.csv.')
     parser.add_argument('--compare-tails', action='store_true',
-                        help='Compare finite-T NDIS on DP-SGD Dirac scores with unknown clipping and sampling rate. Use --exp-dirs or --fig-dir to export corrected bootstrap results.')
-    parser.add_argument('--gaussian-correction-r', type=float,
-                        help='Supplied bound on the IN decision-region probability error for a single --compare-tails run.')
+                        help='Compare Gaussian and finite-T corrected NDIS on DP-SGD Dirac scores.')
+    correction = parser.add_mutually_exclusive_group()
+    correction.add_argument('--gaussian-correction-r', type=float,
+                            help='Supplied bound on the IN decision-region probability error for a single --compare-tails run.')
+    correction.add_argument('--noise-multiplier-floor', type=float,
+                            help='Supplied lower bound on the noise multiplier, used to compute r for --compare-tails.')
     parser.add_argument('--steps', type=int, help='Checkpoint step count for --compare-tails. Defaults to the count inferred from the saved IN sum.')
-    parser.add_argument('--csv-only', action='store_true', help='Export the corrected bootstrap CSVs without plots in --compare-tails mode.')
+    parser.add_argument('--csv-only', action='store_true',
+                        help='Skip corrected NDIS plots. For sample complexity, export bootstrap estimates only.')
     parser.add_argument('--complexity-trials', type=int, default=COMPLEXITY_TRIALS,
                         help='Subsamples per budget for --compare-tails --complexity (default: %(default)s).')
     parser.add_argument('--independence', action='store_true',
@@ -1464,10 +1323,13 @@ def main():
     parser.add_argument('--fig-dir', type=str, default=None)
     args = parser.parse_args()
 
-    if args.gaussian_correction_r is not None and not args.compare_tails:
-        parser.error('--gaussian-correction-r requires --compare-tails')
+    has_correction = args.gaussian_correction_r is not None or args.noise_multiplier_floor is not None
+    if has_correction and not args.compare_tails:
+        parser.error('Gaussian correction inputs require --compare-tails')
 
     if args.compare_tails:
+        if not has_correction:
+            parser.error('--compare-tails requires --gaussian-correction-r or --noise-multiplier-floor')
         if bool(args.exp_dir) == bool(args.exp_dirs):
             parser.error('--compare-tails requires either --exp-dir or --exp-dirs')
         if args.exp_dirs and args.steps is not None:
@@ -1476,24 +1338,25 @@ def main():
             parser.error('--compare-tails --complexity requires a single --exp-dir')
         try:
             export = args.exp_dirs or args.fig_dir or args.complexity or args.ablation_T or args.csv_only
-            if args.gaussian_correction_r is not None:
-                if export:
-                    parser.error('--gaussian-correction-r requires a single --exp-dir comparison without export options')
-                run_gaussian_correction(args.exp_dir, args.delta, args.significance, args.steps, args.gaussian_correction_r)
-                return
+            if export and args.gaussian_correction_r is not None:
+                parser.error('--compare-tails exports require --noise-multiplier-floor')
             if not export:
-                run_finite_t_ndis(args.exp_dir, args.delta, args.significance, args.steps)
+                run_gaussian_correction(args.exp_dir, args.delta, args.significance, args.steps,
+                                        args.gaussian_correction_r, noise_multiplier_floor=args.noise_multiplier_floor)
                 return
 
             fig_dir = args.fig_dir or os.path.join(project_dir, 'fig', 'fixed_gaussianity_error')
             os.makedirs(fig_dir, exist_ok=True)
             if args.complexity:
                 run_corrected_bootstrap_complexity(args.exp_dir, args.delta, args.significance, fig_dir,
-                                                   args.complexity_trials, steps=args.steps, csv_only=args.csv_only)
+                                                   args.complexity_trials, steps=args.steps, csv_only=args.csv_only,
+                                                   noise_multiplier_floor=args.noise_multiplier_floor)
             else:
                 axis = None if args.csv_only else ('T' if args.ablation_T else 'target_epsilon')
-                if not run_corrected_bootstrap_report(args.exp_dirs or [args.exp_dir], args.delta,
-                                                      args.significance, fig_dir, steps=args.steps, axis=axis):
+                exp_dirs = args.exp_dirs or [args.exp_dir]
+                noise_floors = {os.path.realpath(path): args.noise_multiplier_floor for path in exp_dirs}
+                if not run_corrected_bootstrap_report(exp_dirs, args.delta, args.significance, fig_dir,
+                                                      steps=args.steps, axis=axis, noise_floors=noise_floors):
                     sys.exit(1)
         except (OSError, ValueError, RuntimeError) as e:
             parser.error(str(e))

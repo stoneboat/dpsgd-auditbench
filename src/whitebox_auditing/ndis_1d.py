@@ -230,6 +230,7 @@ def _minimize_eps_over_box(
     lo: np.ndarray, hi: np.ndarray, delta: float,
     pool_variance: bool = False, n_starts: int = 5,
     rng: Optional[np.random.Generator] = None,
+    *, gaussian_correction_r: float = 0.0,
 ) -> Tuple[float, np.ndarray]:
     """Minimise eps(theta; delta) over the rectangle [lo, hi].
 
@@ -244,20 +245,22 @@ def _minimize_eps_over_box(
     hi = np.asarray(hi, dtype=float)
     lo = np.maximum(lo, [-(np.inf), 1e-12, -(np.inf), 1e-12])
 
+    def obj(theta):
+        return _eps_of_theta(theta, delta, pool_variance=pool_variance, gaussian_correction_r=gaussian_correction_r)
+
     # Corner search.
     best_eps = np.inf
     best_theta = None
     for mask in range(16):
         corner = np.where(np.array([(mask >> b) & 1 for b in range(4)], dtype=bool), hi, lo)
-        e = _eps_of_theta(corner, delta, pool_variance=pool_variance)
+        e = obj(corner)
         if e < best_eps:
             best_eps, best_theta = e, corner
+        if best_eps == 0.0:
+            return best_eps, best_theta
 
     # Numeric refinement; cheap insurance against non-monotone minima.
     bounds = list(zip(lo.tolist(), hi.tolist()))
-
-    def obj(theta):
-        return _eps_of_theta(theta, delta, pool_variance=pool_variance)
 
     starts = [best_theta]
     for _ in range(max(0, n_starts - 1)):
@@ -280,16 +283,17 @@ def _minimize_eps_over_box(
 def ndis_eps_lb_parametric_bonferroni(
     in_scores, out_scores, delta: float, *,
     alpha: float = 0.05, pool_variance: bool = False,
-    n_dim: int = 4,
+    n_dim: int = 4, gaussian_correction_r: float = 0.0,
 ):
     """Lower bound via Gaussian parametric CIs + Bonferroni rectangle.
 
-    Assumes the in/out scores are Gaussian. Marginal CIs at level
+    Assumes independent Gaussian draws within each score group. Marginal CIs at level
     1 - alpha/n_dim:
       mu      ~ Student-t   CI on the sample mean
       sigma^2 ~ chi^2       CI on the sample variance
     The hyperrectangle of these four CIs has joint coverage >= 1 - alpha
     by Bonferroni. Returns the minimum NDIS eps over that rectangle.
+    An input r corrects the divergence before inversion at each point.
 
     n_dim is the number of CIs Bonferroni-corrected over. Default 4 covers
     (mu_in, sigma_in, mu_out, sigma_out). If pool_variance=True you may
@@ -300,6 +304,8 @@ def ndis_eps_lb_parametric_bonferroni(
     n_in, n_out = len(in_scores), len(out_scores)
     if n_in < 2 or n_out < 2:
         raise ValueError("Need >= 2 samples in each group.")
+    if not math.isfinite(gaussian_correction_r) or gaussian_correction_r < 0.0:
+        raise ValueError("Gaussian correction r must be finite and nonnegative.")
 
     a_marg = alpha / n_dim
     mu_in_hat, mu_out_hat = float(np.mean(in_scores)), float(np.mean(out_scores))
@@ -326,7 +332,9 @@ def ndis_eps_lb_parametric_bonferroni(
 
     lo = np.array([mu_in_lo, sig_in_lo, mu_out_lo, sig_out_lo])
     hi = np.array([mu_in_hi, sig_in_hi, mu_out_hi, sig_out_hi])
-    eps_lb, theta_min = _minimize_eps_over_box(lo, hi, delta, pool_variance=pool_variance)
+    eps_lb, theta_min = _minimize_eps_over_box(
+        lo, hi, delta, pool_variance=pool_variance, gaussian_correction_r=gaussian_correction_r,
+    )
     return {
         'eps_lb': eps_lb,
         'theta_min': theta_min,
@@ -445,6 +453,7 @@ def ndis_eps_lb_all(
     rng: Optional[np.random.Generator] = None,
     methods=NDIS_LB_METHODS,
     bootstrap_gaussian_correction_r: Optional[float] = None,
+    gaussian_correction_r: Optional[float] = None,
 ):
     """Run every NDIS eps lower-bound method, sharing one bootstrap pass.
 
@@ -452,9 +461,11 @@ def ndis_eps_lb_all(
     result dict (same shape as the individual constructors), so callers
     can do `out[method]['eps_lb']` to extract the scalar bound or inspect
     the diagnostic fields (worst-case theta, CR description, etc.).
-    With an input r, also compare the uncorrected and corrected IN-to-OUT
-    estimates and the corrected two-direction estimate on the same bootstrap ellipsoid.
+    With an input r, minimize the corrected epsilon over each confidence
+    region. The bootstrap result also includes the IN-to-OUT comparison.
     """
+    if gaussian_correction_r is not None:
+        bootstrap_gaussian_correction_r = gaussian_correction_r
     if bootstrap_gaussian_correction_r is not None and (
         not math.isfinite(bootstrap_gaussian_correction_r) or bootstrap_gaussian_correction_r < 0.0
     ):
@@ -466,9 +477,15 @@ def ndis_eps_lb_all(
     results = {}
 
     if 'parametric_bonferroni' in methods:
-        results['parametric_bonferroni'] = ndis_eps_lb_parametric_bonferroni(
+        bonferroni = ndis_eps_lb_parametric_bonferroni(
             in_scores, out_scores, delta, alpha=alpha, pool_variance=pool_variance,
         )
+        if gaussian_correction_r is not None:
+            bonferroni['eps_lb_corrected'], _ = _minimize_eps_over_box(
+                bonferroni['box_lo'], bonferroni['box_hi'], delta,
+                pool_variance=pool_variance, gaussian_correction_r=gaussian_correction_r,
+            )
+        results['parametric_bonferroni'] = bonferroni
 
     if 'bootstrap_ellipsoid' in methods:
         samples = _bootstrap_param_samples(in_scores, out_scores, n_bootstrap, rng)
