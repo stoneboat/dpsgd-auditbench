@@ -76,11 +76,25 @@ def _log_delta_two_gaussians_one_direction(mu1: float, std1: float, mu2: float, 
     return pr_z1 + math.log1p(-math.exp(factor))
 
 
+def _log_positive_difference(log_value: float, log_error: float) -> float:
+    if log_value <= log_error:
+        return _NEG_INF
+    return log_value + math.log(-math.expm1(log_error - log_value))
+
+
 def log_delta_two_gaussians(
     mu1: float, std1: float, mu2: float, std2: float, eps: float,
+    *, forward_only: bool = False, gaussian_correction_r: float = 0.0,
 ) -> float:
     log_d_xy = _log_delta_two_gaussians_one_direction(mu1, std1, mu2, std2, eps)
+    if gaussian_correction_r > 0.0:
+        log_r = math.log(gaussian_correction_r)
+        log_d_xy = _log_positive_difference(log_d_xy, log_r)
+    if forward_only:
+        return log_d_xy
     log_d_yx = _log_delta_two_gaussians_one_direction(mu2, std2, mu1, std1, eps)
+    if gaussian_correction_r > 0.0:
+        log_d_yx = _log_positive_difference(log_d_yx, eps + log_r)
     return max(log_d_xy, log_d_yx)
 
 
@@ -96,23 +110,30 @@ def ndis_eps_from_delta_1d_brentq(
     rtol: float = 1e-10,
     delta_tol: float = 1e-12,
     inner_tol: float = 1e-15,
+    forward_only: bool = False,
+    gaussian_correction_r: float = 0.0,
 ) -> float:
     """Smallest eps >= 0 with delta(eps) <= delta_target.
 
-    Uses the symmetric (max-over-directions) hockey-stick, so the result is
-    a tight DP eps regardless of which Gaussian is passed as 1 vs 2 and
-    regardless of whether the variances are equal.
+    By default, take the maximum over both directions. A supplied error r
+    for Gaussian 1 deducts r in the forward direction and exp(eps) * r
+    in the reverse direction.
     """
     delta_target = float(delta_target)
     if not (0.0 <= delta_target <= 1.0):
         raise ValueError("delta_target must be in [0, 1].")
     if not (sigma1 > 0.0 and sigma2 > 0.0):
         raise ValueError("sigma1 and sigma2 must be positive.")
+    if not math.isfinite(gaussian_correction_r) or gaussian_correction_r < 0.0:
+        raise ValueError("Gaussian correction r must be finite and nonnegative.")
 
     log_dt = math.log(delta_target) if delta_target > 0.0 else _NEG_INF
 
     def log_delta_of(eps: float) -> float:
-        return log_delta_two_gaussians(float(mu1), float(sigma1), float(mu2), float(sigma2), float(eps))
+        return log_delta_two_gaussians(
+            float(mu1), float(sigma1), float(mu2), float(sigma2), float(eps),
+            forward_only=forward_only, gaussian_correction_r=gaussian_correction_r,
+        )
 
     # Already (0, delta)-DP?
     if log_delta_of(0.0) <= log_dt + delta_tol:
@@ -162,12 +183,18 @@ def estimate_mean_variance(in_scores, out_scores) -> dict:
     }
 
 
-def _ndis_eps_from_moments(in_mean: float, in_std: float, out_mean: float, out_std: float, delta: float, *, pool_variance: bool = False) -> float:
+def _ndis_eps_from_moments(
+    in_mean: float, in_std: float, out_mean: float, out_std: float, delta: float, *,
+    pool_variance: bool = False, forward_only: bool = False, gaussian_correction_r: float = 0.0,
+) -> float:
     if pool_variance:
         s = math.sqrt(0.5 * (in_std * in_std + out_std * out_std))
         in_std = out_std = s
     try:
-        return ndis_eps_from_delta_1d_brentq(sigma1=out_std, sigma2=in_std,mu1=out_mean, mu2=in_mean,delta_target=delta)
+        return ndis_eps_from_delta_1d_brentq(
+            in_std, out_std, in_mean, out_mean, delta,
+            forward_only=forward_only, gaussian_correction_r=gaussian_correction_r,
+        )
     except (ValueError, RuntimeError):
         return 0.0
 
@@ -187,14 +214,15 @@ def _ndis_eps_from_moments(in_mean: float, in_std: float, out_mean: float, out_s
 # Two constructions of C_alpha are provided.
 
 
-def _eps_of_theta(theta: np.ndarray, delta: float, pool_variance: bool = False) -> float:
+def _eps_of_theta(theta: np.ndarray, delta: float, pool_variance: bool = False, *,
+                  forward_only: bool = False, gaussian_correction_r: float = 0.0) -> float:
     mu_in, sigma_in, mu_out, sigma_out = theta
     if sigma_in <= 0.0 or sigma_out <= 0.0:
         return 0.0
     return _ndis_eps_from_moments(
         in_mean=mu_in, in_std=sigma_in,
         out_mean=mu_out, out_std=sigma_out,
-        delta=delta, pool_variance=pool_variance,
+        delta=delta, pool_variance=pool_variance, forward_only=forward_only, gaussian_correction_r=gaussian_correction_r,
     )
 
 
@@ -416,6 +444,7 @@ def ndis_eps_lb_all(
     pool_variance: bool = False,
     rng: Optional[np.random.Generator] = None,
     methods=NDIS_LB_METHODS,
+    bootstrap_gaussian_correction_r: Optional[float] = None,
 ):
     """Run every NDIS eps lower-bound method, sharing one bootstrap pass.
 
@@ -423,7 +452,13 @@ def ndis_eps_lb_all(
     result dict (same shape as the individual constructors), so callers
     can do `out[method]['eps_lb']` to extract the scalar bound or inspect
     the diagnostic fields (worst-case theta, CR description, etc.).
+    With an input r, also compare the uncorrected and corrected IN-to-OUT
+    estimates and the corrected two-direction estimate on the same bootstrap ellipsoid.
     """
+    if bootstrap_gaussian_correction_r is not None and (
+        not math.isfinite(bootstrap_gaussian_correction_r) or bootstrap_gaussian_correction_r < 0.0
+    ):
+        raise ValueError("Gaussian correction r must be finite and nonnegative.")
     if rng is None:
         rng = np.random.default_rng()
     in_scores = np.asarray(in_scores, dtype=float)
@@ -454,11 +489,6 @@ def ndis_eps_lb_all(
         bounds = [(-np.inf, np.inf), (1e-9, np.inf),
                   (-np.inf, np.inf), (1e-9, np.inf)]
 
-        def obj(theta, _delta=delta, _pv=pool_variance):
-            return _eps_of_theta(theta, _delta, pool_variance=_pv)
-
-        best_eps = float(obj(theta_hat))
-        best_theta = theta_hat.copy()
         try:
             L = np.linalg.cholesky(Sigma)
         except np.linalg.LinAlgError:
@@ -471,21 +501,38 @@ def ndis_eps_lb_all(
             if nrm > 0:
                 z = z / nrm * rng.uniform(0.0, math.sqrt(r2))
             starts.append(theta_hat + L @ z)
-        for x0 in starts:
-            try:
-                res = minimize(obj, x0=x0, method='SLSQP', bounds=bounds,
-                               constraints=cons,
-                               options={'maxiter': 200, 'ftol': 1e-9})
-                if res.success and res.fun < best_eps:
-                    best_eps = float(res.fun)
-                    best_theta = res.x
-            except Exception:
-                pass
-        results['bootstrap_ellipsoid'] = {
-            'eps_lb': max(0.0, best_eps), 'theta_min': best_theta,
+
+        def minimize_eps(*, forward_only=False, gaussian_correction_r=0.0):
+            def obj(theta):
+                return _eps_of_theta(theta, delta, pool_variance, forward_only=forward_only,
+                                     gaussian_correction_r=gaussian_correction_r)
+
+            best_eps = float(obj(theta_hat))
+            best_theta = theta_hat.copy()
+            for x0 in starts:
+                try:
+                    res = minimize(obj, x0=x0, method='SLSQP', bounds=bounds, constraints=cons,
+                                   options={'maxiter': 200, 'ftol': 1e-9})
+                    if res.success and res.fun < best_eps:
+                        best_eps = float(res.fun)
+                        best_theta = res.x
+                except Exception:
+                    pass
+            return max(0.0, best_eps), best_theta
+
+        best_eps, best_theta = minimize_eps()
+        bootstrap = {
+            'eps_lb': best_eps, 'theta_min': best_theta,
             'theta_hat': theta_hat, 'Sigma': Sigma, 'r2': r2,
             'method': 'bootstrap_ellipsoid',
         }
+        if bootstrap_gaussian_correction_r is not None:
+            bootstrap['eps_lb_in_to_out'] = minimize_eps(forward_only=True)[0]
+            bootstrap['eps_lb_in_to_out_corrected'] = minimize_eps(
+                forward_only=True, gaussian_correction_r=bootstrap_gaussian_correction_r,
+            )[0]
+            bootstrap['eps_lb_corrected'] = minimize_eps(gaussian_correction_r=bootstrap_gaussian_correction_r)[0]
+        results['bootstrap_ellipsoid'] = bootstrap
 
     return results
 

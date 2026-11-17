@@ -1151,6 +1151,22 @@ def run_finite_t_ndis(exp_dir, delta, significance, steps=None):
     print('| ' + ' | '.join(f'{value:.6f}' if value is not None else 'n/a' for value in values) + ' |')
 
 
+def run_gaussian_correction(exp_dir, delta, significance, steps, correction_r):
+    if not 0 < delta < 1 or not 0 < significance < 1:
+        raise ValueError('Gaussian correction requires delta and significance in (0, 1)')
+    epoch, steps, in_scores, out_scores = _load_finite_t_scores(exp_dir, steps)
+    bootstrap = ndis_eps_lb_all(
+        in_scores, out_scores, delta=delta, alpha=significance, rng=np.random.default_rng(2),
+        methods=('bootstrap_ellipsoid',), bootstrap_gaussian_correction_r=correction_r,
+    )['bootstrap_ellipsoid']
+    print(f'Checkpoint {epoch}, T={steps}, delta={delta:g}, bootstrap confidence level={1 - significance:.1%}')
+    print(f'Supplied IN probability correction r={correction_r:.6g}')
+    print('\n| Bootstrap NDIS direction | Gaussian epsilon | Corrected epsilon |')
+    print('| --- | --- | --- |')
+    print(f'| IN -> OUT | {bootstrap["eps_lb_in_to_out"]:.6f} | {bootstrap["eps_lb_in_to_out_corrected"]:.6f} |')
+    print(f'| Both directions | {bootstrap["eps_lb"]:.6f} | {bootstrap["eps_lb_corrected"]:.6f} |')
+
+
 def _corrected_bootstrap(in_scores, out_scores, steps, delta, significance, *, pool_variance=False,
                          include_bonferroni=False):
     estimates = _finite_t_ndis_estimates(in_scores, out_scores, steps, delta, significance)
@@ -1324,6 +1340,8 @@ def main():
                              'DP-FTRL only — DP-SGD runs do not save in_scores_andrew_*.csv.')
     parser.add_argument('--compare-tails', action='store_true',
                         help='Compare finite-T NDIS on DP-SGD Dirac scores with unknown clipping and sampling rate. Use --exp-dirs or --fig-dir to export corrected bootstrap results.')
+    parser.add_argument('--gaussian-correction-r', type=float,
+                        help='Supplied bound on the IN decision-region probability error for a single --compare-tails run.')
     parser.add_argument('--steps', type=int, help='Checkpoint step count for --compare-tails. Defaults to the count inferred from the saved IN sum.')
     parser.add_argument('--csv-only', action='store_true', help='Export the corrected bootstrap CSVs without plots in --compare-tails mode.')
     parser.add_argument('--complexity-trials', type=int, default=COMPLEXITY_TRIALS,
@@ -1341,6 +1359,9 @@ def main():
     parser.add_argument('--fig-dir', type=str, default=None)
     args = parser.parse_args()
 
+    if args.gaussian_correction_r is not None and not args.compare_tails:
+        parser.error('--gaussian-correction-r requires --compare-tails')
+
     if args.compare_tails:
         if bool(args.exp_dir) == bool(args.exp_dirs):
             parser.error('--compare-tails requires either --exp-dir or --exp-dirs')
@@ -1350,6 +1371,11 @@ def main():
             parser.error('--compare-tails --complexity requires a single --exp-dir')
         try:
             export = args.exp_dirs or args.fig_dir or args.complexity or args.ablation_T or args.csv_only
+            if args.gaussian_correction_r is not None:
+                if export:
+                    parser.error('--gaussian-correction-r requires a single --exp-dir comparison without export options')
+                run_gaussian_correction(args.exp_dir, args.delta, args.significance, args.steps, args.gaussian_correction_r)
+                return
             if not export:
                 run_finite_t_ndis(args.exp_dir, args.delta, args.significance, args.steps)
                 return
