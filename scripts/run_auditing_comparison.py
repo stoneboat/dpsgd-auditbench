@@ -1020,18 +1020,17 @@ def run_finite_t_ndis(exp_dir, delta, significance, steps=None):
     print(f'q_lower={q_lower:.6g}, sigma_upper={sigma_upper:.6g}, IN CDF error bound={cdf_error:.6g}')
     print(f'Model 1 Gaussian stds at the limits  IN={std_in:.6g}, OUT={sigma_upper:.6g}')
     print(f'NDIS epsilon at confidence limits before correction={uncorrected:.6f}, after correction={corrected:.6f}')
-    reported = corrected
-    try:
-        result = ndis_eps_lb_all(
-            in_scores, out_scores, delta=delta, alpha=significance, rng=np.random.default_rng(2), methods=('bootstrap_ellipsoid',),
-        )['bootstrap_ellipsoid']
-        bootstrap = result['eps_lb']
-        _, fitted_in_std, _, fitted_out_std = result['theta_hat']
-        print(f'Bootstrap NDIS epsilon={bootstrap:.6f}, fitted IN std={fitted_in_std:.6g}, fitted OUT std={fitted_out_std:.6g}')
-        reported = min(bootstrap, corrected)
-    except (ValueError, RuntimeError) as error:
-        print(f'Bootstrap NDIS unavailable: {error}')
-    print(f'Finite-T NDIS epsilon lower bound under Model 1={reported:.6f}')
+    print(f'Fitted Gaussian stds  IN={in_scores.std(ddof=1):.6g}, OUT={out_scores.std(ddof=1):.6g}')
+    for method, label in (('parametric_bonferroni', 'Gaussian Bonferroni'), ('bootstrap_ellipsoid', 'Bootstrap')):
+        try:
+            result = ndis_eps_lb_all(
+                in_scores, out_scores, delta=delta, alpha=significance, rng=np.random.default_rng(2), methods=(method,),
+            )[method]
+        except (ValueError, RuntimeError) as error:
+            print(f'{label} NDIS unavailable ({error})')
+            continue
+        estimate = result['eps_lb']
+        print(f'{label} NDIS epsilon={estimate:.6f}, with finite-T cap={min(corrected, estimate):.6f}')
 
 
 def main():
@@ -1045,7 +1044,7 @@ def main():
                         help='Include Andrew et al. 2024 (max-over-iterates cosine). '
                              'DP-FTRL only — DP-SGD runs do not save in_scores_andrew_*.csv.')
     parser.add_argument('--compare-tails', action='store_true',
-                        help='Compare bootstrap and finite-T NDIS on normalized DP-SGD Dirac scores. Requires --exp-dir.')
+                        help='Compare Bonferroni, bootstrap, and finite-T NDIS on normalized DP-SGD Dirac scores. Requires --exp-dir.')
     parser.add_argument('--steps', type=int, help='Checkpoint step count for --compare-tails. Defaults to the count inferred from the saved IN sum.')
     parser.add_argument('--independence', action='store_true',
                         help='With --exp-dir: render the canary-direction Gram matrix + '
