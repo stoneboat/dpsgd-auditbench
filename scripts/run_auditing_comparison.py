@@ -1306,10 +1306,35 @@ def run_corrected_bootstrap_report(exp_dirs, delta, significance, fig_dir, *, st
     return bool(rows) and not failures
 
 
+def _read_complexity_trials(paths, trial_indices, settings, metric_names):
+    trials = {}
+    for path in paths:
+        with open(path, newline='') as source:
+            # Another job may still be flushing the final row.
+            complete_rows = source.read().rpartition('\n')[0]
+        for row in csv.DictReader(complete_rows.splitlines()):
+            key = int(row['m']), int(row['trial'])
+            if key in trials or key not in trial_indices:
+                raise ValueError(f'{path}: unexpected or duplicate trial {key}')
+            if any(row.get(name) != ('' if value is None else str(value)) for name, value in settings.items()):
+                raise ValueError(f'{path}: trial {key} has different audit settings')
+            in_indices, out_indices = trial_indices[key]
+            if (int(row['n_in']), int(row['n_out'])) != (len(in_indices), len(out_indices)):
+                raise ValueError(f'{path}: trial {key} has a different IN/OUT split')
+            row.update(settings)
+            row.update(m=key[0], trial=key[1], n_in=len(in_indices), n_out=len(out_indices))
+            row.update({name: float(row[name]) for name in metric_names})
+            trials[key] = row
+    return trials
+
+
 def run_corrected_bootstrap_complexity(exp_dir, delta, significance, fig_dir, n_trials, *, steps=None,
-                                       csv_only=False, noise_multiplier_floor=None):
+                                       csv_only=False, noise_multiplier_floor=None, shard=None,
+                                       resume_csv=None, merge_shards=False):
     if n_trials < 1:
         raise ValueError('--complexity-trials must be positive')
+    if shard is not None and (merge_shards or not 0 <= shard[0] < shard[1]):
+        raise ValueError('invalid canary sweep shard')
     exp_dir = os.path.realpath(exp_dir)
     epoch, steps, in_scores, out_scores = _load_finite_t_scores(exp_dir, steps)
     metadata = _finite_t_run_metadata(exp_dir)
@@ -1337,24 +1362,17 @@ def run_corrected_bootstrap_complexity(exp_dir, delta, significance, fig_dir, n_
             estimates.update(_audit_thresholds(in_sum[in_indices], out_sum[out_indices], delta, significance))
         return estimates
 
-    def evaluate_subsets():
-        for budget in budgets:
-            if budget == full_budget:
-                estimates = evaluate_trial(slice(None), slice(None))
-                yield {**metadata, 'checkpoint': epoch, 'trial': 1, **estimates}
-                continue
-            min_in = max(2, budget - out_scores.size)
-            max_in = min(in_scores.size, budget - 2)
-            for trial in range(1, n_trials + 1):
-                n_in = int(np.clip(rng.binomial(budget, 0.5), min_in, max_in))
-                in_indices = rng.choice(in_scores.size, n_in, replace=False)
-                out_indices = rng.choice(out_scores.size, budget - n_in, replace=False)
-                estimates = evaluate_trial(in_indices, out_indices)
-                yield {**metadata, 'checkpoint': epoch, 'trial': trial, **estimates}
+    trial_indices = {}
+    for budget in budgets[:-1]:
+        min_in = max(2, budget - out_scores.size)
+        max_in = min(in_scores.size, budget - 2)
+        for trial in range(1, n_trials + 1):
+            n_in = int(np.clip(rng.binomial(budget, 0.5), min_in, max_in))
+            in_indices = rng.choice(in_scores.size, n_in, replace=False)
+            out_indices = rng.choice(out_scores.size, budget - n_in, replace=False)
+            trial_indices[budget, trial] = in_indices, out_indices
+    trial_indices[full_budget, 1] = np.arange(in_scores.size), np.arange(out_scores.size)
 
-    trial_path = os.path.join(fig_dir, 'sample_complexity_trials.csv')
-    trials = _write_corrected_bootstrap_csv(trial_path, evaluate_subsets())
-    summary = []
     mean_fields = ('bootstrap_eps', 'corrected_bootstrap_eps')
     if correction_r is None:
         mean_fields = ('model1_eps_before_correction', 'model1_eps_corrected', *mean_fields)
@@ -1362,6 +1380,46 @@ def run_corrected_bootstrap_complexity(exp_dir, delta, significance, fig_dir, n_
         mean_fields += ('bootstrap_in_to_out_eps', 'corrected_bootstrap_in_to_out_eps')
     if not csv_only:
         mean_fields += ('steinke', 'fdp', 'ndis_parametric_bonferroni')
+
+    settings = {**metadata, 'checkpoint': epoch, 'T': steps, 'delta': delta, 'alpha': significance,
+                'confidence': 1 - significance, 'bootstrap_pool_variance': correction_r is None}
+    trial_path = os.path.join(fig_dir, 'sample_complexity_trials.csv')
+    if merge_shards:
+        parts = sorted(os.path.join(fig_dir, name) for name in os.listdir(fig_dir)
+                       if re.fullmatch(r'sample_complexity_trials_part_\d+\.csv', name))
+        saved = _read_complexity_trials(parts, trial_indices, settings, mean_fields)
+        if len(saved) != len(trial_indices):
+            raise ValueError(f'canary sweep incomplete: found {len(saved)} of {len(trial_indices)} trials')
+        trials = _write_corrected_bootstrap_csv(trial_path, (saved[key] for key in trial_indices))
+    else:
+        selected = list(trial_indices)
+        if shard is not None:
+            index, count = shard
+            selected = selected[index::count]
+            trial_path = os.path.join(fig_dir, f'sample_complexity_trials_part_{index:03d}.csv')
+        saved = _read_complexity_trials([resume_csv], trial_indices, settings, mean_fields) if resume_csv else {}
+        if list(saved) != list(trial_indices)[:len(saved)]:
+            raise ValueError('resume CSV must contain the initial trials of the same canary sweep')
+        if shard is not None and os.path.isfile(trial_path):
+            previous = _read_complexity_trials([trial_path], trial_indices, settings, mean_fields)
+            saved.update(previous)
+        reused = sum(key in saved for key in selected)
+        print(f'Canary trials assigned={len(selected)}, reusing={reused}, remaining={len(selected) - reused}')
+
+        def evaluate_subsets():
+            for key in selected:
+                if key in saved:
+                    yield saved[key]
+                else:
+                    estimates = evaluate_trial(*trial_indices[key])
+                    yield {**metadata, 'checkpoint': epoch, 'trial': key[1], **estimates}
+
+        trials = _write_corrected_bootstrap_csv(trial_path, evaluate_subsets())
+        if shard is not None:
+            print(f'Saved {len(trials)} trials to {trial_path}')
+            return
+
+    summary = []
     for budget in budgets:
         rows = [row for row in trials if row['m'] == budget]
         means = {key: np.mean([row[key] for row in rows]) for key in mean_fields}

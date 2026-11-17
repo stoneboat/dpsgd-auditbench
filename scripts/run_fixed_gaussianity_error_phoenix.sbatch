@@ -20,8 +20,8 @@ set -uo pipefail
 export MPLBACKEND=Agg OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 
 data_dir="${AUDIT_DATA_DIR:-$PWD/data}"
-result_dir="$PWD/fig/fixed_gaussianity_error/$SLURM_ARRAY_JOB_ID"
-srun python -u - "$data_dir" "$result_dir" "$SLURM_ARRAY_TASK_ID" <<'PY'
+result_dir="$PWD/fig/fixed_gaussianity_error/${AUDIT_COMPLEXITY_MERGE_JOB_ID:-$SLURM_ARRAY_JOB_ID}"
+srun python -u - "$data_dir" "$result_dir" "$SLURM_ARRAY_TASK_ID" "$SLURM_ARRAY_TASK_COUNT" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -29,14 +29,27 @@ from pathlib import Path
 sys.path.insert(0, "scripts")
 from run_auditing_comparison import get_target_T, run_corrected_bootstrap_complexity, run_corrected_bootstrap_report
 
-data_dir, result_dir, task = sys.argv[1:]
-output = Path(result_dir) / ("epsilon", "steps", "canaries", "tables")[int(task)]
-output.mkdir(parents=True, exist_ok=True)
+data_dir, result_dir, task, task_count = sys.argv[1:]
 
 def run_dir(seed):
     return str(Path(data_dir) / f"mislabeled-canaries-{seed}-5000-0.5-cifar10")
 
 sgd8 = run_dir("277640617625635548156432291773894477542")
+sharded = os.environ.get("AUDIT_COMPLEXITY_SHARD") == "1"
+merge = bool(os.environ.get("AUDIT_COMPLEXITY_MERGE_JOB_ID"))
+if task == "2" or sharded or merge:
+    output = Path(result_dir) / "canaries"
+    output.mkdir(parents=True, exist_ok=True)
+    run_corrected_bootstrap_complexity(
+        sgd8, delta=1e-5, significance=0.05, fig_dir=output,
+        n_trials=int(os.environ.get("AUDIT_COMPLEXITY_TRIALS", "50")), noise_multiplier_floor=2.0,
+        shard=(int(task), int(task_count)) if sharded else None, merge_shards=merge,
+        resume_csv=os.environ.get("AUDIT_COMPLEXITY_RESUME"),
+    )
+    sys.exit(0)
+
+output = Path(result_dir) / ("epsilon", "steps", "canaries", "tables")[int(task)]
+output.mkdir(parents=True, exist_ok=True)
 axis = None
 if task == "0":
     noise_floors = {
@@ -57,12 +70,6 @@ elif task == "1":
     floors_by_target_steps = {50: 0.75, 100: 0.85, 500: 1.30, 1000: 1.70, 2500: 2.0}
     noise_floors = {exp_dir: floors_by_target_steps[get_target_T(exp_dir)] for exp_dir in step_runs}
     axis = "T"
-elif task == "2":
-    run_corrected_bootstrap_complexity(
-        sgd8, delta=1e-5, significance=0.05, fig_dir=output,
-        n_trials=int(os.environ.get("AUDIT_COMPLEXITY_TRIALS", "50")), noise_multiplier_floor=2.0,
-    )
-    sys.exit(0)
 else:
     batch1024 = os.environ.get("AUDIT_BATCH1024") or run_dir("228508263780865377273727074192580881208")
     batch2048 = os.environ.get("AUDIT_BATCH2048") or run_dir("131088123116516713197276447333128882228")
