@@ -29,7 +29,7 @@ import sys
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.optimize import brentq
-from scipy.special import log_ndtr, ndtr
+from scipy.special import ndtr
 from scipy.stats import binom, chi2
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1022,22 +1022,6 @@ def _model1_hit_distribution(steps, q):
     return counts / math.sqrt(steps), binom.pmf(counts, steps, q), tail_mass
 
 
-def _finite_t_gaussian_tail_bound(steps, q, hit_to_noise, mean_in, hit_variance, gaussian_eps, delta):
-    if gaussian_eps == 0.0:
-        return 0.0
-    # The upper solution of log(g_in / g_out) = gaussian_eps, with OUT variance one.
-    in_variance = 1 + hit_variance
-    offset = mean_in**2 + in_variance * (2 * gaussian_eps + math.log1p(hit_variance))
-    threshold = offset / (mean_in + math.sqrt(mean_in**2 + hit_variance * offset))
-    hits, weights, _ = _model1_hit_distribution(steps, q)
-    model_tail_lower = ndtr(hit_to_noise * hits - threshold) @ weights
-    gaussian_tail = ndtr((mean_in - threshold) / math.sqrt(in_variance))
-    in_tail_lower = min(model_tail_lower, gaussian_tail)
-    if in_tail_lower <= delta:
-        return 0.0
-    return min(gaussian_eps, max(0.0, math.log(in_tail_lower - delta) - log_ndtr(-threshold)))
-
-
 def _finite_t_comparison_pairs(in_scores, steps, significance, sigma_lower, sigma_upper):
     scores = np.sort(in_scores)
     ranks = np.linspace(0, scores.size - 1, min(41, scores.size), dtype=int)
@@ -1071,6 +1055,22 @@ def _finite_t_comparison_pairs(in_scores, steps, significance, sigma_lower, sigm
         lower_hits = upper_hits
 
 
+def _model1_gaussian_comparison(q, hit_to_noise, steps):
+    hit_variance = q * (1 - q) * hit_to_noise**2
+    skewness_term = hit_variance * abs(1 - 2 * q) * hit_to_noise / (6 * math.sqrt(2 * math.pi * steps))
+    remainder = hit_variance * hit_to_noise**2 / (12 * math.pi * steps)
+    return q * hit_to_noise * math.sqrt(steps), math.sqrt(1 + hit_variance), min(1.0, skewness_term + remainder)
+
+
+def _finite_t_unit_hit_bound(in_scores, out_scores, steps, delta, significance):
+    out_squares = np.dot(out_scores, out_scores)
+    sigma_upper = math.sqrt(out_squares / chi2.ppf(significance / 2, out_scores.size))
+    radius = math.sqrt(2 * (sigma_upper**2 + 0.25) * math.log(2 / significance) / in_scores.size)
+    q_lower = float(np.clip((in_scores.mean() - radius) / math.sqrt(steps), 0, 1))
+    mean_in, std_in, cdf_error = _model1_gaussian_comparison(q_lower, 1 / sigma_upper, steps)
+    return _invert_corrected_ndis(mean_in, std_in, 1.0, delta, cdf_error)
+
+
 def _finite_t_ndis_estimates(in_scores, out_scores, steps, delta, significance):
     if not 0 < delta < 1 or not 0 < significance < 1:
         raise ValueError('finite-T NDIS requires delta and significance in (0, 1)')
@@ -1083,19 +1083,13 @@ def _finite_t_ndis_estimates(in_scores, out_scores, steps, delta, significance):
 
     comparisons = []
     for q, hit_to_noise in _finite_t_comparison_pairs(in_scores, steps, significance, sigma_lower, sigma_upper):
-        hit_variance = q * (1 - q) * hit_to_noise**2
-        skewness_term = hit_variance * abs(1 - 2 * q) * hit_to_noise / (6 * math.sqrt(2 * math.pi * steps))
-        remainder = hit_variance * hit_to_noise**2 / (12 * math.pi * steps)
-        cdf_error = min(1.0, skewness_term + remainder)
-        mean_in = q * hit_to_noise * math.sqrt(steps)
-        std_in = math.sqrt(1.0 + hit_variance)
-        uniform = _invert_corrected_ndis(mean_in, std_in, 1.0, delta, cdf_error)
+        mean_in, std_in, cdf_error = _model1_gaussian_comparison(q, hit_to_noise, steps)
+        corrected = _invert_corrected_ndis(mean_in, std_in, 1.0, delta, cdf_error)
         uncorrected = _invert_corrected_ndis(mean_in, std_in, 1.0, delta, 0.0)
-        tail = _finite_t_gaussian_tail_bound(steps, q, hit_to_noise, mean_in, hit_variance, uncorrected, delta)
-        comparisons.append((max(uniform, tail), uncorrected, q, hit_to_noise, cdf_error, mean_in, std_in, uniform))
+        comparisons.append((corrected, uncorrected, q, hit_to_noise, cdf_error, mean_in, std_in))
 
-    corrected, _, comparison_q, hit_to_noise, cdf_error, mean_in, std_in, _ = min(
-        comparisons, default=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+    corrected, _, comparison_q, hit_to_noise, cdf_error, mean_in, std_in = min(
+        comparisons, default=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
     )
     return {
         'T': steps, 'delta': delta, 'alpha': significance, 'confidence': 1 - significance,
@@ -1108,7 +1102,6 @@ def _finite_t_ndis_estimates(in_scores, out_scores, steps, delta, significance):
         'fitted_mean_in': sample_in_mean, 'fitted_mean_out': out_scores.mean(),
         'fitted_std_in': in_scores.std(ddof=1), 'fitted_std_out': out_scores.std(ddof=1),
         'model1_eps_before_correction': min((row[1] for row in comparisons), default=0.0),
-        'model1_eps_uniform_correction': min((row[-1] for row in comparisons), default=0.0),
         'model1_eps_corrected': corrected,
     }
 
@@ -1120,9 +1113,10 @@ def run_finite_t_ndis(exp_dir, delta, significance, steps=None):
     print('Unknown C and q: OUT noise interval=[{sigma_lower:.6g}, {sigma_upper:.6g}], retained q intervals={retained_q_intervals}'.format(**estimates))
     print('Limiting comparison pair: q={comparison_q:.6g}, C/sigma={comparison_hit_to_noise:.6g}, uniform IN CDF bound={in_cdf_error_bound:.6g}'.format(**estimates))
     print('Comparison Gaussian stds  IN={model1_std_in:.6g}, OUT={model1_std_out:.6g}'.format(**estimates))
-    print('Minimum NDIS epsilon across comparison pairs: Gaussian={model1_eps_before_correction:.6f}, '
-          'uniform correction={model1_eps_uniform_correction:.6f}, with tail check={model1_eps_corrected:.6f}'.format(**estimates))
+    print('Minimum NDIS epsilon across comparison pairs with Gaussian scores={model1_eps_before_correction:.6f}, '
+          'with uniform correction={model1_eps_corrected:.6f}'.format(**estimates))
     print('Fitted Gaussian stds  IN={fitted_std_in:.6g}, OUT={fitted_std_out:.6g}'.format(**estimates))
+    bootstrap_eps = None
     for method, label in (('parametric_bonferroni', 'Gaussian Bonferroni'), ('bootstrap_ellipsoid', 'Bootstrap')):
         try:
             result = ndis_eps_lb_all(
@@ -1132,7 +1126,29 @@ def run_finite_t_ndis(exp_dir, delta, significance, steps=None):
             print(f'{label} NDIS unavailable ({error})')
             continue
         estimate = result['eps_lb']
+        if method == 'bootstrap_ellipsoid':
+            bootstrap_eps = estimate
         print(f'{label} NDIS epsilon={estimate:.6f}, with finite-T cap={min(estimates["model1_eps_corrected"], estimate):.6f}')
+
+    baselines = _audit_thresholds(in_scores, out_scores, delta, significance)
+    metadata = _finite_t_run_metadata(exp_dir)
+    true_eps = metadata['eps_true'] if metadata['eps_true'] is not None else metadata['target_epsilon']
+    unit_hit_scores = (
+        (metadata['max_grad_norm'] == 1.0 and not metadata['adaptive_clipping'])
+        or os.path.isfile(os.path.join(exp_dir, f'clip_norms_{epoch:06d}.csv'))
+    )
+    corrected_q = corrected_q_c = None
+    if bootstrap_eps is not None:
+        corrected_q_c = min(bootstrap_eps, estimates['model1_eps_corrected'])
+        if unit_hit_scores:
+            corrected_q = min(bootstrap_eps, _finite_t_unit_hit_bound(in_scores, out_scores, steps, delta, significance))
+
+    headers = ('True epsilon', 'One Run', 'f-DP', 'Ours without correction',
+               'Ours corrected (q, unit hit)', 'Ours corrected (q and C)')
+    values = (true_eps, baselines['steinke'], baselines['fdp'], bootstrap_eps, corrected_q, corrected_q_c)
+    print('\n| ' + ' | '.join(headers) + ' |')
+    print('| ' + ' | '.join('---' for _ in headers) + ' |')
+    print('| ' + ' | '.join(f'{value:.6f}' if value is not None else 'n/a' for value in values) + ' |')
 
 
 def _corrected_bootstrap(in_scores, out_scores, steps, delta, significance, *, pool_variance=False,
