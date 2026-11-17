@@ -29,7 +29,7 @@ import sys
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.optimize import brentq
-from scipy.special import ndtr
+from scipy.special import log_ndtr, ndtr
 from scipy.stats import binom, chi2
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1022,6 +1022,22 @@ def _model1_hit_distribution(steps, q):
     return counts / math.sqrt(steps), binom.pmf(counts, steps, q), tail_mass
 
 
+def _finite_t_gaussian_tail_bound(steps, q, hit_to_noise, mean_in, hit_variance, gaussian_eps, delta):
+    if gaussian_eps == 0.0:
+        return 0.0
+    # The upper solution of log(g_in / g_out) = gaussian_eps, with OUT variance one.
+    in_variance = 1 + hit_variance
+    offset = mean_in**2 + in_variance * (2 * gaussian_eps + math.log1p(hit_variance))
+    threshold = offset / (mean_in + math.sqrt(mean_in**2 + hit_variance * offset))
+    hits, weights, _ = _model1_hit_distribution(steps, q)
+    model_tail_lower = ndtr(hit_to_noise * hits - threshold) @ weights
+    gaussian_tail = ndtr((mean_in - threshold) / math.sqrt(in_variance))
+    in_tail_lower = min(model_tail_lower, gaussian_tail)
+    if in_tail_lower <= delta:
+        return 0.0
+    return min(gaussian_eps, max(0.0, math.log(in_tail_lower - delta) - log_ndtr(-threshold)))
+
+
 def _finite_t_comparison_pairs(in_scores, steps, significance, sigma_lower, sigma_upper):
     scores = np.sort(in_scores)
     ranks = np.linspace(0, scores.size - 1, min(41, scores.size), dtype=int)
@@ -1073,12 +1089,13 @@ def _finite_t_ndis_estimates(in_scores, out_scores, steps, delta, significance):
         cdf_error = min(1.0, skewness_term + remainder)
         mean_in = q * hit_to_noise * math.sqrt(steps)
         std_in = math.sqrt(1.0 + hit_variance)
-        corrected = _invert_corrected_ndis(mean_in, std_in, 1.0, delta, cdf_error)
+        uniform = _invert_corrected_ndis(mean_in, std_in, 1.0, delta, cdf_error)
         uncorrected = _invert_corrected_ndis(mean_in, std_in, 1.0, delta, 0.0)
-        comparisons.append((corrected, uncorrected, q, hit_to_noise, cdf_error, mean_in, std_in))
+        tail = _finite_t_gaussian_tail_bound(steps, q, hit_to_noise, mean_in, hit_variance, uncorrected, delta)
+        comparisons.append((max(uniform, tail), uncorrected, q, hit_to_noise, cdf_error, mean_in, std_in, uniform))
 
-    corrected, _, comparison_q, hit_to_noise, cdf_error, mean_in, std_in = min(
-        comparisons, default=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+    corrected, _, comparison_q, hit_to_noise, cdf_error, mean_in, std_in, _ = min(
+        comparisons, default=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0),
     )
     return {
         'T': steps, 'delta': delta, 'alpha': significance, 'confidence': 1 - significance,
@@ -1091,6 +1108,7 @@ def _finite_t_ndis_estimates(in_scores, out_scores, steps, delta, significance):
         'fitted_mean_in': sample_in_mean, 'fitted_mean_out': out_scores.mean(),
         'fitted_std_in': in_scores.std(ddof=1), 'fitted_std_out': out_scores.std(ddof=1),
         'model1_eps_before_correction': min((row[1] for row in comparisons), default=0.0),
+        'model1_eps_uniform_correction': min((row[-1] for row in comparisons), default=0.0),
         'model1_eps_corrected': corrected,
     }
 
@@ -1100,10 +1118,10 @@ def run_finite_t_ndis(exp_dir, delta, significance, steps=None):
     estimates = _finite_t_ndis_estimates(in_scores, out_scores, steps, delta, significance)
     print(f'Checkpoint {epoch}, T={steps}, delta={delta:g}, confidence={1 - significance:.1%}')
     print('Unknown C and q: OUT noise interval=[{sigma_lower:.6g}, {sigma_upper:.6g}], retained q intervals={retained_q_intervals}'.format(**estimates))
-    print('Limiting comparison pair: q={comparison_q:.6g}, C/sigma={comparison_hit_to_noise:.6g}, IN CDF error bound={in_cdf_error_bound:.6g}'.format(**estimates))
+    print('Limiting comparison pair: q={comparison_q:.6g}, C/sigma={comparison_hit_to_noise:.6g}, uniform IN CDF bound={in_cdf_error_bound:.6g}'.format(**estimates))
     print('Comparison Gaussian stds  IN={model1_std_in:.6g}, OUT={model1_std_out:.6g}'.format(**estimates))
-    print('Minimum NDIS epsilon across comparison pairs before correction={model1_eps_before_correction:.6f}, '
-          'after correction={model1_eps_corrected:.6f}'.format(**estimates))
+    print('Minimum NDIS epsilon across comparison pairs: Gaussian={model1_eps_before_correction:.6f}, '
+          'uniform correction={model1_eps_uniform_correction:.6f}, with tail check={model1_eps_corrected:.6f}'.format(**estimates))
     print('Fitted Gaussian stds  IN={fitted_std_in:.6g}, OUT={fitted_std_out:.6g}'.format(**estimates))
     for method, label in (('parametric_bonferroni', 'Gaussian Bonferroni'), ('bootstrap_ellipsoid', 'Bootstrap')):
         try:
