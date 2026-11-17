@@ -980,6 +980,7 @@ def run_finite_t_ndis(exp_dir, delta, significance, steps=None):
     if any(scores.ndim != 1 or scores.size < 2 or not np.isfinite(scores).all() for scores in (in_scores, out_scores)):
         raise ValueError('each NDIS score file must contain at least two finite scores')
 
+    #Recover T from the sum and the scores
     sum_path = os.path.join(exp_dir, f'in_scores_sum_{epoch:06d}.csv')
     if os.path.isfile(sum_path):
         in_sum = np.loadtxt(sum_path, delimiter=',', ndmin=1)
@@ -995,18 +996,16 @@ def run_finite_t_ndis(exp_dir, delta, significance, steps=None):
     elif steps is None:
         raise ValueError('pass --steps when the saved IN sum scores are unavailable')
 
+    #Recover mean_in and sigma=0
     sample_in_mean = in_scores.mean()
-    in_residuals = in_scores - sample_in_mean
     out_squares = np.dot(out_scores, out_scores)
-    joint_squares = out_squares + np.dot(in_residuals, in_residuals)
-    noise_alpha = significance / 4
-    out_variance_upper = out_squares / chi2.ppf(noise_alpha, out_scores.size)
-    joint_variance_upper = joint_squares / chi2.ppf(noise_alpha, out_scores.size + in_scores.size - 1)
-    sigma_upper = math.sqrt(min(out_variance_upper, joint_variance_upper))
+    sigma_upper = math.sqrt(out_squares / chi2.ppf(significance / 2, out_scores.size))
     if not math.isfinite(sigma_upper) or sigma_upper <= 0:
         raise ValueError('OUT scores must give a finite, positive upper noise bound')
+    #Recover q by diving IN mean by root T (alpha/2)
     radius = math.sqrt(2 * (sigma_upper**2 + 0.25) * math.log(2 / significance) / in_scores.size)
     q_lower = float(np.clip((sample_in_mean - radius) / math.sqrt(steps), 0, 1))
+    #Build gaussian pair conservative using lesser q and more sigma
     hit_variance = q_lower * (1 - q_lower)
     skewness_term = hit_variance * abs(1 - 2 * q_lower) / (6 * sigma_upper**3 * math.sqrt(2 * math.pi * steps))
     remainder = hit_variance / (12 * math.pi * sigma_upper**4 * steps)
@@ -1014,6 +1013,7 @@ def run_finite_t_ndis(exp_dir, delta, significance, steps=None):
 
     mean_in = q_lower * math.sqrt(steps)
     std_in = math.sqrt(sigma_upper**2 + hit_variance)
+    #calc ndis epsi
     uncorrected = _invert_corrected_ndis(mean_in, std_in, sigma_upper, delta, 0.0)
     corrected = _invert_corrected_ndis(mean_in, std_in, sigma_upper, delta, cdf_error)
     print(f'Checkpoint {epoch}, T={steps}, delta={delta:g}, confidence={1 - significance:.1%}')
