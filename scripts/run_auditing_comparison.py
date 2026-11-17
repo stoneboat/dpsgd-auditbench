@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -28,7 +29,8 @@ import sys
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.optimize import brentq
-from scipy.stats import chi2
+from scipy.special import ndtr
+from scipy.stats import binom, chi2
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_dir = os.path.abspath(os.path.join(script_dir, '..'))
@@ -84,6 +86,8 @@ NDIS_METHODS = (
 )
 NDIS_KEYS = tuple(f'ndis_{m}' for m in NDIS_METHODS)
 NDIS_PLOT_METHODS = NDIS_METHODS
+CANARY_BUDGETS = (50, 100, 200, 400, 600, 1000, 1500, 2000, 3500, 5000)
+COMPLEXITY_TRIALS = 50
 
 
 def _plot_method(ax, x, y, key, label_override=None):
@@ -146,8 +150,19 @@ def _resolve_score_path(exp_dir, kind, side, epoch):
     return None
 
 
+def _audit_thresholds(in_sum, out_sum, delta, significance):
+    auditor = CanaryScoreAuditor(in_sum, out_sum)
+    eps_steinke, _ = auditor._epsilon_one_run_all_thresholds(
+        significance=significance, delta=delta, one_sided=True, threshold=None, use_fdp=False,
+    )
+    eps_fdp, _ = auditor._epsilon_one_run_all_thresholds(
+        significance=significance, delta=delta, one_sided=True, threshold=None, use_fdp=True,
+    )
+    return {'steinke': eps_steinke, 'fdp': eps_fdp}
+
+
 def audit_epoch(exp_dir, epoch, delta, significance, method=None, target_eps=None,
-                with_andrew=False):
+                with_andrew=False, *, correct_bootstrap=False, steps=None):
     in_sum_path = _resolve_score_path(exp_dir, 'sum', 'in', epoch)
     out_sum_path = _resolve_score_path(exp_dir, 'sum', 'out', epoch)
     in_ndis_path = os.path.join(exp_dir, f'in_scores_ndis_{epoch:06d}.csv')
@@ -162,8 +177,11 @@ def audit_epoch(exp_dir, epoch, delta, significance, method=None, target_eps=Non
 
     in_sum = np.loadtxt(in_sum_path, delimiter=',')
     out_sum = np.loadtxt(out_sum_path, delimiter=',')
-    in_ndis = np.loadtxt(in_ndis_path, delimiter=',')
-    out_ndis = np.loadtxt(out_ndis_path, delimiter=',')
+    if correct_bootstrap:
+        _, steps, in_ndis, out_ndis = _load_finite_t_scores(exp_dir, steps, epoch=epoch)
+    else:
+        in_ndis = np.loadtxt(in_ndis_path, delimiter=',')
+        out_ndis = np.loadtxt(out_ndis_path, delimiter=',')
 
     emp_std = np.std(np.concatenate([in_ndis, out_ndis]), ddof=1)
     mu_sep  = np.mean(in_ndis) - np.mean(out_ndis)
@@ -175,33 +193,24 @@ def audit_epoch(exp_dir, epoch, delta, significance, method=None, target_eps=Non
     else:
         eps_upper = float('nan')
 
-    auditor = CanaryScoreAuditor(in_sum, out_sum)
-    eps_steinke, _ = auditor._epsilon_one_run_all_thresholds(
-        significance=significance, delta=delta, one_sided=True, threshold=None, use_fdp=False,
-    )
-    eps_fdp, _ = auditor._epsilon_one_run_all_thresholds(
-        significance=significance, delta=delta, one_sided=True, threshold=None, use_fdp=True,
-    )
-
-    ndis_results = {f'ndis_{m}': 0.0 for m in NDIS_METHODS}
-    try:
-        all_out = ndis_eps_lb_all(
-            in_ndis, out_ndis, delta=delta,
-            alpha=significance, n_bootstrap=2000,
-            pool_variance=False,
+    out = {'upper': eps_upper, **_audit_thresholds(in_sum, out_sum, delta, significance)}
+    if correct_bootstrap:
+        out['correction'] = _corrected_bootstrap(
+            in_ndis, out_ndis, steps, delta, significance, include_bonferroni=True,
         )
-        for m in NDIS_METHODS:
-            if m in all_out:
-                ndis_results[f'ndis_{m}'] = float(all_out[m]['eps_lb'])
-    except (ValueError, RuntimeError) as e:
-        print(f"  NDIS failed ({e}), setting all variants to 0")
-
-    out = {
-        'upper': eps_upper,
-        'steinke': eps_steinke,
-        'fdp': eps_fdp,
-        **ndis_results,
-    }
+    else:
+        out.update(dict.fromkeys(NDIS_KEYS, 0.0))
+        try:
+            all_out = ndis_eps_lb_all(
+                in_ndis, out_ndis, delta=delta,
+                alpha=significance, n_bootstrap=2000,
+                pool_variance=False,
+            )
+            for m in NDIS_METHODS:
+                if m in all_out:
+                    out[f'ndis_{m}'] = float(all_out[m]['eps_lb'])
+        except (ValueError, RuntimeError) as e:
+            print(f"  NDIS failed ({e}), setting all variants to 0")
 
     if with_andrew:
         eps_andrew = 0.0
@@ -408,6 +417,10 @@ def run_multi(exp_dirs, delta, significance, fig_dir, with_andrew=False):
         print("="*60)
         print("Note: Dirac canaries are perfectly orthogonal if collisions = 0.")
 
+    _plot_multi(series, fig_dir, with_andrew)
+
+
+def _plot_multi(series, fig_dir, with_andrew=False):
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(11, 6.5))
         _plot_method(ax, series['target'], series['upper'],   'upper')
@@ -510,6 +523,11 @@ def run_ablation_T(exp_dirs, delta, significance, fig_dir, with_andrew=False):
     np.savetxt(results_path, results, delimiter=',', header=','.join(cols), comments='')
     print(f"\nResults saved to: {results_path}")
 
+    _plot_training_steps(series, target_eps_label, fig_dir, with_andrew)
+
+
+def _plot_training_steps(series, target_eps_label, fig_dir, with_andrew=False):
+    eps_tag = f"{target_eps_label:g}".replace('.', 'p')
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(11, 6.5))
         ax.axhline(y=target_eps_label, color='#555555', ls=(0, (3, 5, 1, 5)), lw=1.4,
@@ -576,12 +594,12 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
     in_ndis = np.loadtxt(in_ndis_path, delimiter=',')
     out_ndis = np.loadtxt(out_ndis_path, delimiter=',')
 
-    total_budgets = [50, 100, 200, 400, 600, 1000, 1500, 2000, 3500, 5000]
+    total_budgets = CANARY_BUDGETS
     full_budget = len(in_sum) + len(out_sum)
 
     metric_keys = ('steinke', 'fdp', *NDIS_KEYS)
     results = {k: [] for k in metric_keys}
-    n_trials = 50
+    n_trials = COMPLEXITY_TRIALS
 
     print(f"Running sample complexity on total budget for epoch {final_epoch} "
           f"(in={len(in_sum)}, out={len(out_sum)})...")
@@ -605,13 +623,7 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
             s_in, s_out = in_sum[idx_in], out_sum[idx_out]
             n_in_scores, n_out_scores = in_ndis[idx_in], out_ndis[idx_out]
 
-            auditor = CanaryScoreAuditor(s_in, s_out)
-            eps_s, _ = auditor._epsilon_one_run_all_thresholds(
-                significance, delta, True, None, use_fdp=False,
-            )
-            eps_f, _ = auditor._epsilon_one_run_all_thresholds(
-                significance, delta, True, None, use_fdp=True,
-            )
+            baselines = _audit_thresholds(s_in, s_out, delta, significance)
             try:
                 ndis_out = ndis_eps_lb_all(
                     n_in_scores, n_out_scores, delta=delta,
@@ -620,8 +632,8 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
             except (ValueError, RuntimeError):
                 ndis_out = None
 
-            trial_data['steinke'].append(eps_s)
-            trial_data['fdp'].append(eps_f)
+            trial_data['steinke'].append(baselines['steinke'])
+            trial_data['fdp'].append(baselines['fdp'])
             for m in NDIS_METHODS:
                 v = float(ndis_out[m]['eps_lb']) if (ndis_out is not None and m in ndis_out) else 0.0
                 trial_data[f'ndis_{m}'].append(v)
@@ -637,6 +649,10 @@ def run_complexity(exp_dir, delta, significance, fig_dir):
                header=','.join(cols), comments='')
     print(f"\nResults saved to: {results_path}")
 
+    _plot_sample_complexity(total_budgets, results, target_eps, fig_dir)
+
+
+def _plot_sample_complexity(total_budgets, results, target_eps, fig_dir):
     with plt.rc_context(_RC):
         fig, ax = plt.subplots(figsize=(9, 5.5))
         ax.grid(True, which="major", ls="-", alpha=0.2)
@@ -961,18 +977,17 @@ def _invert_corrected_ndis(mean_in, std_in, std_out, delta, cdf_error):
     return brentq(margin, 0.0, upper)
 
 
-def run_finite_t_ndis(exp_dir, delta, significance, steps=None):
-    if not 0 < delta < 1 or not 0 < significance < 1:
-        raise ValueError('finite-T NDIS requires delta and significance in (0, 1)')
+def _load_finite_t_scores(exp_dir, steps, *, epoch=None):
     if steps is not None and steps < 1:
         raise ValueError('--steps must be positive')
 
-    epochs = [int(match[1]) for name in os.listdir(exp_dir) if (match := re.fullmatch(r'in_scores_ndis_(\d+)\.csv', name))]
-    if not epochs:
-        raise ValueError('no saved IN NDIS scores found')
-    epoch = max(epochs)
+    if epoch is None:
+        epochs = [int(match[1]) for name in os.listdir(exp_dir) if (match := re.fullmatch(r'in_scores_ndis_(\d+)\.csv', name))]
+        if not epochs:
+            raise ValueError('no saved IN NDIS scores found')
+        epoch = max(epochs)
     if os.path.isfile(os.path.join(exp_dir, f'in_scores_andrew_{epoch:06d}.csv')):
-        raise ValueError('finite-T NDIS requires normalized DP-SGD Dirac scores')
+        raise ValueError('finite-T NDIS requires DP-SGD Dirac scores')
     in_scores, out_scores = [
         np.loadtxt(os.path.join(exp_dir, f'{side}_scores_ndis_{epoch:06d}.csv'), delimiter=',', ndmin=1)
         for side in ('in', 'out')
@@ -996,31 +1011,100 @@ def run_finite_t_ndis(exp_dir, delta, significance, steps=None):
     elif steps is None:
         raise ValueError('pass --steps when the saved IN sum scores are unavailable')
 
-    #Recover mean_in and sigma=0
+    return epoch, steps, in_scores, out_scores
+
+
+def _model1_hit_distribution(steps, q):
+    first = int(binom.ppf(1e-12, steps, q))
+    last = int(binom.isf(1e-12, steps, q))
+    counts = np.arange(first, last + 1)
+    tail_mass = binom.cdf(first - 1, steps, q) + binom.sf(last, steps, q)
+    return counts / math.sqrt(steps), binom.pmf(counts, steps, q), tail_mass
+
+
+def _finite_t_comparison_pairs(in_scores, steps, significance, sigma_lower, sigma_upper):
+    scores = np.sort(in_scores)
+    ranks = np.linspace(0, scores.size - 1, min(41, scores.size), dtype=int)
+    thresholds = np.unique(scores[ranks])
+    radius = math.sqrt((math.log(4) - math.log(significance)) / (2 * scores.size))
+    cdf_lower = np.searchsorted(scores, thresholds, side='right') / scores.size - radius
+    cdf_upper = np.searchsorted(scores, thresholds, side='left') / scores.size + radius
+    z_lower, z_upper = np.sort(thresholds / np.array([sigma_lower, sigma_upper])[:, None], axis=0)
+    q_edges = np.r_[0.0, np.geomspace(1 / (16 * steps), 1.0, 401)]
+    noise_cdf = ndtr(z_lower)
+    ratio_search_upper = max(1.0, z_lower.max() + 8) * math.sqrt(steps)
+    tolerance = 1e-12
+
+    def cdf(z, ratio, hit_distribution):
+        hits, weights, _ = hit_distribution
+        return ndtr(z[:, None] - ratio * hits) @ weights
+
+    lower_hits = _model1_hit_distribution(steps, 0)
+    for q_lower, q_upper in zip(q_edges[:-1], q_edges[1:]):
+        upper_hits = _model1_hit_distribution(steps, q_upper)
+        if np.all(binom.pmf(0, steps, q_upper) * noise_cdf <= cdf_upper + tolerance):
+            ratio_lower, upper = 0.0, ratio_search_upper
+            for _ in range(30):
+                ratio = (ratio_lower + upper) / 2
+                if np.any(cdf(z_lower, ratio, upper_hits) > cdf_upper + tolerance):
+                    ratio_lower = ratio
+                else:
+                    upper = ratio
+            if np.all(cdf(z_upper, ratio_lower, lower_hits) + lower_hits[2] + tolerance >= cdf_lower):
+                yield q_lower, ratio_lower
+        lower_hits = upper_hits
+
+
+def _finite_t_ndis_estimates(in_scores, out_scores, steps, delta, significance):
+    if not 0 < delta < 1 or not 0 < significance < 1:
+        raise ValueError('finite-T NDIS requires delta and significance in (0, 1)')
     sample_in_mean = in_scores.mean()
     out_squares = np.dot(out_scores, out_scores)
-    sigma_upper = math.sqrt(out_squares / chi2.ppf(significance / 2, out_scores.size))
-    if not math.isfinite(sigma_upper) or sigma_upper <= 0:
-        raise ValueError('OUT scores must give a finite, positive upper noise bound')
-    #Recover q by diving IN mean by root T (alpha/2)
-    radius = math.sqrt(2 * (sigma_upper**2 + 0.25) * math.log(2 / significance) / in_scores.size)
-    q_lower = float(np.clip((sample_in_mean - radius) / math.sqrt(steps), 0, 1))
-    #Build gaussian pair conservative using lesser q and more sigma
-    hit_variance = q_lower * (1 - q_lower)
-    skewness_term = hit_variance * abs(1 - 2 * q_lower) / (6 * sigma_upper**3 * math.sqrt(2 * math.pi * steps))
-    remainder = hit_variance / (12 * math.pi * sigma_upper**4 * steps)
-    cdf_error = min(1.0, skewness_term + remainder)
+    sigma_lower = math.sqrt(out_squares / chi2.isf(significance / 4, out_scores.size))
+    sigma_upper = math.sqrt(out_squares / chi2.ppf(significance / 4, out_scores.size))
+    if not 0 < sigma_lower <= sigma_upper < math.inf:
+        raise ValueError('OUT scores must give a finite, positive noise interval')
 
-    mean_in = q_lower * math.sqrt(steps)
-    std_in = math.sqrt(sigma_upper**2 + hit_variance)
-    #calc ndis epsi
-    uncorrected = _invert_corrected_ndis(mean_in, std_in, sigma_upper, delta, 0.0)
-    corrected = _invert_corrected_ndis(mean_in, std_in, sigma_upper, delta, cdf_error)
+    comparisons = []
+    for q, hit_to_noise in _finite_t_comparison_pairs(in_scores, steps, significance, sigma_lower, sigma_upper):
+        hit_variance = q * (1 - q) * hit_to_noise**2
+        skewness_term = hit_variance * abs(1 - 2 * q) * hit_to_noise / (6 * math.sqrt(2 * math.pi * steps))
+        remainder = hit_variance * hit_to_noise**2 / (12 * math.pi * steps)
+        cdf_error = min(1.0, skewness_term + remainder)
+        mean_in = q * hit_to_noise * math.sqrt(steps)
+        std_in = math.sqrt(1.0 + hit_variance)
+        corrected = _invert_corrected_ndis(mean_in, std_in, 1.0, delta, cdf_error)
+        uncorrected = _invert_corrected_ndis(mean_in, std_in, 1.0, delta, 0.0)
+        comparisons.append((corrected, uncorrected, q, hit_to_noise, cdf_error, mean_in, std_in))
+
+    corrected, _, comparison_q, hit_to_noise, cdf_error, mean_in, std_in = min(
+        comparisons, default=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+    )
+    return {
+        'T': steps, 'delta': delta, 'alpha': significance, 'confidence': 1 - significance,
+        'n_in': in_scores.size, 'n_out': out_scores.size, 'm': in_scores.size + out_scores.size,
+        'q_lower': min((row[2] for row in comparisons), default=0.0),
+        'sigma_lower': sigma_lower, 'sigma_upper': sigma_upper, 'retained_q_intervals': len(comparisons),
+        'comparison_q': comparison_q, 'comparison_hit_to_noise': hit_to_noise,
+        'in_cdf_error_bound': cdf_error,
+        'model1_mean_in': mean_in * sigma_upper, 'model1_std_in': std_in * sigma_upper, 'model1_std_out': sigma_upper,
+        'fitted_mean_in': sample_in_mean, 'fitted_mean_out': out_scores.mean(),
+        'fitted_std_in': in_scores.std(ddof=1), 'fitted_std_out': out_scores.std(ddof=1),
+        'model1_eps_before_correction': min((row[1] for row in comparisons), default=0.0),
+        'model1_eps_corrected': corrected,
+    }
+
+
+def run_finite_t_ndis(exp_dir, delta, significance, steps=None):
+    epoch, steps, in_scores, out_scores = _load_finite_t_scores(exp_dir, steps)
+    estimates = _finite_t_ndis_estimates(in_scores, out_scores, steps, delta, significance)
     print(f'Checkpoint {epoch}, T={steps}, delta={delta:g}, confidence={1 - significance:.1%}')
-    print(f'q_lower={q_lower:.6g}, sigma_upper={sigma_upper:.6g}, IN CDF error bound={cdf_error:.6g}')
-    print(f'Model 1 Gaussian stds at the limits  IN={std_in:.6g}, OUT={sigma_upper:.6g}')
-    print(f'NDIS epsilon at confidence limits before correction={uncorrected:.6f}, after correction={corrected:.6f}')
-    print(f'Fitted Gaussian stds  IN={in_scores.std(ddof=1):.6g}, OUT={out_scores.std(ddof=1):.6g}')
+    print('Unknown C and q: OUT noise interval=[{sigma_lower:.6g}, {sigma_upper:.6g}], retained q intervals={retained_q_intervals}'.format(**estimates))
+    print('Limiting comparison pair: q={comparison_q:.6g}, C/sigma={comparison_hit_to_noise:.6g}, IN CDF error bound={in_cdf_error_bound:.6g}'.format(**estimates))
+    print('Comparison Gaussian stds  IN={model1_std_in:.6g}, OUT={model1_std_out:.6g}'.format(**estimates))
+    print('Minimum NDIS epsilon across comparison pairs before correction={model1_eps_before_correction:.6f}, '
+          'after correction={model1_eps_corrected:.6f}'.format(**estimates))
+    print('Fitted Gaussian stds  IN={fitted_std_in:.6g}, OUT={fitted_std_out:.6g}'.format(**estimates))
     for method, label in (('parametric_bonferroni', 'Gaussian Bonferroni'), ('bootstrap_ellipsoid', 'Bootstrap')):
         try:
             result = ndis_eps_lb_all(
@@ -1030,7 +1114,168 @@ def run_finite_t_ndis(exp_dir, delta, significance, steps=None):
             print(f'{label} NDIS unavailable ({error})')
             continue
         estimate = result['eps_lb']
-        print(f'{label} NDIS epsilon={estimate:.6f}, with finite-T cap={min(corrected, estimate):.6f}')
+        print(f'{label} NDIS epsilon={estimate:.6f}, with finite-T cap={min(estimates["model1_eps_corrected"], estimate):.6f}')
+
+
+def _corrected_bootstrap(in_scores, out_scores, steps, delta, significance, *, pool_variance=False,
+                         include_bonferroni=False):
+    estimates = _finite_t_ndis_estimates(in_scores, out_scores, steps, delta, significance)
+    ndis = ndis_eps_lb_all(
+        in_scores, out_scores, delta=delta, alpha=significance, pool_variance=pool_variance,
+        rng=np.random.default_rng(2), methods=NDIS_METHODS if include_bonferroni else ('bootstrap_ellipsoid',),
+    )
+    bootstrap = ndis['bootstrap_ellipsoid']['eps_lb']
+    if not math.isfinite(bootstrap):
+        raise ValueError('bootstrap NDIS returned a nonfinite estimate')
+    if include_bonferroni:
+        estimates['ndis_parametric_bonferroni'] = ndis['parametric_bonferroni']['eps_lb']
+    estimates['bootstrap_pool_variance'] = pool_variance
+    estimates['bootstrap_eps'] = bootstrap
+    estimates['corrected_bootstrap_eps'] = min(estimates['model1_eps_corrected'], bootstrap)
+    return estimates
+
+
+def _finite_t_run_metadata(exp_dir):
+    path = os.path.join(exp_dir, 'hparams.json')
+    metadata = {}
+    if os.path.isfile(path):
+        with open(path) as source:
+            metadata = json.load(source)
+        if not isinstance(metadata, dict):
+            raise ValueError('hparams.json must contain a JSON object')
+    fields = ('target_steps', 'logical_batch_size', 'max_grad_norm', 'lr', 'adaptive_clipping', 'fault', 'eps_claimed', 'eps_true')
+    return {'exp_dir': exp_dir, 'target_epsilon': metadata.get('epsilon'), **{key: metadata.get(key) for key in fields}}
+
+
+def _write_corrected_bootstrap_csv(path, rows):
+    saved = []
+    with open(path, 'w', newline='') as output:
+        writer = None
+        for row in rows:
+            if writer is None:
+                writer = csv.DictWriter(output, fieldnames=list(row))
+                writer.writeheader()
+            writer.writerow(row)
+            output.flush()
+            saved.append(row)
+    return saved
+
+
+def _plot_corrected_bootstrap(rows, axis, fig_dir):
+    x_field = 'target_steps' if axis == 'T' else axis
+    if any(row[x_field] is None for row in rows):
+        raise ValueError(f'The original plot requires {x_field} for every run')
+    rows = sorted(rows, key=lambda row: row[x_field])
+    x = [row[x_field] for row in rows]
+    series = {key: [row[key] for row in rows] for key in ('steinke', 'fdp', 'ndis_parametric_bonferroni')}
+    series['ndis_bootstrap_ellipsoid'] = [row['corrected_bootstrap_eps'] for row in rows]
+    target_eps = rows[0]['target_epsilon']
+    if axis == 'm':
+        _plot_sample_complexity(x, series, target_eps, fig_dir)
+        return
+
+    series['upper'] = [row['upper'] for row in rows]
+    if axis == 'T':
+        if target_eps is None:
+            raise ValueError('The training-step plot requires epsilon in hparams.json')
+        series['T'] = x
+        _plot_training_steps(series, target_eps, fig_dir)
+    else:
+        series['target'] = x
+        _plot_multi(series, fig_dir)
+
+
+def run_corrected_bootstrap_report(exp_dirs, delta, significance, fig_dir, *, steps=None, axis=None):
+    failures = []
+
+    def evaluate_runs():
+        for exp_dir in dict.fromkeys(map(os.path.realpath, exp_dirs)):
+            try:
+                metadata = _finite_t_run_metadata(exp_dir)
+                if axis:
+                    epoch = get_final_epoch(exp_dir)
+                    if epoch is None:
+                        raise ValueError('The original plot requires saved canary sums')
+                    metrics = audit_epoch(exp_dir, epoch, delta, significance, correct_bootstrap=True, steps=steps)
+                    if metrics is None:
+                        raise ValueError(f'Missing IN or OUT scores for checkpoint {epoch}')
+                    estimates = metrics.pop('correction')
+                    estimates.update(metrics)
+                else:
+                    epoch, actual_steps, in_scores, out_scores = _load_finite_t_scores(exp_dir, steps)
+                    estimates = _corrected_bootstrap(in_scores, out_scores, actual_steps, delta, significance)
+            except (OSError, ValueError, RuntimeError) as error:
+                print(f'{exp_dir}: {error}', file=sys.stderr)
+                failures.append(exp_dir)
+                continue
+            yield {**metadata, 'checkpoint': epoch, **estimates}
+
+    path = os.path.join(fig_dir, 'corrected_bootstrap.csv')
+    rows = _write_corrected_bootstrap_csv(path, evaluate_runs())
+    print(f'Saved {len(rows)} rows to {path}')
+    if rows and axis:
+        _plot_corrected_bootstrap(rows, axis, fig_dir)
+    return bool(rows) and not failures
+
+
+def run_corrected_bootstrap_complexity(exp_dir, delta, significance, fig_dir, n_trials, *, steps=None, csv_only=False):
+    if n_trials < 1:
+        raise ValueError('--complexity-trials must be positive')
+    exp_dir = os.path.realpath(exp_dir)
+    epoch, steps, in_scores, out_scores = _load_finite_t_scores(exp_dir, steps)
+    metadata = _finite_t_run_metadata(exp_dir)
+    if not csv_only:
+        in_sum, out_sum = [
+            np.loadtxt(os.path.join(exp_dir, f'{side}_scores_sum_{epoch:06d}.csv'), delimiter=',', ndmin=1)
+            for side in ('in', 'out')
+        ]
+        if in_sum.shape != in_scores.shape or out_sum.shape != out_scores.shape:
+            raise ValueError('Saved NDIS scores and sums must have matching shapes')
+    full_budget = in_scores.size + out_scores.size
+    budgets = [budget for budget in CANARY_BUDGETS if budget < full_budget] + [full_budget]
+    rng = np.random.default_rng(2)
+
+    def evaluate_trial(in_indices, out_indices):
+        estimates = _corrected_bootstrap(
+            in_scores[in_indices], out_scores[out_indices], steps, delta, significance,
+            pool_variance=True, include_bonferroni=not csv_only,
+        )
+        if not csv_only:
+            estimates.update(_audit_thresholds(in_sum[in_indices], out_sum[out_indices], delta, significance))
+        return estimates
+
+    def evaluate_subsets():
+        for budget in budgets:
+            if budget == full_budget:
+                estimates = evaluate_trial(slice(None), slice(None))
+                yield {**metadata, 'checkpoint': epoch, 'trial': 1, **estimates}
+                continue
+            min_in = max(2, budget - out_scores.size)
+            max_in = min(in_scores.size, budget - 2)
+            for trial in range(1, n_trials + 1):
+                n_in = int(np.clip(rng.binomial(budget, 0.5), min_in, max_in))
+                in_indices = rng.choice(in_scores.size, n_in, replace=False)
+                out_indices = rng.choice(out_scores.size, budget - n_in, replace=False)
+                estimates = evaluate_trial(in_indices, out_indices)
+                yield {**metadata, 'checkpoint': epoch, 'trial': trial, **estimates}
+
+    trial_path = os.path.join(fig_dir, 'sample_complexity_trials.csv')
+    trials = _write_corrected_bootstrap_csv(trial_path, evaluate_subsets())
+    summary = []
+    mean_fields = ('model1_eps_before_correction', 'model1_eps_corrected', 'bootstrap_eps', 'corrected_bootstrap_eps')
+    if not csv_only:
+        mean_fields += ('steinke', 'fdp', 'ndis_parametric_bonferroni')
+    for budget in budgets:
+        rows = [row for row in trials if row['m'] == budget]
+        means = {key: np.mean([row[key] for row in rows]) for key in mean_fields}
+        summary.append({**metadata, 'checkpoint': epoch, 'T': steps, 'm': budget, 'trials': len(rows),
+                        'delta': delta, 'alpha': significance, 'confidence': 1 - significance,
+                        'bootstrap_pool_variance': rows[0]['bootstrap_pool_variance'], **means})
+    path = os.path.join(fig_dir, 'sample_complexity.csv')
+    _write_corrected_bootstrap_csv(path, summary)
+    if not csv_only:
+        _plot_corrected_bootstrap(summary, 'm', fig_dir)
+    print(f'Saved {len(trials)} trials to {trial_path} and {len(summary)} rows to {path}')
 
 
 def main():
@@ -1044,8 +1289,11 @@ def main():
                         help='Include Andrew et al. 2024 (max-over-iterates cosine). '
                              'DP-FTRL only — DP-SGD runs do not save in_scores_andrew_*.csv.')
     parser.add_argument('--compare-tails', action='store_true',
-                        help='Compare Bonferroni, bootstrap, and finite-T NDIS on normalized DP-SGD Dirac scores. Requires --exp-dir.')
+                        help='Compare finite-T NDIS on DP-SGD Dirac scores with unknown clipping and sampling rate. Use --exp-dirs or --fig-dir to export corrected bootstrap results.')
     parser.add_argument('--steps', type=int, help='Checkpoint step count for --compare-tails. Defaults to the count inferred from the saved IN sum.')
+    parser.add_argument('--csv-only', action='store_true', help='Export the corrected bootstrap CSVs without plots in --compare-tails mode.')
+    parser.add_argument('--complexity-trials', type=int, default=COMPLEXITY_TRIALS,
+                        help='Subsamples per budget for --compare-tails --complexity (default: %(default)s).')
     parser.add_argument('--independence', action='store_true',
                         help='With --exp-dir: render the canary-direction Gram matrix + '
                              'per-canary score density (independence diagnostic).')
@@ -1060,11 +1308,29 @@ def main():
     args = parser.parse_args()
 
     if args.compare_tails:
-        if not args.exp_dir:
-            parser.error('--compare-tails requires --exp-dir')
+        if bool(args.exp_dir) == bool(args.exp_dirs):
+            parser.error('--compare-tails requires either --exp-dir or --exp-dirs')
+        if args.exp_dirs and args.steps is not None:
+            parser.error('--compare-tails --steps requires a single --exp-dir')
+        if args.complexity and (args.exp_dirs or args.ablation_T):
+            parser.error('--compare-tails --complexity requires a single --exp-dir')
         try:
-            run_finite_t_ndis(args.exp_dir, args.delta, args.significance, args.steps)
-        except (OSError, ValueError) as e:
+            export = args.exp_dirs or args.fig_dir or args.complexity or args.ablation_T or args.csv_only
+            if not export:
+                run_finite_t_ndis(args.exp_dir, args.delta, args.significance, args.steps)
+                return
+
+            fig_dir = args.fig_dir or os.path.join(project_dir, 'fig', 'fixed_gaussianity_error')
+            os.makedirs(fig_dir, exist_ok=True)
+            if args.complexity:
+                run_corrected_bootstrap_complexity(args.exp_dir, args.delta, args.significance, fig_dir,
+                                                   args.complexity_trials, steps=args.steps, csv_only=args.csv_only)
+            else:
+                axis = None if args.csv_only else ('T' if args.ablation_T else 'target_epsilon')
+                if not run_corrected_bootstrap_report(args.exp_dirs or [args.exp_dir], args.delta,
+                                                      args.significance, fig_dir, steps=args.steps, axis=axis):
+                    sys.exit(1)
+        except (OSError, ValueError, RuntimeError) as e:
             parser.error(str(e))
         return
 
