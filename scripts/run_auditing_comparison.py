@@ -1005,9 +1005,8 @@ def run_gaussian_correction(exp_dir, delta, significance, steps, correction_r, *
     print(f'IN probability correction r={correction_r:.6g}')
     print('\n| NDIS estimate | Gaussian epsilon | Corrected epsilon |')
     print('| --- | --- | --- |')
-    print(f'| Bootstrap IN -> OUT | {estimates["bootstrap_in_to_out_eps"]:.6f} | {estimates["corrected_bootstrap_in_to_out_eps"]:.6f} |')
-    print(f'| Bootstrap both directions | {estimates["bootstrap_eps"]:.6f} | {estimates["corrected_bootstrap_eps"]:.6f} |')
-    print(f'| Bonferroni both directions | {estimates["ndis_parametric_bonferroni"]:.6f} | {estimates["ndis_parametric_bonferroni_corrected"]:.6f} |')
+    print(f'| Bootstrap IN -> OUT | {estimates["bootstrap_eps"]:.6f} | {estimates["corrected_bootstrap_eps"]:.6f} |')
+    print(f'| Bonferroni IN -> OUT | {estimates["ndis_parametric_bonferroni"]:.6f} | {estimates["ndis_parametric_bonferroni_corrected"]:.6f} |')
 
 
 def _gaussian_correction_for_noise_floor(steps, noise_multiplier_floor):
@@ -1041,8 +1040,6 @@ def _corrected_bootstrap(in_scores, out_scores, steps, delta, significance, *,
     estimates['bootstrap_pool_variance'] = False
     estimates['bootstrap_eps'] = bootstrap['eps_lb']
     estimates['corrected_bootstrap_eps'] = bootstrap['eps_lb_corrected']
-    estimates['bootstrap_in_to_out_eps'] = bootstrap['eps_lb_in_to_out']
-    estimates['corrected_bootstrap_in_to_out_eps'] = bootstrap['eps_lb_in_to_out_corrected']
     return estimates
 
 
@@ -1055,7 +1052,8 @@ def _finite_t_run_metadata(exp_dir):
         if not isinstance(metadata, dict):
             raise ValueError('hparams.json must contain a JSON object')
     fields = ('target_steps', 'logical_batch_size', 'max_grad_norm', 'lr', 'adaptive_clipping', 'fault', 'eps_claimed', 'eps_true')
-    return {'exp_dir': exp_dir, 'target_epsilon': metadata.get('epsilon'), **{key: metadata.get(key) for key in fields}}
+    return {'exp_dir': exp_dir, 'target_epsilon': metadata.get('epsilon'), 'ndis_direction': 'in_to_out',
+            **{key: metadata.get(key) for key in fields}}
 
 
 def _write_corrected_bootstrap_csv(path, rows):
@@ -1151,6 +1149,8 @@ def _read_complexity_trials(paths, trial_indices, settings, metric_names):
             # Another job may still be flushing the final row.
             complete_rows = source.read().rpartition('\n')[0]
         for row in csv.DictReader(complete_rows.splitlines()):
+            if row.get('ndis_direction') != settings['ndis_direction']:
+                raise ValueError(f'{path}: cached NDIS estimates must use IN-to-OUT only. Start a fresh canary sweep.')
             key = int(row['m']), int(row['trial'])
             if key in trials or key not in trial_indices:
                 raise ValueError(f'{path}: unexpected or duplicate trial {key}')
@@ -1214,7 +1214,7 @@ def run_corrected_bootstrap_complexity(exp_dir, delta, significance, fig_dir, n_
             trial_indices[budget, trial] = in_indices, out_indices
     trial_indices[full_budget, 1] = np.arange(in_scores.size), np.arange(out_scores.size)
 
-    mean_fields = ('bootstrap_eps', 'corrected_bootstrap_eps', 'bootstrap_in_to_out_eps', 'corrected_bootstrap_in_to_out_eps')
+    mean_fields = ('bootstrap_eps', 'corrected_bootstrap_eps')
     if not csv_only:
         mean_fields += ('steinke', 'fdp', 'ndis_parametric_bonferroni', 'ndis_parametric_bonferroni_corrected')
 

@@ -8,8 +8,8 @@ Two confidence-region constructions are exposed:
   * `ndis_eps_lb_bootstrap_ellipsoid`   -- joint elliptical CR estimated by
     bootstrap, eps minimised over the ellipsoid.
 
-Both ultimately invert `ndis_eps_from_delta_1d_brentq` (Balle--Wang on the
-symmetric Gaussian-vs-Gaussian hockey-stick) at every theta they evaluate.
+Both ultimately invert the IN-to-OUT Gaussian hockey-stick divergence
+at every theta they evaluate.
 """
 import math
 from typing import Optional, Tuple, Union
@@ -84,18 +84,13 @@ def _log_positive_difference(log_value: float, log_error: float) -> float:
 
 def log_delta_two_gaussians(
     mu1: float, std1: float, mu2: float, std2: float, eps: float,
-    *, forward_only: bool = False, gaussian_correction_r: float = 0.0,
+    *, gaussian_correction_r: float = 0.0,
 ) -> float:
+    """Log hockey-stick divergence from Gaussian 1 to Gaussian 2."""
     log_d_xy = _log_delta_two_gaussians_one_direction(mu1, std1, mu2, std2, eps)
     if gaussian_correction_r > 0.0:
-        log_r = math.log(gaussian_correction_r)
-        log_d_xy = _log_positive_difference(log_d_xy, log_r)
-    if forward_only:
-        return log_d_xy
-    log_d_yx = _log_delta_two_gaussians_one_direction(mu2, std2, mu1, std1, eps)
-    if gaussian_correction_r > 0.0:
-        log_d_yx = _log_positive_difference(log_d_yx, eps + log_r)
-    return max(log_d_xy, log_d_yx)
+        return _log_positive_difference(log_d_xy, math.log(gaussian_correction_r))
+    return log_d_xy
 
 
 def ndis_eps_from_delta_1d_brentq(
@@ -110,14 +105,12 @@ def ndis_eps_from_delta_1d_brentq(
     rtol: float = 1e-10,
     delta_tol: float = 1e-12,
     inner_tol: float = 1e-15,
-    forward_only: bool = False,
     gaussian_correction_r: float = 0.0,
 ) -> float:
     """Smallest eps >= 0 with delta(eps) <= delta_target.
 
-    By default, take the maximum over both directions. A supplied error r
-    for Gaussian 1 deducts r in the forward direction and exp(eps) * r
-    in the reverse direction.
+    Gaussian 1 is IN and Gaussian 2 is OUT. Deducting r from their
+    directional divergence is equivalent to inverting at delta_target + r.
     """
     delta_target = float(delta_target)
     if not (0.0 <= delta_target <= 1.0):
@@ -132,7 +125,7 @@ def ndis_eps_from_delta_1d_brentq(
     def log_delta_of(eps: float) -> float:
         return log_delta_two_gaussians(
             float(mu1), float(sigma1), float(mu2), float(sigma2), float(eps),
-            forward_only=forward_only, gaussian_correction_r=gaussian_correction_r,
+            gaussian_correction_r=gaussian_correction_r,
         )
 
     # Already (0, delta)-DP?
@@ -185,7 +178,7 @@ def estimate_mean_variance(in_scores, out_scores) -> dict:
 
 def _ndis_eps_from_moments(
     in_mean: float, in_std: float, out_mean: float, out_std: float, delta: float, *,
-    pool_variance: bool = False, forward_only: bool = False, gaussian_correction_r: float = 0.0,
+    pool_variance: bool = False, gaussian_correction_r: float = 0.0,
 ) -> float:
     if pool_variance:
         s = math.sqrt(0.5 * (in_std * in_std + out_std * out_std))
@@ -193,7 +186,7 @@ def _ndis_eps_from_moments(
     try:
         return ndis_eps_from_delta_1d_brentq(
             in_std, out_std, in_mean, out_mean, delta,
-            forward_only=forward_only, gaussian_correction_r=gaussian_correction_r,
+            gaussian_correction_r=gaussian_correction_r,
         )
     except (ValueError, RuntimeError):
         return 0.0
@@ -204,9 +197,8 @@ def _ndis_eps_from_moments(
 # ---------------------------------------------------------------------------
 #
 # Notation. theta = (mu_in, sigma_in, mu_out, sigma_out). The NDIS functional
-# eps(theta; delta) returns the smallest eps such that the symmetric
-# hockey-stick divergence between N(mu_in, sigma_in^2) and
-# N(mu_out, sigma_out^2) at level delta is non-positive.
+# eps(theta; delta) returns the smallest eps such that the hockey-stick
+# divergence from N(mu_in, sigma_in^2) to N(mu_out, sigma_out^2) is at most delta.
 #
 # A (1 - alpha) confidence region C_alpha for theta gives a (1 - alpha)
 # lower bound on the realised eps via
@@ -215,14 +207,14 @@ def _ndis_eps_from_moments(
 
 
 def _eps_of_theta(theta: np.ndarray, delta: float, pool_variance: bool = False, *,
-                  forward_only: bool = False, gaussian_correction_r: float = 0.0) -> float:
+                  gaussian_correction_r: float = 0.0) -> float:
     mu_in, sigma_in, mu_out, sigma_out = theta
     if sigma_in <= 0.0 or sigma_out <= 0.0:
         return 0.0
     return _ndis_eps_from_moments(
         in_mean=mu_in, in_std=sigma_in,
         out_mean=mu_out, out_std=sigma_out,
-        delta=delta, pool_variance=pool_variance, forward_only=forward_only, gaussian_correction_r=gaussian_correction_r,
+        delta=delta, pool_variance=pool_variance, gaussian_correction_r=gaussian_correction_r,
     )
 
 
@@ -461,8 +453,8 @@ def ndis_eps_lb_all(
     result dict (same shape as the individual constructors), so callers
     can do `out[method]['eps_lb']` to extract the scalar bound or inspect
     the diagnostic fields (worst-case theta, CR description, etc.).
-    With an input r, minimize the corrected epsilon over each confidence
-    region. The bootstrap result also includes the IN-to-OUT comparison.
+    With an input r, also minimize the corrected epsilon over each confidence
+    region.
     """
     if gaussian_correction_r is not None:
         bootstrap_gaussian_correction_r = gaussian_correction_r
@@ -519,10 +511,9 @@ def ndis_eps_lb_all(
                 z = z / nrm * rng.uniform(0.0, math.sqrt(r2))
             starts.append(theta_hat + L @ z)
 
-        def minimize_eps(*, forward_only=False, gaussian_correction_r=0.0):
+        def minimize_eps(*, gaussian_correction_r=0.0):
             def obj(theta):
-                return _eps_of_theta(theta, delta, pool_variance, forward_only=forward_only,
-                                     gaussian_correction_r=gaussian_correction_r)
+                return _eps_of_theta(theta, delta, pool_variance, gaussian_correction_r=gaussian_correction_r)
 
             best_eps = float(obj(theta_hat))
             best_theta = theta_hat.copy()
@@ -544,10 +535,6 @@ def ndis_eps_lb_all(
             'method': 'bootstrap_ellipsoid',
         }
         if bootstrap_gaussian_correction_r is not None:
-            bootstrap['eps_lb_in_to_out'] = minimize_eps(forward_only=True)[0]
-            bootstrap['eps_lb_in_to_out_corrected'] = minimize_eps(
-                forward_only=True, gaussian_correction_r=bootstrap_gaussian_correction_r,
-            )[0]
             bootstrap['eps_lb_corrected'] = minimize_eps(gaussian_correction_r=bootstrap_gaussian_correction_r)[0]
         results['bootstrap_ellipsoid'] = bootstrap
 
