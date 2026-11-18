@@ -1028,7 +1028,7 @@ def _corrected_bootstrap(in_scores, out_scores, steps, delta, significance, *,
     ndis = ndis_eps_lb_all(
         in_scores, out_scores, delta=delta, alpha=significance,
         rng=np.random.default_rng(2), methods=NDIS_METHODS if include_bonferroni else ('bootstrap_ellipsoid',),
-        gaussian_correction_r=correction_r,
+        gaussian_correction_r=correction_r, enforce_variance_order=True,
     )
     bootstrap = ndis['bootstrap_ellipsoid']
     if not math.isfinite(bootstrap['eps_lb']):
@@ -1053,6 +1053,7 @@ def _finite_t_run_metadata(exp_dir):
             raise ValueError('hparams.json must contain a JSON object')
     fields = ('target_steps', 'logical_batch_size', 'max_grad_norm', 'lr', 'adaptive_clipping', 'fault', 'eps_claimed', 'eps_true')
     return {'exp_dir': exp_dir, 'target_epsilon': metadata.get('epsilon'), 'ndis_direction': 'in_to_out',
+            'ndis_variance_order': 'in_ge_out',
             **{key: metadata.get(key) for key in fields}}
 
 
@@ -1261,7 +1262,7 @@ def run_corrected_bootstrap_complexity(exp_dir, delta, significance, fig_dir, n_
                         in_indices, out_indices = trial_indices[key]
                         bonferroni = ndis_eps_lb_parametric_bonferroni(
                             in_scores[in_indices], out_scores[out_indices], delta, alpha=significance,
-                            gaussian_correction_r=correction_r,
+                            gaussian_correction_r=correction_r, enforce_variance_order=True,
                         )
                         row['ndis_parametric_bonferroni_corrected'] = bonferroni['eps_lb']
                     yield row

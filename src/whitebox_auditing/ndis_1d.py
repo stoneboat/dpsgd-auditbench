@@ -23,6 +23,7 @@ Number = Union[float, int]
 
 _norm_logcdf = norm.logcdf
 _NEG_INF = -np.inf
+_STD_GAP = np.array([0., 1., 0., -1.])
 
 
 # ---------------------------------------------------------------------------
@@ -54,10 +55,8 @@ def _log_delta_two_gaussians_one_direction(mu1: float, std1: float, mu2: float, 
             return _NEG_INF
 
         sqrtD = math.sqrt(determinant)
-        i_left = (-b - sqrtD) / (2.0 * a)
-        i_right = (-b + sqrtD) / (2.0 * a)
-        if i_left > i_right:
-            i_left, i_right = i_right, i_left
+        root_term = -0.5 * (b + math.copysign(sqrtD, b))
+        i_left, i_right = sorted((root_term / a, (c - eps) / root_term))
 
         if a > 0:
             pr_z1 = np.logaddexp(_norm_logcdf(i_left, loc=mu1, scale=std1),_norm_logcdf(mu1, loc=i_right, scale=std1))
@@ -222,7 +221,7 @@ def _minimize_eps_over_box(
     lo: np.ndarray, hi: np.ndarray, delta: float,
     pool_variance: bool = False, n_starts: int = 5,
     rng: Optional[np.random.Generator] = None,
-    *, gaussian_correction_r: float = 0.0,
+    *, gaussian_correction_r: float = 0.0, enforce_variance_order: bool = False,
 ) -> Tuple[float, np.ndarray]:
     """Minimise eps(theta; delta) over the rectangle [lo, hi].
 
@@ -236,6 +235,12 @@ def _minimize_eps_over_box(
     lo = np.asarray(lo, dtype=float)
     hi = np.asarray(hi, dtype=float)
     lo = np.maximum(lo, [-(np.inf), 1e-12, -(np.inf), 1e-12])
+    if enforce_variance_order:
+        if hi[1] < lo[3]:
+            return 0.0, None
+        lo[1] = max(lo[1], lo[3])
+        hi = hi.copy()
+        hi[3] = min(hi[3], hi[1])
 
     def obj(theta):
         return _eps_of_theta(theta, delta, pool_variance=pool_variance, gaussian_correction_r=gaussian_correction_r)
@@ -245,6 +250,8 @@ def _minimize_eps_over_box(
     best_theta = None
     for mask in range(16):
         corner = np.where(np.array([(mask >> b) & 1 for b in range(4)], dtype=bool), hi, lo)
+        if enforce_variance_order:
+            corner[1] = max(corner[1], corner[3])
         e = obj(corner)
         if e < best_eps:
             best_eps, best_theta = e, corner
@@ -254,16 +261,23 @@ def _minimize_eps_over_box(
     # Numeric refinement; cheap insurance against non-monotone minima.
     bounds = list(zip(lo.tolist(), hi.tolist()))
 
+    constraints = ({'type': 'ineq', 'fun': _STD_GAP.dot},) if enforce_variance_order else ()
+    method = 'SLSQP' if enforce_variance_order else 'L-BFGS-B'
     starts = [best_theta]
     for _ in range(max(0, n_starts - 1)):
         starts.append(rng.uniform(lo, hi))
     for x0 in starts:
         try:
-            res = minimize(obj, x0=x0, method='L-BFGS-B', bounds=bounds,
+            res = minimize(obj, x0=x0, method=method, bounds=bounds, constraints=constraints,
                            options={'maxiter': 50, 'ftol': 1e-9})
-            if res.fun < best_eps:
-                best_eps = float(res.fun)
-                best_theta = res.x
+            candidate = res.x
+            if enforce_variance_order:
+                candidate = np.clip(candidate, lo, hi)
+                candidate[1] = max(candidate[1], candidate[3])
+            value = obj(candidate) if enforce_variance_order else res.fun
+            if value < best_eps:
+                best_eps = float(value)
+                best_theta = candidate
         except Exception:
             pass
 
@@ -275,7 +289,7 @@ def _minimize_eps_over_box(
 def ndis_eps_lb_parametric_bonferroni(
     in_scores, out_scores, delta: float, *,
     alpha: float = 0.05, pool_variance: bool = False,
-    n_dim: int = 4, gaussian_correction_r: float = 0.0,
+    n_dim: int = 4, gaussian_correction_r: float = 0.0, enforce_variance_order: bool = False,
 ):
     """Lower bound via Gaussian parametric CIs + Bonferroni rectangle.
 
@@ -326,6 +340,7 @@ def ndis_eps_lb_parametric_bonferroni(
     hi = np.array([mu_in_hi, sig_in_hi, mu_out_hi, sig_out_hi])
     eps_lb, theta_min = _minimize_eps_over_box(
         lo, hi, delta, pool_variance=pool_variance, gaussian_correction_r=gaussian_correction_r,
+        enforce_variance_order=enforce_variance_order,
     )
     return {
         'eps_lb': eps_lb,
@@ -446,6 +461,7 @@ def ndis_eps_lb_all(
     methods=NDIS_LB_METHODS,
     bootstrap_gaussian_correction_r: Optional[float] = None,
     gaussian_correction_r: Optional[float] = None,
+    enforce_variance_order: bool = False,
 ):
     """Run every NDIS eps lower-bound method, sharing one bootstrap pass.
 
@@ -454,7 +470,8 @@ def ndis_eps_lb_all(
     can do `out[method]['eps_lb']` to extract the scalar bound or inspect
     the diagnostic fields (worst-case theta, CR description, etc.).
     With an input r, also minimize the corrected epsilon over each confidence
-    region.
+    region. With enforce_variance_order, intersect the regions with
+    sigma_IN >= sigma_OUT, as required by Model 1.
     """
     if gaussian_correction_r is not None:
         bootstrap_gaussian_correction_r = gaussian_correction_r
@@ -471,11 +488,13 @@ def ndis_eps_lb_all(
     if 'parametric_bonferroni' in methods:
         bonferroni = ndis_eps_lb_parametric_bonferroni(
             in_scores, out_scores, delta, alpha=alpha, pool_variance=pool_variance,
+            enforce_variance_order=enforce_variance_order,
         )
         if gaussian_correction_r is not None:
             bonferroni['eps_lb_corrected'], _ = _minimize_eps_over_box(
                 bonferroni['box_lo'], bonferroni['box_hi'], delta,
                 pool_variance=pool_variance, gaussian_correction_r=gaussian_correction_r,
+                enforce_variance_order=enforce_variance_order,
             )
         results['parametric_bonferroni'] = bonferroni
 
@@ -495,6 +514,8 @@ def ndis_eps_lb_all(
             return _r2 - float(d @ _Sinv @ d)
 
         cons = ({'type': 'ineq', 'fun': constraint_fn},)
+        if enforce_variance_order:
+            cons += ({'type': 'ineq', 'fun': _STD_GAP.dot},)
         bounds = [(-np.inf, np.inf), (1e-9, np.inf),
                   (-np.inf, np.inf), (1e-9, np.inf)]
 
@@ -510,23 +531,46 @@ def ndis_eps_lb_all(
             if nrm > 0:
                 z = z / nrm * rng.uniform(0.0, math.sqrt(r2))
             starts.append(theta_hat + L @ z)
+        if enforce_variance_order and _STD_GAP @ theta_hat < 0:
+            # Closest point on the equal-variance plane in Mahalanobis distance.
+            normal = Sigma @ _STD_GAP
+            anchor = theta_hat - (_STD_GAP @ theta_hat) * normal / (_STD_GAP @ normal)
+            anchor[1] = anchor[3]
+            if constraint_fn(anchor) < -1e-8:
+                starts = []
+            else:
+                starts.insert(0, anchor)
 
         def minimize_eps(*, gaussian_correction_r=0.0):
             def obj(theta):
                 return _eps_of_theta(theta, delta, pool_variance, gaussian_correction_r=gaussian_correction_r)
 
-            best_eps = float(obj(theta_hat))
-            best_theta = theta_hat.copy()
+            if enforce_variance_order:
+                best_eps, best_theta = np.inf, None
+            else:
+                best_eps, best_theta = float(obj(theta_hat)), theta_hat.copy()
             for x0 in starts:
+                if (enforce_variance_order and _STD_GAP @ x0 >= 0
+                        and min(x0[1], x0[3]) >= 1e-9 and constraint_fn(x0) >= -1e-8):
+                    value = obj(x0)
+                    if value < best_eps:
+                        best_eps, best_theta = float(value), x0.copy()
                 try:
                     res = minimize(obj, x0=x0, method='SLSQP', bounds=bounds, constraints=cons,
                                    options={'maxiter': 200, 'ftol': 1e-9})
                     if res.success and res.fun < best_eps:
-                        best_eps = float(res.fun)
-                        best_theta = res.x
+                        candidate = res.x
+                        if enforce_variance_order:
+                            candidate = candidate.copy()
+                            candidate[1] = max(candidate[1], candidate[3])
+                            if min(candidate[1], candidate[3]) < 1e-9 or constraint_fn(candidate) < -1e-8:
+                                continue
+                        value = obj(candidate) if enforce_variance_order else res.fun
+                        if value < best_eps:
+                            best_eps, best_theta = float(value), candidate
                 except Exception:
                     pass
-            return max(0.0, best_eps), best_theta
+            return (0.0, None) if best_theta is None else (max(0.0, best_eps), best_theta)
 
         best_eps, best_theta = minimize_eps()
         bootstrap = {
