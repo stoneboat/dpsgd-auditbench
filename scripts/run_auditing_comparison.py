@@ -39,7 +39,6 @@ from canary_score_diagnostics import dirac_canary_interference
 from whitebox_auditing.ndis_1d import (
     _ndis_eps_from_moments,
     ndis_eps_lb_all,
-    ndis_eps_lb_parametric_bonferroni,
 )
 from whitebox_auditing.tree_mechanism import num_levels
 
@@ -1053,6 +1052,7 @@ def _finite_t_run_metadata(exp_dir):
             raise ValueError('hparams.json must contain a JSON object')
     fields = ('target_steps', 'logical_batch_size', 'max_grad_norm', 'lr', 'adaptive_clipping', 'fault', 'eps_claimed', 'eps_true')
     return {'exp_dir': exp_dir, 'target_epsilon': metadata.get('epsilon'), 'ndis_direction': 'in_to_out',
+            'ndis_variance_order': 'in_ge_out',
             **{key: metadata.get(key) for key in fields}}
 
 
@@ -1162,10 +1162,9 @@ def _read_complexity_trials(paths, trial_indices, settings, metric_names):
             row.update(settings)
             row.update(m=key[0], trial=key[1], n_in=len(in_indices), n_out=len(out_indices))
             for name in metric_names:
-                if name == 'ndis_parametric_bonferroni_corrected' and not row.get(name):
-                    row.pop(name, None)
-                else:
-                    row[name] = float(row[name])
+                if not row.get(name):
+                    raise ValueError(f'{path}: trial {key} is missing {name}')
+                row[name] = float(row[name])
             trials[key] = row
     return trials
 
@@ -1225,8 +1224,6 @@ def run_corrected_bootstrap_complexity(exp_dir, delta, significance, fig_dir, n_
         saved = _read_complexity_trials(_complexity_trial_parts(fig_dir), trial_indices, settings, mean_fields)
         if len(saved) != len(trial_indices):
             raise ValueError(f'canary sweep incomplete: found {len(saved)} of {len(trial_indices)} trials')
-        if not csv_only and any('ndis_parametric_bonferroni_corrected' not in row for row in saved.values()):
-            raise ValueError('Some shards lack corrected Bonferroni values. Resume from this directory to fill them in.')
         trials = _write_corrected_bootstrap_csv(trial_path, (saved[key] for key in trial_indices))
     else:
         selected = list(trial_indices)
@@ -1247,24 +1244,12 @@ def run_corrected_bootstrap_complexity(exp_dir, delta, significance, fig_dir, n_
             previous = _read_complexity_trials([trial_path], trial_indices, settings, mean_fields)
             saved.update(previous)
         reused = sum(key in saved for key in selected)
-        bonferroni_to_fill = 0 if csv_only else sum(
-            'ndis_parametric_bonferroni_corrected' not in saved[key] for key in selected if key in saved
-        )
-        print(f'Canary trials assigned={len(selected)}, reusing={reused}, remaining={len(selected) - reused}, '
-              f'Bonferroni to fill={bonferroni_to_fill}')
+        print(f'Canary trials assigned={len(selected)}, reusing={reused}, remaining={len(selected) - reused}')
 
         def evaluate_subsets():
             for key in selected:
                 if key in saved:
-                    row = saved[key]
-                    if not csv_only and 'ndis_parametric_bonferroni_corrected' not in row:
-                        in_indices, out_indices = trial_indices[key]
-                        bonferroni = ndis_eps_lb_parametric_bonferroni(
-                            in_scores[in_indices], out_scores[out_indices], delta, alpha=significance,
-                            gaussian_correction_r=correction_r,
-                        )
-                        row['ndis_parametric_bonferroni_corrected'] = bonferroni['eps_lb']
-                    yield row
+                    yield saved[key]
                 else:
                     estimates = evaluate_trial(*trial_indices[key])
                     yield {**metadata, 'checkpoint': epoch, 'trial': key[1], **estimates}
